@@ -226,7 +226,7 @@ impl FrameReader {
                 return Ok(Some(item));
             }
             if self.finished {
-                return Ok(None);
+                return self.end();
             }
 
             // One chunk while the read-ahead is off, which is what every
@@ -251,16 +251,22 @@ impl FrameReader {
 
             if taken.is_none() {
                 self.finished = true;
-                if !self.decoder.at_frame_boundary() {
-                    return Err(Violation::connection(
-                        Code::H3_FRAME_ERROR,
-                        "the stream ended part-way through a frame",
-                    )
-                    .into());
-                }
-                return Ok(None);
+                return self.end();
             }
         }
+    }
+
+    /// The verdict once quinn has reported the end, the same on every call: a
+    /// clean end at a frame boundary, and H3_FRAME_ERROR inside a frame.
+    fn end(&self) -> Result<Option<Item>, Error> {
+        if self.decoder.at_frame_boundary() {
+            return Ok(None);
+        }
+        Err(Violation::connection(
+            Code::H3_FRAME_ERROR,
+            "the stream ended part-way through a frame",
+        )
+        .into())
     }
 
     /// The next item that can be decoded from chunks already taken from quinn,
@@ -461,6 +467,32 @@ mod tests {
             delivered, expected,
             "everything before the end, including the truncated frame's bytes, comes first"
         );
+    }
+
+    /// The verdict on a truncated last frame is the same on every later read,
+    /// so a caller that polls again after the error never sees a clean end.
+    #[tokio::test]
+    async fn a_truncated_frame_is_refused_on_every_later_read() {
+        let mut wire = BytesMut::new();
+        put_header(&mut wire, DATA, 10);
+        wire.extend_from_slice(b"abc");
+
+        let mut upload = loopback::Upload::start(&wire).await;
+        upload.send.finish().expect("finish the request stream");
+        let mut reader = tunnel_reader(upload.take_recv());
+
+        let mut delivered = Vec::new();
+        read_body(&mut reader, &mut delivered)
+            .await
+            .expect_err("a truncated frame must be refused");
+        for _ in 0..2 {
+            let again = reader.next().await;
+            let Err(Error::Protocol(violation)) = again else {
+                panic!("a later read must repeat the refusal, got {again:?}");
+            };
+            assert_eq!(violation.code(), Code::H3_FRAME_ERROR);
+            assert!(violation.is_connection_error());
+        }
     }
 
     /// `try_next` hands out what the last read took and then stops, without
