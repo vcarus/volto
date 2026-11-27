@@ -700,3 +700,32 @@ pub fn server_control_stream(
         recv
     }
 }
+
+/// Reads `recv` to its end and asserts that the peer reset it with `code`.
+///
+/// `what` names the stream in every failure, for a caller that judges several.
+/// A stream that ends any other way, or neither ends nor is reset within
+/// [`TIMEOUT`], fails here.
+#[track_caller]
+pub fn expect_reset<'a>(
+    recv: &'a mut quinn::RecvStream,
+    code: u64,
+    what: &'a str,
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        let ended = tokio::time::timeout(TIMEOUT, recv.read_to_end(4096))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("at {caller}: {what}: the stream was neither reset nor ended in {TIMEOUT:?}")
+            });
+        match ended {
+            Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(got))) => assert_eq!(
+                got.into_inner(),
+                code,
+                "at {caller}: {what}: the stream was reset with the wrong code"
+            ),
+            other => panic!("at {caller}: {what}: expected a reset with {code:#x}, got {other:?}"),
+        }
+    }
+}

@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use common::rawstream::{
     FRAME_HEADERS, H3_NO_ERROR, H3_REQUEST_INCOMPLETE, H3_STREAM_CREATION_ERROR, authenticate,
-    authenticated_connect_headers_frame, close_reason, read_frame, server_control_stream,
-    status_of, still_serving,
+    authenticated_connect_headers_frame, close_reason, expect_reset, read_frame,
+    server_control_stream, status_of, still_serving,
 };
 use common::{
     ALLOW_PRIVATE, H3Client, IMPATIENT, Leg, Relayed, TIMEOUT, TestServer, auth_section,
@@ -364,18 +364,12 @@ async fn a_request_that_stalls_before_its_headers_is_reset() {
         .await
         .expect("send one byte of a request");
 
-    let error = tokio::time::timeout(TIMEOUT, stalled_recv.read_to_end(64))
-        .await
-        .expect("the server must not wait for a request that is not coming")
-        .expect_err("the stalled stream must be reset");
-    match error {
-        quinn::ReadToEndError::Read(quinn::ReadError::Reset(code)) => assert_eq!(
-            code.into_inner(),
-            H3_REQUEST_INCOMPLETE,
-            "the peer must be told its request never arrived"
-        ),
-        other => panic!("expected a reset, got {other}"),
-    }
+    expect_reset(
+        &mut stalled_recv,
+        H3_REQUEST_INCOMPLETE,
+        "the stalled stream, whose request never arrived",
+    )
+    .await;
 
     // The connection is untouched: another request on it is served normally.
     still_serving(&connection).await;
@@ -406,17 +400,12 @@ async fn a_request_reset_before_its_headers_draws_an_abort() {
     send.reset(quinn::VarInt::from_u32(0x10c))
         .expect("reset the request stream");
 
-    let ended = tokio::time::timeout(TIMEOUT, recv.read_to_end(64))
-        .await
-        .expect("the server must answer a reset request stream");
-    match ended {
-        Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))) => assert_eq!(
-            code.into_inner(),
-            H3_REQUEST_INCOMPLETE,
-            "the peer must be told its request never arrived"
-        ),
-        other => panic!("expected the response stream to be reset, got {other:?}"),
-    }
+    expect_reset(
+        &mut recv,
+        H3_REQUEST_INCOMPLETE,
+        "the response to a request reset before its HEADERS",
+    )
+    .await;
 
     still_serving(&connection).await;
 }
@@ -469,20 +458,8 @@ async fn a_batch_of_stalled_requests_is_reset_stream_by_stream() {
     }
 
     for (index, (_send, mut recv)) in stalled.into_iter().enumerate() {
-        let error = tokio::time::timeout(TIMEOUT, recv.read_to_end(64))
-            .await
-            .unwrap_or_else(|_| {
-                panic!("stream {index} of {STALLED}: the server must not wait for a request that is not coming")
-            })
-            .expect_err("the stalled stream must be reset");
-        match error {
-            quinn::ReadToEndError::Read(quinn::ReadError::Reset(code)) => assert_eq!(
-                code.into_inner(),
-                H3_REQUEST_INCOMPLETE,
-                "stream {index} of {STALLED} must draw its own reset"
-            ),
-            other => panic!("stream {index} of {STALLED}: expected a reset, got {other}"),
-        }
+        let what = format!("stalled stream {index} of {STALLED}");
+        expect_reset(&mut recv, H3_REQUEST_INCOMPLETE, &what).await;
     }
 
     assert!(

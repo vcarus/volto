@@ -76,8 +76,8 @@ use common::rawstream::{
     H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_MISSING_SETTINGS, H3_REQUEST_INCOMPLETE,
     H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR, RESERVED_HTTP2_TYPES, SETTINGS_H3_DATAGRAM,
     SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER,
-    STREAM_QPACK_ENCODER, application_close, connect_headers_frame, frame, grease_type, read_frame,
-    settings_frame, status_of, still_serving, varint_frame,
+    STREAM_QPACK_ENCODER, application_close, connect_headers_frame, expect_reset, frame,
+    grease_type, read_frame, settings_frame, status_of, still_serving, varint_frame,
 };
 use common::{TIMEOUT, TestServer, connect_quic, spawn_echo_target};
 use volto::varint;
@@ -1230,22 +1230,8 @@ async fn run_plan(
             // RFC 9114 §4.1: the server aborts its response stream with
             // H3_REQUEST_INCOMPLETE -- the grease frames must not have been
             // mistaken for the beginnings of a request.
-            let ended = tokio::time::timeout(TIMEOUT, recv.read_to_end(256))
-                .await
-                .expect("the server must answer a request that never was");
-            match ended {
-                Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))) => {
-                    assert_eq!(
-                        code.into_inner(),
-                        H3_REQUEST_INCOMPLETE,
-                        "grease {grease:?}"
-                    );
-                }
-                other => panic!(
-                    "a stream finished before its request must be reset with \
-                     H3_REQUEST_INCOMPLETE, got {other:?}"
-                ),
-            }
+            let what = format!("a stream finished after grease {grease:?} and no request");
+            expect_reset(&mut recv, H3_REQUEST_INCOMPLETE, &what).await;
             None
         }
     }
