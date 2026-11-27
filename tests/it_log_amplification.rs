@@ -474,14 +474,16 @@ async fn a_udp_session_costs_exactly_one_line(buffer: &SharedBuffer) {
 
     // Every INFO line in the window, less the ones the connection and the
     // server write for themselves, named by their permanent `log_id`s: the
-    // connection's opening and closing lines, and the shutdown's three. What
-    // is left is what the sessions cost.
-    const NOT_A_SESSION: [&str; 5] = [
+    // connection's opening and closing lines, the shutdown's three, and the
+    // drain's own line, written when a session task was still running at the
+    // signal. What is left is what the sessions cost.
+    const NOT_A_SESSION: [&str; 6] = [
         "log_id=\"7l4svyo3\"",
         "log_id=\"8ro19wv6\"",
         "log_id=\"7x7xt92f\"",
         "log_id=\"2rquy1sk\"",
         "log_id=\"85kda9tt\"",
+        "log_id=\"2l3q6ors\"",
     ];
     let session_lines: Vec<String> = buffer
         .lines_since(mark, &[" INFO "])
