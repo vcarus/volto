@@ -518,7 +518,7 @@ since the drops themselves are required to be silent.
 Get either wrong and the symptom is "the handshake succeeds, the tunnel is
 established, and not one packet gets through", with no error anywhere. The
 encoder and decoder are hand-rolled in `src/datagram.rs` and `src/varint.rs`,
-about 120 lines of code, and no dependency is carried for them.
+and no dependency is carried for them.
 
 Routing uses a bounded channel and `try_send`: a session that is not draining
 its queue loses packets, which is correct UDP behaviour, instead of blocking the
