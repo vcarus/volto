@@ -429,14 +429,12 @@ impl AeadHeaderKey {
             .0
             .new_mask(&packet[sample_at..sample_at + sample_len])
             .expect("the sample is the length the algorithm takes");
-        let long_header = packet[0] & 0x80 != 0;
-        let bits = if long_header { 0x0f } else { 0x1f };
-        let pn_len = if encrypting {
-            usize::from(packet[0] & 0x03) + 1
-        } else {
+        // The long-header bit is never masked, so it reads the same either way.
+        let bits = if packet[0] & 0x80 != 0 { 0x0f } else { 0x1f };
+        if !encrypting {
             packet[0] ^= mask[0] & bits;
-            usize::from(packet[0] & 0x03) + 1
-        };
+        }
+        let pn_len = usize::from(packet[0] & 0x03) + 1;
         if encrypting {
             packet[0] ^= mask[0] & bits;
         }
