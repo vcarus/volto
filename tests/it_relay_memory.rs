@@ -32,9 +32,8 @@ use tokio::net::TcpListener;
 /// The smallest allocation this counts, and `tunnel::tcp`'s read window with
 /// the frame header room in front of it.
 ///
-/// Written out rather than imported: it is the size the relay used to pin per
-/// read, so a test that took it from the code under test would follow that code
-/// wherever it went.
+/// Written out rather than imported, so the bound does not move with the code
+/// under test.
 const RELAY_BUF_SIZE: usize = 16 * 1024;
 
 /// A pass-through allocator that tallies large allocations while armed.
@@ -127,17 +126,7 @@ async fn spawn_lockstep_target() -> SocketAddr {
 
 /// A trickle of small reads must not cost a heap block each.
 ///
-/// # Measured
-///
-/// On the dev host (macOS, debug build), 2000 answers of 100 bytes each:
-///
-/// | shape | allocations of >= 16 KiB while the trickle is in flight |
-/// |---|---|
-/// | `reserve(RELAY_BLOCK_SIZE)` only when under a window remains | 5 |
-/// | `reserve(RELAY_BUF_SIZE)` every iteration (the shape this fixes) | 2000 |
-///
-/// Both numbers are the arithmetic rather than an approximation of it: a
-/// 64 KiB block is abandoned once fewer than 16 KiB of it remain, so it carries
+/// A 64 KiB block is abandoned once fewer than 16 KiB of it remain, so it carries
 /// at least 48 KiB, and 2000 reads of 100 bytes, each behind 5 bytes of frame
 /// header room, use 210000 bytes and so need 5 of them (`210000 / 49152` is
 /// 4.3) -- while a reserve per read is a block per read. The bound below is 200 to
@@ -180,9 +169,6 @@ async fn a_trickle_of_small_reads_does_not_pin_a_block_each() {
         "the trickle arrived truncated"
     );
 
-    // One block per read would be about `TRICKLES`; one block per 48 KiB
-    // relayed is about five. Anything in between is a relay that has started
-    // pinning per read again.
     assert!(
         allocations < 200,
         "{allocations} allocations of >= {RELAY_BUF_SIZE} bytes for {TRICKLES} reads of \
