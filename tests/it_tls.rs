@@ -17,7 +17,7 @@
 mod common;
 
 use common::{
-    ALLOW_PRIVATE, H3Client, Offer, SharedBuffer, TempDir, TestServer, endpoint_from,
+    ALLOW_PRIVATE, H3Client, Offer, SharedBuffer, TempDir, TestServer, echoes, endpoint_from,
     finish_connect, impatient_transport, open_tcp_tunnel, open_udp_session, roots_of,
     rustls_client, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
 };
@@ -61,16 +61,7 @@ fn ech_endpoint_on(
 async fn tcp_and_udp(client: &mut H3Client, server: &TestServer) {
     let target = spawn_echo_target().await;
     let mut stream = open_tcp_tunnel(client, &target.to_string()).await;
-    stream
-        .send_data(bytes::Bytes::from_static(b"over tcp"))
-        .await
-        .expect("send through the tunnel");
-    let echoed = stream
-        .recv_data()
-        .await
-        .expect("read the tunnel")
-        .expect("the echo answers");
-    assert_eq!(&echoed[..], b"over tcp");
+    echoes(&mut stream, b"over tcp").await;
 
     let udp_target = spawn_udp_echo_target().await;
     let (qsid, _session) = open_udp_session(client, server, udp_target).await;
