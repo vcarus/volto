@@ -189,7 +189,6 @@ MSG_UDP_SESSION = "udp session established"
 MSG_BLACKHOLE = "every address of the target is a DNS blackhole"
 MSG_POLICY_DENIED = "every address of the target is prohibited by policy"
 MSG_GOAWAY = "sent GOAWAY, draining tunnels"
-MSG_SIGNAL = "received a termination signal"
 MSG_OVERSIZE = "target packet too large for a QUIC datagram, dropping"
 MSG_EVICTION = "QUIC datagram send buffer full, older datagrams evicted"
 
