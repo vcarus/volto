@@ -559,7 +559,7 @@ struct Report {
 /// their exact time. The probe timeout is quinn's in its simplest form: when
 /// no loss timer is set, it fires the smoothed RTT plus four RTT variations
 /// plus the peer's 25 ms ACK delay after the last packet sent, doubled per
-/// timeout in a row, and lets two packets out above the window.
+/// timeout in a row, and lets two packets out past the window and the pacer.
 struct Sim {
     sc: Scenario,
     c: Bbr,
@@ -984,7 +984,10 @@ impl Sim {
     /// quinn's `Connection::poll_transmit` for a sender that always has data:
     /// a packet goes out while in-flight data plus the packet is under the
     /// window and the pacer does not ask for a delay. A packet the probe
-    /// timeout lets out skips the window check but not the pacer.
+    /// timeout lets out skips the window check and the pacer, as quinn-proto
+    /// 0.11.19 does: in `Connection::poll_transmit` both checks sit inside
+    /// `loss_probes == 0`, although a comment there says that loss probes
+    /// should be paced. It still takes the pacer's tokens.
     fn transmit(&mut self, now: u64) {
         self.pacing_at = None;
         let size = u64::from(self.sc.packet);
@@ -1026,9 +1029,10 @@ impl Sim {
                 return;
             }
             let at = self.at(now);
-            if let Some(wake) = self
-                .pacer
-                .delay(self.rtt.get(), size, self.sc.packet, window, at)
+            if !probe
+                && let Some(wake) = self
+                    .pacer
+                    .delay(self.rtt.get(), size, self.sc.packet, window, at)
             {
                 let wake = nanos(wake.saturating_duration_since(self.t0));
                 self.pacing_at = Some(wake.max(now + 1));
