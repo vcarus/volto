@@ -248,9 +248,6 @@ pub fn decode(block: &[u8], max_section_size: u64) -> Result<Vec<Field>, Violati
         if size > max_section_size {
             // Not a QPACK failure: the section decoded, it is simply larger
             // than what SETTINGS_MAX_FIELD_SECTION_SIZE told the peer to send.
-            // RFC 9114 §8.1 defines H3_EXCESSIVE_LOAD for a peer "exhibiting a
-            // behavior that might be generating excessive load", which is what
-            // ignoring an advertised bound is.
             return Err(Violation::field_section_too_large(format!(
                 "field section exceeds the advertised {max_section_size} bytes"
             )));
@@ -355,35 +352,26 @@ fn dynamic_reference() -> Violation {
 
 /// A failure this decoder answers by closing the connection.
 ///
-/// Of the connection errors RFC 9204 makes a decoder answer, this decoder can
-/// reach three: a reference to the dynamic table (§2.2.3), an invalid static
-/// table index (§3.1), and a Required Insert Count no conformant encoder could
-/// have produced (§4.5.1.1). The other two, more blocked streams than promised
-/// (§2.1.2) and a Required Insert Count smaller than expected (§2.2.1), need a
-/// dynamic table, and a non-zero Required Insert Count is refused first under
-/// §4.5.1.1. A fourth reachable one, the field block §4.5.1.2 makes invalid
-/// through its Sign bit, is graded the same way by this server's own reading.
-/// The RFC leaves that one's class unstated. Each is quoted at the point it is
-/// raised.
+/// This decoder can reach four: a dynamic-table reference (§2.2.3), an
+/// invalid static index (§3.1), a Required Insert Count no conformant encoder
+/// could produce (§4.5.1.1), and a Sign bit of 1 (§4.5.1.2). The RFC calls the
+/// last one invalid without a class, and this server grades it the same way.
+/// The two others RFC 9204 names (§2.1.2, §2.2.1) need a dynamic table. Each is
+/// quoted where it is raised.
 fn connection_error(detail: &'static str) -> Violation {
     Violation::connection(Code::QPACK_DECOMPRESSION_FAILED, detail)
 }
 
 /// A failure answered on the one stream it arrived on.
 ///
-/// Everything else a field section can be wrong about carries the same
-/// QPACK_DECOMPRESSION_FAILED code but ends only the request that carried it.
-/// Examples are a representation that ends early and a string literal that
-/// Huffman decoding rejects. That is this server's own reading, not a rule the
-/// RFC states. Every connection error RFC 9204 mandates that this decoder
-/// can reach is one of the cases in [`connection_error`], while RFC 7541 §5.2
-/// calls a bad literal a "decoding error" without naming a class at all.
-/// With a zero dynamic table capacity this decoder holds no state between
-/// field sections, so a section it could not read leaves nothing
-/// desynchronised, and the narrower answer costs one request rather than
-/// every tunnel on the connection. The one case the RFC does class is an integer too large to
-/// decode, which §7.4 makes a stream error on a request stream. It is quoted
-/// where it is raised.
+/// Every other fault in a field section, such as a representation that ends
+/// early or a Huffman literal that does not decode, ends only its request.
+/// That is our own rule: RFC 7541 §5.2 calls a bad literal a "decoding error"
+/// without a class. With no dynamic table this decoder keeps no state between
+/// sections, so nothing is left out of step, and the answer costs one request
+/// rather than every tunnel on the connection. The one case the RFC does class,
+/// an integer too large to decode, is a stream error under §7.4, quoted where
+/// it is raised.
 fn stream_error(detail: &'static str) -> Violation {
     Violation::stream(Code::QPACK_DECOMPRESSION_FAILED, detail)
 }
@@ -621,7 +609,6 @@ mod tests {
 
     /// RFC 9204 §4.5.1.1: with a zero table capacity nothing can have been
     /// inserted, so a non-zero count is one no conformant encoder could send.
-    /// It is one of the three connection errors this decoder can reach.
     #[test]
     fn a_non_zero_required_insert_count_is_refused() {
         let error =
@@ -673,8 +660,8 @@ mod tests {
     #[test]
     fn a_truncated_representation_is_refused() {
         for body in [
-            vec![0x51],             // a literal name whose length byte is missing
-            vec![0x51, 0x0b, b'/'], // a literal name shorter than it declared
+            vec![0x51],             // a name-reference literal whose value length is missing
+            vec![0x51, 0x0b, b'/'], // a name-reference literal whose value is shorter than declared
             vec![0xff],             // a prefixed integer with no continuation
         ] {
             let error =
