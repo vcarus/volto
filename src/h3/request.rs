@@ -244,6 +244,7 @@ fn uri_authority(authority: &[u8]) -> Result<&str, Violation> {
     if !authority
         .iter()
         .all(|byte| is_pchar(*byte) || matches!(byte, b'[' | b']'))
+        || !percent_encoding_is_complete(authority)
     {
         return Err(invalid());
     }
@@ -280,13 +281,16 @@ fn split_target(target: &[u8], extended: bool) -> Result<(&str, Option<&str>), V
             (&target[..mark], Some(&target[mark + 1..]))
         });
 
-    if !path.iter().all(|byte| is_pchar(*byte) || *byte == b'/') {
+    if !path.iter().all(|byte| is_pchar(*byte) || *byte == b'/')
+        || !percent_encoding_is_complete(path)
+    {
         return Err(malformed("a :path with a character no path may contain"));
     }
     if !query.is_none_or(|query| {
         query
             .iter()
             .all(|byte| is_pchar(*byte) || matches!(byte, b'/' | b'?'))
+            && percent_encoding_is_complete(query)
     }) {
         return Err(malformed("a :path with a character no query may contain"));
     }
@@ -312,9 +316,20 @@ fn ascii(bytes: &[u8], invalid: impl Fn() -> Violation) -> Result<&str, Violatio
 
 /// Whether `byte` is an RFC 3986 §3.3 `pchar`, or the "%" one begins with.
 ///
-/// `unreserved / pct-encoded / sub-delims / ":" / "@"`.
+/// `unreserved / pct-encoded / sub-delims / ":" / "@"`. The two hex digits after
+/// a "%" are [`percent_encoding_is_complete`]'s to check.
 fn is_pchar(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"-._~%!$&'()*+,;=:@".contains(&byte)
+}
+
+/// Whether every "%" in `component` begins a `pct-encoded`, which RFC 3986
+/// §2.1 writes as `"%" HEXDIG HEXDIG`.
+fn percent_encoding_is_complete(component: &[u8]) -> bool {
+    component.split(|byte| *byte == b'%').skip(1).all(|after| {
+        after
+            .get(..2)
+            .is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit))
+    })
 }
 
 /// Adds one regular field, applying RFC 9114 §4.2's rules on the way.
@@ -504,6 +519,17 @@ mod tests {
             field(":authority", "proxy.example:443"),
             field(":path", "/.well-known/masque/udp/192.0.2.1/443/"),
         ]
+    }
+
+    /// [`connect_udp`] with the value of one pseudo-header replaced.
+    fn replacing(name: &str, value: &str) -> Vec<Field> {
+        let mut fields = connect_udp();
+        for existing in &mut fields {
+            if existing.name.as_ref() == name.as_bytes() {
+                *existing = field(name, value);
+            }
+        }
+        fields
     }
 
     #[track_caller]
@@ -886,16 +912,6 @@ mod tests {
     /// as loudly.
     #[test]
     fn pseudo_headers_that_name_a_target_are_checked_for_syntax() {
-        let replacing = |name: &str, value: &str| {
-            let mut fields = connect_udp();
-            for existing in &mut fields {
-                if existing.name.as_ref() == name.as_bytes() {
-                    *existing = field(name, value);
-                }
-            }
-            fields
-        };
-
         // A scheme is ALPHA then ALPHA / DIGIT / "+" / "-" / "." (RFC 3986 §3.1).
         assert!(build_request(replacing(":scheme", "coap+tcp")).is_ok());
         for scheme in ["1https", "http s", "http/1"] {
@@ -938,5 +954,30 @@ mod tests {
         // And an ordinary request is not thereby excused a real path.
         options[3] = field(":path", "masque/udp/");
         refused(options);
+    }
+
+    /// A "%" in a target is the start of `pct-encoded`, `"%" HEXDIG HEXDIG`
+    /// (RFC 3986 §2.1), and never a character of its own.
+    #[test]
+    fn a_percent_sign_must_begin_a_percent_encoded_octet() {
+        for path in [
+            "/.well-known/masque/udp/%5B2001%3adb8%3A%3A1%5D/53/",
+            "/a?b=%20",
+        ] {
+            assert!(build_request(replacing(":path", path)).is_ok(), "{path}");
+        }
+        assert!(build_request(replacing(":authority", "proxy%2Dexample:443")).is_ok());
+
+        for path in [
+            "/.well-known/masque/udp/a%zz/53/",
+            "/%",
+            "/a%2",
+            "/a%%41",
+            "/a?b=%",
+            "/a?b=%g0",
+        ] {
+            refused(replacing(":path", path));
+        }
+        refused(replacing(":authority", "proxy%:443"));
     }
 }
