@@ -289,7 +289,7 @@ async fn stalled(rx: &mut watch::Receiver<State>, other: State, budget: Duration
 }
 
 /// Establishes a TCP tunnel to `authority` and relays until both directions end.
-pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
+pub(crate) async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     let Some(tcp) = establish(authority, &mut stream, ctx).await else {
         return;
     };

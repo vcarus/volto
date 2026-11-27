@@ -25,7 +25,7 @@ use crate::policy::{self, Policy};
 use crate::quic::{AuthGate, MarkOutcome};
 
 pub use quota::{AuthFailures, Pending, Quota, Slot};
-pub use status::ProxyError;
+pub(crate) use status::ProxyError;
 pub(crate) use status::{
     ResolveFailure, Unreachable, accept_then_close, refuse, refuse_because, refuse_unreachable,
     refuse_with, respond,
@@ -33,7 +33,7 @@ pub(crate) use status::{
 
 /// How a request should be handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Route<'a> {
+pub(crate) enum Route<'a> {
     /// CONNECT with no `:protocol`: a TCP tunnel (RFC 9114 §4.4).
     Tcp,
     /// CONNECT with `:protocol = connect-udp`: a UDP tunnel (RFC 9298).
@@ -51,7 +51,7 @@ pub enum Route<'a> {
 ///
 /// The pseudo-header is read straight off the [`Request`], as the tunnels read
 /// every other field of one (D78).
-pub fn route(req: &Request) -> Route<'_> {
+pub(crate) fn route(req: &Request) -> Route<'_> {
     if req.method != Method::Connect {
         return Route::NotConnect;
     }
