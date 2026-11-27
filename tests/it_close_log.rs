@@ -396,10 +396,10 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         );
         // The packet size DPLPMTUD settled on, which is how an operator tells a
         // path that carried the probes from one that black-holed them. Never
-        // below the QUIC floor, so a zero here is a placeholder rather than a
-        // measurement.
+        // below the QUIC floor, so a value under it is a placeholder rather than
+        // a measurement.
         assert!(
-            line.contains("mtu=1"),
+            numeric_field(line, "mtu") >= 1200,
             "a close log must carry the path MTU discovery settled on; line was:\n{line}"
         );
         // Loopback drops nothing, so the detector has nothing to fire on: the
