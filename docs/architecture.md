@@ -39,7 +39,10 @@ change.
 `systemd.rs` holds the service manager's notification protocol, and `quic/`
 knows nothing of it. `main` sends `READY=1` through it once `Server::bind` has
 bound that socket and before the accept loop runs, which is when a
-`Type=notify` start is done ([systemd](deployment.md#systemd)).
+`Type=notify` start is done ([systemd](deployment.md#systemd)). The watchdog's
+keep-alive is polled in the same future as the accept loop rather than in a task
+of its own, so it stops when that loop's thread or every worker thread stops
+([the watchdog](deployment.md#the-watchdog)).
 
 ### TLS
 

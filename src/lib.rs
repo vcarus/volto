@@ -23,7 +23,8 @@
 //!   at most 1.25 times the bandwidth-delay product it measures, plus what the
 //!   path's own loss takes out of it.
 //! * [`shutdown`]: the graceful-shutdown signal shared by endpoint and connections.
-//! * [`systemd`]: the service manager's notification protocol: readiness.
+//! * [`systemd`]: the service manager's notification protocol: readiness and
+//!   the watchdog's keep-alive.
 //! * [`h3`]: HTTP/3 (RFC 9114) for a proxy: framing, QPACK, the control
 //!   stream, request streams, and the routing of inbound HTTP Datagrams to the
 //!   stream each one names.

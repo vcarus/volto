@@ -57,6 +57,16 @@ ExecReload=/bin/kill -HUP $MAINPID
 KillSignal=SIGTERM
 TimeoutStopSec=45
 
+# volto sends a keep-alive every half of this, 30 s, from the future that runs
+# its accept loop, so a keep-alive needs that loop's thread and the runtime's
+# workers. When 60 s pass without one, systemd sends SIGABRT and the service is
+# restarted under Restart=on-failure: a server that stopped is detected 30 to
+# 60 s after it stopped. A client that advertises a 30 s idle timeout, as Surge
+# does, has discarded its connections by then (RFC 9000, section 10.1), so the
+# restart ends nothing that was still usable. Change or switch it off with a
+# drop-in:
+# docs/deployment.md#the-watchdog
+WatchdogSec=60
 Restart=on-failure
 RestartSec=5s
 # volto creates its SIGHUP handler before it binds the listener, but in the first

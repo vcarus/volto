@@ -1573,7 +1573,9 @@ fn unit_directives() -> Vec<String> {
 /// path. `Type=notify` makes a start done only when the server says its
 /// listener is bound, and `TimeoutStartSec=15` fails a start that never says
 /// so; `NotifyAccess=` stays unset because `Type=notify` already makes it
-/// `main`. `UMask=0077` keeps any file it creates to its user, `ProcSubset=pid` hides
+/// `main`. `WatchdogSec=60` restarts a server that stopped sending its
+/// keep-alive, through `Restart=on-failure` and with systemd's own watchdog
+/// signal. `UMask=0077` keeps any file it creates to its user, `ProcSubset=pid` hides
 /// the `/proc` entries only `--diagnostics` reads, and `RemoveIPC=yes` removes
 /// IPC objects it never makes. `ReadOnlyPaths=/etc/volto` added nothing under
 /// `ProtectSystem=strict`. `SystemCallFilter=~@resources` removes the calls that
@@ -1589,6 +1591,8 @@ fn the_unit_carries_the_safe_hardening_and_nothing_that_breaks_the_binary() {
     for expected in [
         "Type=notify",
         "TimeoutStartSec=15",
+        "WatchdogSec=60",
+        "Restart=on-failure",
         "UMask=0077",
         "ProcSubset=pid",
         "RemoveIPC=yes",
@@ -1625,6 +1629,10 @@ fn the_unit_carries_the_safe_hardening_and_nothing_that_breaks_the_binary() {
         // It changes how `systemctl reload` reaches the server, and the
         // server implements none of it (D124).
         "Type=notify-reload",
+        // A watchdog timeout is systemd's default SIGABRT, and whether it
+        // leaves a core file is the host's setting, not the unit's (D124).
+        "WatchdogSignal=",
+        "LimitCORE=",
     ] {
         assert!(
             !directives.iter().any(|line| line.starts_with(absent)),

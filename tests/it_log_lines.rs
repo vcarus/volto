@@ -504,6 +504,24 @@ const ACCOUNTED: &[Accounted] = &[
         reason: "Once at startup: readiness is sent one time, after the listener \
                  is bound.",
     },
+    Accounted {
+        id: "4s9p4dd7",
+        file: "systemd.rs",
+        message: "the watchdog variables cannot be used, so no keep-alive is sent",
+        bound: Bound::Lifecycle,
+        reason: "Once at startup, from the environment the service manager or the \
+                 operator set; no keep-alive is tried after it.",
+    },
+    Accounted {
+        id: "30nndon9",
+        file: "systemd.rs",
+        message: "could not send the watchdog keep-alive to the service manager; \
+                  further failures are logged when the count doubles",
+        bound: Bound::Sampled,
+        reason: "At most one attempt per heartbeat period, half of `WatchdogSec=`, \
+                 and the keep-alive's own sampler writes the 1st, 2nd, 4th failure \
+                 and so on. No peer can cause one.",
+    },
 ];
 
 /// The macros a production log line is written with.

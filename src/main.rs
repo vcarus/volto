@@ -575,15 +575,19 @@ async fn run(path: PathBuf, config: Config) -> Result<Duration> {
     // `Server::bind` has bound the UDP socket, so the start is done: under
     // `Type=notify` systemd reports it as finished from this message on, and a
     // start that never reaches it fails at `TimeoutStartSec=` (D124). The
-    // variable is read here and nowhere else; `volto::systemd` takes values.
+    // variables are read here and nowhere else; `volto::systemd` takes values.
     let notifier = volto::systemd::Notifier::connect(&volto::systemd::Environment {
         notify_socket: std::env::var_os("NOTIFY_SOCKET"),
+        watchdog_usec: std::env::var_os("WATCHDOG_USEC"),
+        watchdog_pid: std::env::var_os("WATCHDOG_PID"),
     });
     if let Some(notifier) = &notifier {
         notifier.ready();
     }
 
-    let stopped = server.run().await;
+    // The keep-alive is polled in this future, beside the accept loop, and not
+    // in a task of its own: `with_keep_alive` says why that is the design.
+    let stopped = volto::systemd::with_keep_alive(notifier.as_ref(), server.run()).await;
 
     // After the drain, so a reload that arrived during the process's life is in
     // it.

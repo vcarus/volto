@@ -1487,13 +1487,14 @@ impl Serving {
 }
 
 /// Under `Type=notify` the server says `READY=1` once its listener is bound,
-/// and not before.
+/// and not before, and under `WatchdogSec=` keep-alives follow.
 ///
 /// The test owns the notification socket, as systemd does. When the message
 /// arrives the test tries to bind the server's port itself, and that bind has
-/// to fail: the server's socket already holds it.
+/// to fail: the server's socket already holds it. `WATCHDOG_USEC` is 200 ms, so
+/// a keep-alive is due every 100 ms, and at least two have to arrive.
 #[test]
-fn readiness_is_sent_once_the_listener_is_bound() {
+fn readiness_is_sent_once_the_listener_is_bound_and_keep_alives_follow() {
     use std::os::unix::net::UnixDatagram;
 
     let dir = scratch_tree("cli", "ready", &[]);
@@ -1502,7 +1503,13 @@ fn readiness_is_sent_once_the_listener_is_bound() {
     receiver
         .set_read_timeout(Some(Duration::from_secs(20)))
         .expect("a read timeout");
-    let serving = Serving::start(&dir, &[("NOTIFY_SOCKET", socket.as_os_str())]);
+    let serving = Serving::start(
+        &dir,
+        &[
+            ("NOTIFY_SOCKET", socket.as_os_str()),
+            ("WATCHDOG_USEC", std::ffi::OsStr::new("200000")),
+        ],
+    );
 
     let mut buf = [0u8; 256];
     let len = receiver
@@ -1515,6 +1522,12 @@ fn readiness_is_sent_once_the_listener_is_bound() {
         Some(std::io::ErrorKind::AddrInUse),
         "the listener must be bound by the time READY=1 arrives: {probe:?}"
     );
+    for keep_alive in 1..=2 {
+        let len = receiver
+            .recv(&mut buf)
+            .unwrap_or_else(|error| panic!("keep-alive {keep_alive} must arrive: {error}"));
+        assert_eq!(&buf[..len], b"WATCHDOG=1", "keep-alive {keep_alive}");
+    }
 
     let (status, lines, stderr) = serving.stop();
     assert!(
@@ -1530,7 +1543,13 @@ fn readiness_is_sent_once_the_listener_is_bound() {
 fn a_notification_socket_nobody_listens_on_is_one_warning_and_no_outage() {
     let dir = scratch_tree("cli", "notify-absent", &[]);
     let socket = dir.join("nobody");
-    let mut serving = Serving::start(&dir, &[("NOTIFY_SOCKET", socket.as_os_str())]);
+    let mut serving = Serving::start(
+        &dir,
+        &[
+            ("NOTIFY_SOCKET", socket.as_os_str()),
+            ("WATCHDOG_USEC", std::ffi::OsStr::new("200000")),
+        ],
+    );
     serving.wait_for("accepting QUIC connections");
 
     let runtime = tokio::runtime::Runtime::new().expect("a runtime for the client");
