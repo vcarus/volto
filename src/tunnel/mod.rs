@@ -1252,7 +1252,7 @@ pub(crate) async fn admit_target(
         return None;
     }
 
-    let (judged, resolve) = judge(
+    let judged = judge(
         host,
         port,
         &ctx.resolver,
@@ -1264,7 +1264,7 @@ pub(crate) async fn admit_target(
 
     match judged {
         Judged::Admitted(admitted) => Some(admitted),
-        Judged::Unresolved(failure) => {
+        Judged::Unresolved(failure, resolve) => {
             let error = failure.proxy_error();
             ctx.failed_setups.resolve(resolve);
             debug!(stream_id, host, port, reason = %failure, "failed to resolve target");
@@ -1341,8 +1341,8 @@ pub(crate) fn usable_addresses(
 enum Judged {
     /// The tunnel may dial it.
     Admitted(Admitted),
-    /// The name did not resolve.
-    Unresolved(ResolveFailure),
+    /// The name did not resolve, after this long.
+    Unresolved(ResolveFailure, Duration),
     /// Every address, of both families, is the unspecified one.
     Blackhole(Vec<std::net::SocketAddr>),
     /// No address passed the policy. These are all of them, of both families.
@@ -1350,7 +1350,7 @@ enum Judged {
 }
 
 /// Resolves a target and applies `usable`, the destination policy, to what
-/// it resolved to, with the time spent waiting on lookups.
+/// it resolved to.
 ///
 /// The preferred family is judged first. When none of its addresses passes,
 /// the other family is read before anything is decided, so the request is
@@ -1365,24 +1365,21 @@ async fn judge(
     budget: Option<Duration>,
     family: IpFamilyPreference,
     usable: impl Fn(&[std::net::SocketAddr]) -> Vec<std::net::SocketAddr>,
-) -> (Judged, Duration) {
+) -> Judged {
     let (resolved, mut resolve) = timed(resolve_within(host, port, resolver, budget, family)).await;
     let resolved = match resolved {
         Ok(resolved) => resolved,
-        Err(failure) => return (Judged::Unresolved(failure), resolve),
+        Err(failure) => return Judged::Unresolved(failure, resolve),
     };
 
     let allowed = usable(&resolved.addresses);
     if !allowed.is_empty() {
-        return (
-            Judged::Admitted(Admitted {
-                addresses: allowed,
-                later: resolved.other,
-                deadline: resolved.deadline,
-                resolve,
-            }),
+        return Judged::Admitted(Admitted {
+            addresses: allowed,
+            later: resolved.other,
+            deadline: resolved.deadline,
             resolve,
-        );
+        });
     }
 
     let mut addresses = resolved.addresses;
@@ -1396,7 +1393,7 @@ async fn judge(
         }
     }
 
-    let judged = if !allowed.is_empty() {
+    if !allowed.is_empty() {
         Judged::Admitted(Admitted {
             addresses: allowed,
             later: None,
@@ -1407,8 +1404,7 @@ async fn judge(
         Judged::Blackhole(addresses)
     } else {
         Judged::Prohibited(addresses)
-    };
-    (judged, resolve)
+    }
 }
 
 #[cfg(test)]
@@ -2094,7 +2090,7 @@ mod tests {
                 preference: IpFamilyPreference,
                 budget: Option<Duration>,
                 allowed: fn(&SocketAddr) -> bool,
-            ) -> (Judged, Duration) {
+            ) -> Judged {
                 judge(
                     "example.test",
                     443,
@@ -2114,10 +2110,11 @@ mod tests {
                 budget: Option<Duration>,
                 plan: impl Fn(SocketAddr) -> Dial,
             ) -> (Walk<SocketAddr>, Duration) {
-                let (judged, resolve) = self.judge(preference, budget, |_| true).await;
+                let judged = self.judge(preference, budget, |_| true).await;
                 let Judged::Admitted(Admitted {
                     addresses,
                     mut later,
+                    resolve,
                     ..
                 }) = judged
                 else {
@@ -2530,7 +2527,7 @@ mod tests {
 
             for (v4_answer, v6_answer, expected, addresses) in cases {
                 let lab = Lab::new(v4_answer.clone(), v6_answer.clone(), Answer::Never);
-                let (judged, _) = lab
+                let judged = lab
                     .judge(IpFamilyPreference::Ipv4, Some(ms(5_000)), allowed)
                     .await;
 
