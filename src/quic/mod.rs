@@ -657,50 +657,8 @@ impl Server {
                 () = evicted.notified() => Some(Ok(CloseReason::Evicted)),
 
                 closed = async {
-                    let quic = match tokio::time::timeout(handshake_deadline, accepted).await {
-                        Ok(Ok(quic)) => quic,
-                        Ok(Err(error)) => {
-                            // A failed handshake is routine on a public port:
-                            // scanners, version negotiation, stale retries.
-                            //
-                            // Through `peer_error` because a peer that closes
-                            // during the handshake writes the reason phrase
-                            // inside this error, and `Display` escapes nothing.
-                            debug!(
-                                %remote,
-                                error = %crate::logfmt::peer_error(error),
-                                "QUIC handshake failed"
-                            );
-                            return None;
-                        }
-                        // Equally routine, and logged at the same level for the
-                        // same reason: a flood is exactly when this fires.
-                        Err(_elapsed) => {
-                            debug!(
-                                %remote,
-                                timeout_secs = handshake_deadline.as_secs(),
-                                "QUIC handshake did not complete in time"
-                            );
-                            return None;
-                        }
-                    };
-
-                    let peer = peer_info(&quic);
-                    info!(
-                        log_id = "7l4svyo3",
-                        remote = %peer.remote,
-                        alpn = %crate::logfmt::or_dash(peer.alpn.as_deref()),
-                        server_name = %crate::logfmt::or_dash(peer.server_name.as_deref()),
-                        // Whether this handshake used ECH. The startup line's
-                        // `ech=` says whether a key is loaded.
-                        ech = peer.ech,
-                        // At this point the estimate comes from the handshake
-                        // samples alone; the close logs below carry the lifetime
-                        // smoothed value.
-                        rtt_ms = quic.rtt().as_millis(),
-                        "connection established"
-                    );
-                    established = Some((peer.remote, quic.clone()));
+                    let (peer, quic) = establish(accepted, handshake_deadline, remote).await?;
+                    established = Some((peer, quic.clone()));
 
                     let handled = conn::handle(
                         quic,
@@ -808,6 +766,62 @@ impl Server {
         let _ =
             tokio::time::timeout(shutdown::CLOSE_FLUSH_TIMEOUT, self.endpoint.wait_idle()).await;
     }
+}
+
+/// Completes one connection's QUIC handshake within `deadline`, and says so
+/// in the line that opens the connection.
+///
+/// Returns the peer's address with the connection, or `None` for a handshake
+/// that failed or lapsed, which is logged here. [`Server::serve`] says why the
+/// deadline is one idle timeout.
+async fn establish(
+    accepted: Handshake,
+    deadline: Duration,
+    remote: SocketAddr,
+) -> Option<(SocketAddr, quinn::Connection)> {
+    let quic = match tokio::time::timeout(deadline, accepted).await {
+        Ok(Ok(quic)) => quic,
+        Ok(Err(error)) => {
+            // A failed handshake is routine on a public port: scanners,
+            // version negotiation, stale retries.
+            //
+            // Through `peer_error` because a peer that closes during the
+            // handshake writes the reason phrase inside this error, and
+            // `Display` escapes nothing.
+            debug!(
+                %remote,
+                error = %crate::logfmt::peer_error(error),
+                "QUIC handshake failed"
+            );
+            return None;
+        }
+        // Equally routine, and logged at the same level for the same reason:
+        // a flood is exactly when this fires.
+        Err(_elapsed) => {
+            debug!(
+                %remote,
+                timeout_secs = deadline.as_secs(),
+                "QUIC handshake did not complete in time"
+            );
+            return None;
+        }
+    };
+
+    let peer = peer_info(&quic);
+    info!(
+        log_id = "7l4svyo3",
+        remote = %peer.remote,
+        alpn = %crate::logfmt::or_dash(peer.alpn.as_deref()),
+        server_name = %crate::logfmt::or_dash(peer.server_name.as_deref()),
+        // Whether this handshake used ECH. The startup line's `ech=` says
+        // whether a key is loaded.
+        ech = peer.ech,
+        // At this point the estimate comes from the handshake samples alone;
+        // the close logs carry the lifetime smoothed value.
+        rtt_ms = quic.rtt().as_millis(),
+        "connection established"
+    );
+    Some((peer.remote, quic))
 }
 
 /// Answers an unvalidated arrival at a full server: a Retry, or a refusal
