@@ -1,20 +1,12 @@
-//! M7 increment: the QUIC transport parameters are configuration, not constants.
+//! The QUIC transport parameters a running server applies: the configured idle
+//! timeout, its reload to new connections only, and the stream allowance and
+//! receive window that authentication raises. `src/quic/transport.rs` asserts
+//! the values in `TransportConfig`; these tests assert what reaches the wire.
 //!
-//! `max_idle_timeout` is the one of the five that can be observed from outside
-//! without reaching into quinn, so it stands in for the group: if the configured
-//! value reaches `TransportConfig`, it reaches it for all of them, since they are
-//! set together in `quic::server_config`.
-//!
-//! The second test is the one that matters for operations. The README tells an
-//! operator to lower `keep_alive_interval` when the relay's conntrack timeout is
-//! shorter than the default, and the way to apply that is `systemctl reload` — so
-//! a reload really has to carry transport parameters to new connections, not just
-//! credentials and certificates.
-//!
-//! The next two are about a transport parameter that is *not* simply the
-//! configured value: the bidirectional stream allowance, which a connection
-//! starts below and is raised to by authenticating. The last two are about the
-//! other one raised the same way, the connection receive window.
+//! The reload matters for operations: `docs/deployment.md` tells an operator to
+//! lower `keep_alive_interval` when the relay's conntrack timeout is shorter
+//! than the default, and `docs/configuration.md` says a reload carries it to
+//! new connections.
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the transport numbers are ones this file writes out itself.

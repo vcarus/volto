@@ -11,7 +11,8 @@
 //! The distinction the gate lives or dies by is between *no answer* and *an
 //! answer that says no*, and a handshake failure alone does not tell them apart.
 //! So the certificate here covers two names, `localhost` and `other.example`,
-//! and every negative test asks for a name the certificate would have accepted.
+//! and every negative test that names a host asks for one the certificate
+//! would have accepted.
 //! A `ConnectionError::TimedOut` is then the gate working: the client asked for a
 //! name it could have completed a handshake under, and heard nothing. Anything
 //! else — a transport error, a connection closed — means the server replied.

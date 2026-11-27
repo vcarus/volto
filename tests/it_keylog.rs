@@ -39,8 +39,8 @@ async fn enabling_keylog_writes_the_tls_secrets() {
     let keylog = dir.path().join("keys.log");
 
     // `KeyLogFile` reads this once, when the rustls configuration is built, so it
-    // has to be set before the server starts. Safe here: single test, single
-    // thread, nothing else in this binary depends on the environment.
+    // has to be set before the server starts. Sound because `ENV` serializes
+    // every access to the environment in this binary.
     unsafe { std::env::set_var("SSLKEYLOGFILE", &keylog) };
 
     let server = TestServer::start_with_log(ALLOW_PRIVATE, "keylog = true\n").await;

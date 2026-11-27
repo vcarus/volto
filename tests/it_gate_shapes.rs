@@ -1023,7 +1023,7 @@ fn large_first_flight(
 /// 1350, the CRYPTO stream cut into about thirty pieces and sent out of order
 /// with PING and PADDING between them. The gate keeps no state between
 /// datagrams, so it never holds the whole message, and a message that is not
-/// whole is not judged. The name is in the first packet in every case below
+/// whole is not judged. The name starts in the first packet in every case below
 /// and is still not judged. The TLS layer refuses the unlisted name
 /// (`it_sni_gate`).
 #[test]
@@ -1249,7 +1249,7 @@ async fn quinn_first_flight(alpn: &[&str]) -> Vec<u8> {
 /// later-Initial defect on 2026-09-03, so what it does differently from quinn
 /// is exactly what this gate has already been wrong about once. Captured with
 /// aioquic 1.3.0 asking for `localhost`, and kept as bytes because generating it
-/// needs a Python interpreter no CI job here has.
+/// needs a Python interpreter the `cargo test` jobs do not have.
 ///
 /// Two things about it are worth reading off the hex before the assertions: the
 /// Initial packet is 518 bytes and the remaining 682 of the datagram are zero
@@ -1591,7 +1591,7 @@ async fn draws_no_reply(what: &str, dcid: &[u8], frames: &[u8]) {
 /// and therefore that it is a client's first Initial, and a first Initial's
 /// Destination Connection ID is at least eight bytes (RFC 9000 §7.2). quinn
 /// answers a shorter one with a CONNECTION_CLOSE before it looks at a single
-/// frame (`early_validate_first_packet`, quinn-proto 0.11.18), which is what
+/// frame (`early_validate_first_packet`), which is what
 /// the gate-off half of this probe records.
 #[tokio::test]
 async fn a_padding_only_initial_with_a_short_connection_id_is_silent() {
