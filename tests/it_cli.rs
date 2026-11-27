@@ -33,12 +33,12 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use scripts::{
-    loadable_config_text, plant_placeholder_certificates, real_binary, scratch_tree, stderr_of,
-    stdout_of, write_private,
+    Scratch, loadable_config_text, plant_placeholder_certificates, real_binary, scratch_tree,
+    stderr_of, stdout_of, write_private,
 };
 
 /// A directory of this test's own, standing in for `/etc/volto`.
-fn config_dir(name: &str) -> PathBuf {
+fn config_dir(name: &str) -> Scratch {
     let dir = scratch_tree("cli", name, &[]);
     plant_placeholder_certificates(&dir);
     dir

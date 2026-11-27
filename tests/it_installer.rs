@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use scripts::{
-    loadable_config_text, path_with_stubs, plant_binary_without_the_flag,
+    Scratch, loadable_config_text, path_with_stubs, plant_binary_without_the_flag,
     plant_placeholder_certificates, real_binary, repo_root, scratch_tree, stderr_of, stdout_of,
     write_executable,
 };
@@ -45,7 +45,7 @@ use volto::config::{Config, EXAMPLE_PLACEHOLDER_PASSWORD};
 /// Nothing reads them: `Config::validate` insists both paths are files, which is
 /// exactly the rule that makes `--check-config` unusable from a bare checkout and
 /// the reason this seam exists at all.
-fn install_root(name: &str) -> PathBuf {
+fn install_root(name: &str) -> Scratch {
     let root = scratch_tree("install", name, &["etc/volto"]);
     plant_placeholder_certificates(&root.join("etc/volto"));
     root
@@ -1273,7 +1273,7 @@ fn an_install_whose_service_is_active_reports_success() {
 /// A configured host for the re-run tests: a config the real binary loads with
 /// `body` appended, its certificate pair, an installed binary that reports an
 /// old version, and an installed unit.
-fn configured_root(name: &str, body: &str) -> PathBuf {
+fn configured_root(name: &str, body: &str) -> Scratch {
     let root = scratch_tree(
         "install",
         name,

@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use scripts::{
-    loadable_config_text, path_with_stubs, plant_binary_without_the_flag,
+    Scratch, loadable_config_text, path_with_stubs, plant_binary_without_the_flag,
     plant_placeholder_certificates, real_binary, repo_root, scratch_tree, stderr_of, stdout_of,
     write_executable,
 };
@@ -96,7 +96,7 @@ fn run_deploy_piped(root: &Path, cwd: &Path, args: &[&str]) -> Output {
 
 /// A stand-in for a host's filesystem: the directories a Linux host already has,
 /// under a directory of this test's own.
-fn install_root(name: &str) -> PathBuf {
+fn install_root(name: &str) -> Scratch {
     scratch_tree(
         "deploy",
         name,
@@ -1279,7 +1279,7 @@ fn a_signature_is_accepted_only_from_the_trusted_key_over_the_same_bytes() {
 /// A release directory as the download step leaves it, with the key that signs
 /// it, for [`verify_release`].
 struct Download {
-    dir: PathBuf,
+    dir: Scratch,
     /// The public key the function under test is told to trust.
     trusted: String,
 }
@@ -1879,6 +1879,8 @@ enum Candidate {
 /// Everything else the script runs is the host's own: `install`, `tar`,
 /// `mktemp`, `cmp`, `readlink`, `awk` and `bash`.
 struct Host {
+    /// Holds the tree the paths below are in.
+    _base: Scratch,
     root: PathBuf,
     stubs: PathBuf,
     release: PathBuf,
@@ -1913,6 +1915,7 @@ impl Host {
             staging: base.join("staging"),
             logs: base.join("logs"),
             tmp: base.join("tmp"),
+            _base: base,
         };
 
         // `id -u volto` answers the uid in `logs/volto-uid`, or a uid no file

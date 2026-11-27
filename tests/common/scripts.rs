@@ -296,42 +296,59 @@ pub fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// A scratch directory named for this process, emptied if it already exists.
+/// A scratch directory tree, removed when this value is dropped on a green run
+/// and kept when it is dropped while the thread panics.
 ///
-/// Named by pid so two `cargo test` runs at once do not share one, and cleared
-/// rather than trusted, so a run that crashed before its cleanup cannot leave a
-/// file behind that makes the next one pass. The directory itself is not
-/// created: some callers want it empty and some want a tree inside it.
-///
-/// That clearing is why no caller deletes its tree on the way out. A trailing
-/// `remove_dir_all` is skipped exactly when a test panics, which is the one run
-/// whose leftovers anybody wants to open, and it buys nothing on a green run
-/// that this does not already buy on the next one. A `Drop` guard would run on
-/// the panic and take that evidence away, which is why there is not one.
-pub fn scratch_dir(tag: &str, name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("volto-{tag}-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    dir
+/// A failed test is the run whose files somebody wants to open, so its tree
+/// stays behind under the system temp directory. Every other tree goes with
+/// the value that owns it. The value derefs to the root's [`Path`], so a caller
+/// keeps it bound for as long as anything uses the tree, and returns it rather
+/// than a [`PathBuf`] from a helper that builds one.
+pub struct Scratch {
+    root: PathBuf,
 }
 
-/// [`scratch_dir`] with `dirs` created inside it, all of them.
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for Scratch {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.root.as_os_str()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
+/// Creates a scratch root with `dirs` inside it, all of them.
 ///
-/// The three binaries that drive a shipped script each stand a directory tree up
-/// for it: a stand-in `/etc/volto` for `it_cli`, the four directories a Linux
-/// host already has for `it_deploy`, one configuration directory for
-/// `it_installer`. Which directories differ, and so does whether a certificate
-/// pair is planted afterwards, which each caller still does itself; creating
-/// them is the shared half.
-///
-/// An empty `dirs` creates the scratch directory and nothing under it, which
-/// [`scratch_dir`] on its own deliberately does not do.
-pub fn scratch_tree(tag: &str, name: &str, dirs: &[&str]) -> PathBuf {
-    let root = scratch_dir(tag, name);
+/// The root is `volto-{tag}-{pid}-{name}` under the system temp directory.
+/// The pid keeps two `cargo test` runs at once apart. A tree already there is
+/// removed first, so a file a failed run left behind cannot make this one pass.
+pub fn scratch_tree(tag: &str, name: &str, dirs: &[&str]) -> Scratch {
+    let root = std::env::temp_dir().join(format!("volto-{tag}-{}-{name}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("the temporary root must be creatable");
     for dir in dirs {
         fs::create_dir_all(root.join(dir)).expect("the temporary root must be creatable");
     }
-    root
+    Scratch { root }
 }
 
 /// Writes `text` to `path` with mode 0755.
