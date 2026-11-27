@@ -785,7 +785,7 @@ pub enum Offer {
 }
 
 /// The rustls `EchMode` for `offer`, or none.
-pub fn ech_mode(offer: &Offer) -> Option<EchMode> {
+fn ech_mode(offer: &Offer) -> Option<EchMode> {
     match offer {
         Offer::Plain => None,
         Offer::Ech(list) => Some(EchMode::from(

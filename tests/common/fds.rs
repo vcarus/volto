@@ -25,7 +25,7 @@ use std::time::Duration;
 /// where it is judged; anywhere else it returns `None` and the caller says so
 /// rather than passing quietly. Reading it needs a descriptor of its own, so it
 /// is only ever called with the budget intact.
-pub fn open_fds() -> Option<usize> {
+fn open_fds() -> Option<usize> {
     let listing = if cfg!(target_os = "macos") {
         "/dev/fd"
     } else {
