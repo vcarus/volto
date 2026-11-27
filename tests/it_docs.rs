@@ -640,7 +640,10 @@ fn crate_constants() -> BTreeMap<&'static str, (u64, Dimension)> {
             "HOLD_TOTAL_BYTES",
             (volto::gate::HOLD_TOTAL_BYTES as u64, Dimension::Bytes),
         ),
-        ("MIN_CONNECT_SHARE", millis(volto::tunnel::MIN_CONNECT_SHARE)),
+        (
+            "MIN_CONNECT_SHARE",
+            millis(volto::tunnel::MIN_CONNECT_SHARE),
+        ),
         (
             "CLOSE_FLUSH_TIMEOUT",
             millis(volto::shutdown::CLOSE_FLUSH_TIMEOUT),
