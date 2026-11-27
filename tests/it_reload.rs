@@ -549,6 +549,15 @@ async fn a_broken_configuration_changes_nothing() {
             Status::OK,
             "after a failed reload ({label}), the running configuration must survive"
         );
+        // And a wrong one is still refused: several of these files have no
+        // `[auth]`, which applied alone would leave an open proxy.
+        assert_eq!(
+            connect_as(&mut client, &target.to_string(), "user1", "wrong")
+                .await
+                .status,
+            Status::PROXY_AUTHENTICATION_REQUIRED,
+            "after a failed reload ({label}), a wrong credential must still be refused"
+        );
     }
 
     // A good reload still works after all those failures.
