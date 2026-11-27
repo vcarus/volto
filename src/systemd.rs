@@ -319,18 +319,34 @@ mod tests {
     /// What [`heartbeat`] is expected to answer, with the error's text left out.
     type Expected = Result<Option<Duration>, ()>;
 
-    /// A directory of the test's own, short enough for a socket path.
+    /// A directory of the test's own, short enough for a socket path, removed
+    /// with the socket in it when this is dropped.
     ///
     /// `sun_path` holds 104 bytes on macOS and 108 on Linux, and the temporary
     /// directory on macOS is already about 50 of them.
-    fn socket_dir(name: &str) -> PathBuf {
-        static MADE: AtomicU64 = AtomicU64::new(0);
-        let serial = MADE.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("volto-sd-{}-{serial}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create the socket directory");
-        dir
+    struct SocketDir(PathBuf);
+
+    impl SocketDir {
+        fn new(name: &str) -> Self {
+            static MADE: AtomicU64 = AtomicU64::new(0);
+            let serial = MADE.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("volto-sd-{}-{serial}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create the socket directory");
+            Self(dir)
+        }
+
+        /// The socket's path in the directory.
+        fn socket(&self) -> PathBuf {
+            self.0.join("notify")
+        }
+    }
+
+    impl Drop for SocketDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// The environment of a unit whose notification socket is `path`.
@@ -435,7 +451,8 @@ mod tests {
 
     #[test]
     fn readiness_reaches_a_socket_file_as_one_datagram() {
-        let path = socket_dir("ready").join("notify");
+        let dir = SocketDir::new("ready");
+        let path = dir.socket();
         let receiver = UnixDatagram::bind(&path).expect("bind the receiver");
         let notifier = Notifier::connect(&notifying_to(&path)).expect("the socket is reachable");
         notifier.ready();
@@ -467,7 +484,8 @@ mod tests {
     /// `tests/it_cli.rs`.
     #[test]
     fn a_socket_nobody_listens_on_turns_notifications_off() {
-        let path = socket_dir("absent").join("notify");
+        let dir = SocketDir::new("absent");
+        let path = dir.socket();
         assert!(Notifier::connect(&notifying_to(&path)).is_none());
     }
 
@@ -500,6 +518,8 @@ mod tests {
     /// The datagrams that reach a socket file, each with the moment the
     /// receiving thread read it.
     struct Arrivals {
+        /// Held so the directory goes when the arrivals do.
+        _dir: SocketDir,
         path: PathBuf,
         seen: Arc<Mutex<Vec<Arrival>>>,
         stop: Arc<AtomicBool>,
@@ -510,7 +530,8 @@ mod tests {
         /// Binds a receiving socket in a directory of its own and starts
         /// reading it.
         fn listen(name: &str) -> Self {
-            let path = socket_dir(name).join("notify");
+            let dir = SocketDir::new(name);
+            let path = dir.socket();
             let socket = UnixDatagram::bind(&path).expect("bind the receiver");
             socket
                 .set_read_timeout(Some(Duration::from_millis(10)))
@@ -532,6 +553,7 @@ mod tests {
                 }
             });
             Self {
+                _dir: dir,
                 path,
                 seen,
                 stop,
