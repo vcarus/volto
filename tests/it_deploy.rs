@@ -1355,47 +1355,16 @@ fn an_archive_that_does_not_match_its_signed_digest_is_refused() {
     );
 }
 
-/// The key the install path trusts comes from the script. `VOLTO_DEPLOY_SIGNER`
-/// names the key that really signed this release, and the release is refused
-/// all the same, because `verify_release` does not read the variable.
+/// The script sets the trusted key once, to a literal, and takes its own
+/// replacement from a release only under a verified signature.
+///
+/// These are text checks because no run can reach them: a literal key is
+/// tested only by a signature that the release key made, which a test cannot
+/// make, and the replacement is taken only from a release signed by that key.
+/// What a run can show is in
+/// `the_install_path_trusts_only_its_own_key_and_verifies_before_it_unpacks`.
 #[test]
-fn the_install_path_ignores_a_key_named_in_the_environment() {
-    let download = download(
-        "verify-environment",
-        |digest| format!("{digest}  {ARCHIVE}.tar.gz\n"),
-        Some("stranger"),
-    );
-    let stranger = fs::read_to_string(download.dir.join("stranger.pub")).unwrap();
-    let stranger: Vec<&str> = stranger.split_whitespace().take(2).collect();
-
-    let signature_is_valid = shell_function_body("script/deploy.sh", "signature_is_valid");
-    let prelude = format!(
-        "{signature_is_valid}\n}}\n\
-         export VOLTO_DEPLOY_SIGNER='{}'\n\
-         RELEASE_SIGNER='{}'\nSIGN_NAMESPACE={SIGN_NAMESPACE}\n\
-         TMP='{}'\nNAME={ARCHIVE}\nTAG=v9.9.9\nALLOW_UNSIGNED=0\nRELEASE_IS_SIGNED=0",
-        stranger.join(" "),
-        download.trusted,
-        download.dir.display(),
-    );
-    let output = run_shell_function(
-        "script/deploy.sh",
-        "verify_release",
-        &download.dir.join("stubs"),
-        &prelude,
-    );
-
-    assert!(
-        !output.status.success(),
-        "the install path accepted a release signed by the key in VOLTO_DEPLOY_SIGNER"
-    );
-}
-
-/// The script itself sets the trusted key once, to a literal, and reads the
-/// override variable in the verify-only mode alone. The install path is one
-/// call of `verify_release`, which the tests above run.
-#[test]
-fn the_trusted_key_is_a_literal_and_the_install_path_is_one_call() {
+fn the_trusted_key_is_a_literal_and_only_a_signed_release_replaces_the_script() {
     let text = fs::read_to_string(deploy_script()).expect("the deploy script must be readable");
     let code: Vec<&str> = text
         .lines()
@@ -1416,40 +1385,6 @@ fn the_trusted_key_is_a_literal_and_the_install_path_is_one_call() {
         assignments[0].starts_with("RELEASE_SIGNER='ssh-ed25519 ") && !assignments[0].contains('$'),
         "RELEASE_SIGNER is a literal key, not an expansion: {}",
         assignments[0]
-    );
-
-    let reads: Vec<&&str> = code
-        .iter()
-        .filter(|line| line.contains("VOLTO_DEPLOY_SIGNER"))
-        .collect();
-    assert_eq!(
-        reads.len(),
-        1,
-        "VOLTO_DEPLOY_SIGNER is read in one place, the verify-only mode: {reads:?}"
-    );
-    assert!(
-        reads[0].contains("\"$VERIFY_SUMS\""),
-        "the one read of VOLTO_DEPLOY_SIGNER is the verify-only call: {}",
-        reads[0]
-    );
-
-    assert_eq!(
-        code.iter()
-            .filter(|line| **line == "verify_release")
-            .count(),
-        1,
-        "the install path verifies the download with one call of verify_release"
-    );
-    let call = text.find("\n    verify_release\n").expect("the call");
-    let unpack = text.find("tar -xzf").expect("the unpack step");
-    assert!(
-        call < unpack,
-        "verify_release must run before the archive is unpacked"
-    );
-    assert_eq!(
-        text.matches("tar -xzf").count(),
-        1,
-        "the archive is unpacked in one place"
     );
 
     // The installed copy of the script is replaced from the release in one
@@ -1939,6 +1874,32 @@ impl Host {
         binary
     }
 
+    /// Signs the published `SHA256SUMS` of `tag` with a key made for this host,
+    /// and returns that key's public half.
+    fn sign_release(&self, tag: &str) -> String {
+        let signer = generate_key(&self.logs, "test-signer");
+        sign(
+            &self.logs,
+            "test-signer",
+            SIGN_NAMESPACE,
+            &self.release.join(tag).join("SHA256SUMS"),
+        );
+        signer
+    }
+
+    /// Replaces `tar` with a stand-in that records its arguments in
+    /// `logs/tar` and runs the host's own.
+    fn record_tar(&self) {
+        write_executable(
+            &self.stubs.join("tar"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+                self.logs.join("tar").display(),
+                real_tool("tar").display()
+            ),
+        );
+    }
+
     /// Makes the latest-release lookup answer `tag`.
     fn mark_latest(&self, tag: &str) {
         fs::write(
@@ -2158,6 +2119,57 @@ fn an_unsigned_release_does_not_replace_the_installed_script() {
         calls.starts_with("daemon-reload\nrestart volto\nis-active --quiet volto\n")
             && calls.contains("enable --now volto-deploy.timer\n"),
         "systemctl must see the update and the timer: {calls}"
+    );
+}
+
+/// The install path trusts the key the script carries, and verifies the
+/// download before it unpacks it.
+///
+/// `VOLTO_DEPLOY_SIGNER` names the key that really signed this release, and the
+/// run is refused all the same: the variable replaces the key for
+/// `--verify-signature` alone. A release whose archive does not match its
+/// listed digest is refused too. In neither run is the archive unpacked.
+#[test]
+fn the_install_path_trusts_only_its_own_key_and_verifies_before_it_unpacks() {
+    let host = Host::new("environment-signer", Service::ComesUp);
+    host.plant_install();
+    host.publish("v1.4.0", Candidate::LoadsTheConfig);
+    let signer = host.sign_release("v1.4.0");
+    host.record_tar();
+
+    let output = run_within_deadline(
+        host.command()
+            .args(["--tag", "v1.4.0"])
+            .env("VOLTO_DEPLOY_SIGNER", &signer),
+    );
+
+    let stderr = stderr_of(&output);
+    assert!(
+        !output.status.success()
+            && stderr.contains("SHA256SUMS in v1.4.0 is not signed by the release key"),
+        "the install path must not trust the key in VOLTO_DEPLOY_SIGNER: {stderr}"
+    );
+    assert_eq!(host.calls("tar"), "", "nothing may be unpacked: {stderr}");
+
+    let host = Host::new("wrong-digest", Service::ComesUp);
+    host.plant_install();
+    host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+    let sums = host.release.join(UNSIGNED_TAG).join("SHA256SUMS");
+    let listed = fs::read_to_string(&sums).expect("the published list");
+    fs::write(&sums, format!("{}{}", "0".repeat(64), &listed[64..])).expect("a wrong digest");
+    host.record_tar();
+
+    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+
+    let stderr = stderr_of(&output);
+    assert!(
+        !output.status.success() && stderr.contains("checksum mismatch"),
+        "an archive that does not match its digest must be refused: {stderr}"
+    );
+    assert_eq!(host.calls("tar"), "", "nothing may be unpacked: {stderr}");
+    assert_eq!(
+        fs::read_to_string(host.bin()).ok().as_deref(),
+        Some("#!/bin/sh\necho \"volto 1.3.6\"\n")
     );
 }
 
