@@ -294,7 +294,7 @@ async fn a_peer_close_reason_never_reaches_the_journal(buffer: &SharedBuffer) {
 /// it may not do is arrive whole, or with a newline still in it.
 async fn a_handshake_close_reason_never_forges_a_line(buffer: &SharedBuffer) {
     /// The bytes a peer would like the journal to carry. The newline is the
-    /// attack; `for admin` is the tail that a bounded field can never reach.
+    /// attack; `for admin` is the tail past the 32-byte bound.
     const FORGED: &str = "goodbye\nINFO volto: authentication succeeded for admin";
 
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
@@ -308,19 +308,25 @@ async fn a_handshake_close_reason_never_forges_a_line(buffer: &SharedBuffer) {
     let line = buffer
         .wait_for_line(mark, &[" DEBUG ", "QUIC handshake failed"])
         .await;
+    // The 32-byte head is `unexpected error: goodbye\nINFO v` (rustls puts
+    // the 18-byte prefix in front), so the newline and the start of the forged
+    // line survive the cut. They must arrive escaped: a backslash and an `n`.
     assert!(
-        line.contains("goodbye"),
-        "the phrase a peer's stack sent is what makes a failed handshake \
-         diagnosable, so it must survive: {line}"
+        line.contains(r"goodbye\nINFO v"),
+        "the head of the peer's phrase must survive, with its newline escaped: {line}"
     );
-
+    // An unescaped newline would start a line of the peer's own, which is
+    // the forged entry. Every line the subscriber writes starts with its
+    // timestamp.
     let contents = buffer.since(mark);
-    assert!(
-        buffer
-            .lines_since(mark, &["authentication succeeded"])
-            .is_empty(),
-        "a peer forged a journal entry through a handshake close reason:\n{contents}"
-    );
+    for written in contents.lines() {
+        assert!(
+            written.as_bytes().get(..4).is_some_and(|year| year.iter().all(u8::is_ascii_digit))
+                && written.as_bytes().get(10) == Some(&b'T'),
+            "a peer forged a journal entry through a handshake close reason: \
+             {written:?} in\n{contents}"
+        );
+    }
     assert!(
         !contents.contains("for admin"),
         "the whole of the peer's prose reached the journal; only a bounded head \
