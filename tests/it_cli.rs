@@ -1376,7 +1376,7 @@ fn the_check_refuses_require_ech_without_an_ech_key() {
 /// protocol are removed before `env` is set, so the run depends on none of
 /// the test runner's own.
 struct Serving {
-    child: std::process::Child,
+    child: Reaped,
     lines: std::sync::mpsc::Receiver<String>,
     seen: Vec<String>,
     addr: std::net::SocketAddr,
@@ -1384,10 +1384,17 @@ struct Serving {
 }
 
 impl Serving {
-    /// Starts the binary on a configuration written into `dir`.
-    fn start(dir: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Self {
-        use std::io::{BufRead, BufReader};
-
+    /// Starts the binary on a configuration written into `dir`, with both of
+    /// its output streams piped and nothing reading them yet. Returns the
+    /// child, the address it listens on and its certificate.
+    fn spawn(
+        dir: &Path,
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> (
+        Reaped,
+        std::net::SocketAddr,
+        rustls::pki_types::CertificateDer<'static>,
+    ) {
         let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .expect("a self-signed certificate must be generated");
         let cert = dir.join("cert.pem");
@@ -1406,7 +1413,7 @@ impl Serving {
             &loadable_config_text(&cert, &key, &addr.to_string(), SECRET, ""),
         );
 
-        let mut child = Command::new(real_binary())
+        let child = Command::new(real_binary())
             .args(["--config", path.to_str().unwrap()])
             .env_remove("JOURNAL_STREAM")
             .env_remove("RUST_LOG")
@@ -1421,9 +1428,16 @@ impl Serving {
             .stderr(Stdio::piped())
             .spawn()
             .expect("the volto binary must be runnable");
+        (Reaped(child), addr, issued.cert.der().clone())
+    }
 
+    /// Starts the binary as [`Self::spawn`] does and reads its stdout.
+    fn start(dir: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Self {
+        use std::io::{BufRead, BufReader};
+
+        let (mut child, addr, ca) = Self::spawn(dir, env);
         let (sender, lines) = std::sync::mpsc::channel();
-        let stdout = child.stdout.take().expect("stdout is piped");
+        let stdout = child.0.stdout.take().expect("stdout is piped");
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
@@ -1438,7 +1452,7 @@ impl Serving {
             lines,
             seen: Vec::new(),
             addr,
-            ca: issued.cert.der().clone(),
+            ca,
         }
     }
 
@@ -1448,7 +1462,7 @@ impl Serving {
     fn wait_for(&mut self, needle: &str) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if let Some(status) = self.child.try_wait().expect("the child must be waitable") {
+            if let Some(status) = self.child.0.try_wait().expect("the child must be waitable") {
                 panic!(
                     "volto exited with {status} while waiting for {needle:?}; stdout so far:\n{}",
                     self.seen.join("\n")
@@ -1474,16 +1488,90 @@ impl Serving {
     fn stop(mut self) -> (std::process::ExitStatus, Vec<String>, String) {
         use rustix::process::{Pid, Signal, kill_process};
 
-        kill_process(Pid::from_child(&self.child), Signal::TERM)
+        kill_process(Pid::from_child(&self.child.0), Signal::TERM)
             .expect("SIGTERM must be deliverable");
-        let output = self
-            .child
-            .wait_with_output()
-            .expect("the child's output must be readable");
+        // Read to the pipe's end, which the exit closes, before the wait, so
+        // that a child with a full pipe is not waited for while it waits.
+        let mut stderr = Vec::new();
+        if let Some(mut pipe) = self.child.0.stderr.take() {
+            use std::io::Read as _;
+            pipe.read_to_end(&mut stderr)
+                .expect("the child's stderr must be readable");
+        }
+        let status = self.child.0.wait().expect("the child must be waitable");
         // The reader thread ends at the pipe's end, which the exit closes.
         self.seen.extend(self.lines.iter());
-        (output.status, self.seen, stderr_of(&output))
+        (
+            status,
+            self.seen,
+            String::from_utf8_lossy(&stderr).into_owned(),
+        )
     }
+}
+
+/// A child that is killed and reaped when this is dropped, so that a test
+/// which fails before it stops its server leaves no process behind.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A server that can write neither its log nor a complaint about it still
+/// starts, and still stops on `SIGTERM`.
+///
+/// The test closes the reading ends of the server's stdout and stderr, so every
+/// write to either fails with a broken pipe. tracing-subscriber's default is to
+/// report a log line it could not write with `eprintln!`, and `eprintln!`
+/// panics when stderr cannot be written. The panic ended whichever task had
+/// logged. For the main future that was the process, at its first line. For the
+/// signal watcher it came before the shutdown trigger was fired, so a server
+/// whose pipes broke later ran on after `SIGTERM`. `READY=1` on a notification
+/// socket is how the test knows the server is up without reading its output.
+#[test]
+fn a_server_that_cannot_write_its_log_still_starts_and_stops() {
+    use std::os::unix::net::UnixDatagram;
+
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let dir = scratch_tree("cli", "log-closed", &[]);
+    let socket = dir.join("notify");
+    let receiver = UnixDatagram::bind(&socket).expect("the notification socket must bind");
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("a read timeout");
+    let (mut child, _addr, _ca) = Serving::spawn(&dir, &[("NOTIFY_SOCKET", socket.as_os_str())]);
+    drop(child.0.stdout.take());
+    drop(child.0.stderr.take());
+
+    let mut buf = [0u8; 64];
+    let len = receiver
+        .recv(&mut buf)
+        .expect("READY=1 must arrive within 20 s from a server that cannot write its log");
+    assert_eq!(&buf[..len], b"READY=1");
+    // Long enough for the accept loop to have written its startup line, which
+    // is the first write after `READY=1` that has to fail without a panic.
+    std::thread::sleep(Duration::from_millis(300));
+
+    kill_process(Pid::from_child(&child.0), Signal::TERM).expect("SIGTERM must be deliverable");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("the child must be waitable") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server was still running 20 s after SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        status.success(),
+        "the server must stop cleanly on SIGTERM: {status}"
+    );
 }
 
 /// Under `Type=notify` the server says `READY=1` once its listener is bound,
