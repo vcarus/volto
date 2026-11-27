@@ -293,10 +293,8 @@ impl Server {
     /// The `server.shutdown_grace` in force now, which a reload may have moved.
     ///
     /// Read from the live configuration rather than from a copy taken at bind,
-    /// because `server.shutdown_grace` is a reloadable key and both readers have
-    /// to see the same value: `Server::drain` bounds the drain with it, and
-    /// `main` bounds the blocking pool with it after the runtime has stopped.
-    /// [`crate::shutdown::blocking_grace`] states that as an invariant.
+    /// because `server.shutdown_grace` is a reloadable key: `Server::drain`
+    /// bounds the drain with the value in force when the drain starts.
     pub fn shutdown_grace(&self) -> Duration {
         self.config().server.shutdown_grace()
     }
@@ -1275,10 +1273,9 @@ pub(crate) mod tests {
 
     /// The grace a reload raises is the grace the exit bound gets.
     ///
-    /// `Server::drain` and `main` both ask for it, and `shutdown::blocking_grace`
-    /// states that the blocking pool gets the whole allowance the connections
-    /// got. That is only true while both read the live configuration, so that a
-    /// `SIGHUP` raising the key raises the exit bound as well as the drain.
+    /// `Server::drain` asks for it, so a `SIGHUP` raising the key raises the
+    /// drain, and with it the exit bound, only while the read is of the live
+    /// configuration.
     #[tokio::test]
     async fn a_reload_moves_the_grace_the_exit_is_bounded_by() {
         let bound = bound_server("");

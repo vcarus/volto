@@ -801,17 +801,16 @@ a few seconds of failed requests at each restart.
 
 The tunnels get one grace period. After it, the endpoint gets
 `CLOSE_FLUSH_TIMEOUT` (1 s) to flush its CLOSE, and then a name lookup still
-running on the blocking pool gets up to `shutdown_grace + CLOSE_FLUSH_TIMEOUT +
-EXIT_SLACK` more, because `getaddrinfo` cannot be cancelled. That second wait
-happens only while a lookup is still running. So the exit takes at most
-`2 * shutdown_grace + 2 * CLOSE_FLUSH_TIMEOUT + EXIT_SLACK`, which is
-`2 * shutdown_grace + 3` seconds at the shipped constants. The bound is not
-the tunnels' allowance: with `shutdown_grace = 20` the tunnels are closed at
-20 s. Set systemd's `TimeoutStopSec` above the whole bound, not above the grace
-period alone: the shipped unit uses 45, which covers the 13 seconds the default
-grace of 5 can take. An hour is the most that can be configured, because a drain
+running on the blocking pool gets `EXIT_SLACK` (1 s) more, because
+`getaddrinfo` cannot be cancelled. Past that the process exits with the lookup
+still running; nothing is left to read its answer. So the exit takes at most
+`shutdown_grace + CLOSE_FLUSH_TIMEOUT + EXIT_SLACK`, which is
+`shutdown_grace + 2` seconds at the shipped constants. Set systemd's
+`TimeoutStopSec` above that bound, not above the grace period alone: the
+shipped unit uses 45, which covers the 7 seconds the default grace of 5 can
+take. An hour is the most that can be configured, because a drain
 longer than that has outlived any service manager's patience and would only
-replace the graceful ending with a SIGKILL. At that ceiling the bound is 7203
+replace the graceful ending with a SIGKILL. At that ceiling the bound is 3602
 seconds, so `TimeoutStopSec` has to be raised past 45 as well, or systemd sends
 SIGKILL mid-drain. `shutdown_grace = 0` closes every tunnel at once.
 

@@ -29,7 +29,7 @@ key = "/etc/volto/privkey.pem"
 
 # Seconds to let established tunnels finish after SIGTERM before closing anyway.
 # Surge keeps using a connection after GOAWAY, so its new requests fail for this
-# long at every restart. The exit can take up to 2 * shutdown_grace + 3 seconds,
+# long at every restart. The exit can take up to shutdown_grace + 2 seconds,
 # so keep systemd's TimeoutStopSec above that bound, not above this value alone.
 # docs/deployment.md#graceful-shutdown
 # Range: 0..3600, where 0 closes every tunnel at once.

@@ -635,9 +635,9 @@ async fn a_peer_that_will_not_take_a_goaway_does_not_hold_up_shutdown() {
 /// resolver's to decide and differs between macOS and Linux, while what is under
 /// test is the wait, not the resolver.
 ///
-/// The grace period is zero so the whole bound is the endpoint's close flush
-/// plus `volto::shutdown::EXIT_SLACK`, which keeps the test's own wall time to a
-/// couple of seconds.
+/// The wait measured is the one after the server has stopped, which is
+/// `volto::shutdown::EXIT_SLACK` whatever the grace period. The grace period is
+/// zero so the drain before it is short.
 #[test]
 fn a_parked_name_lookup_does_not_hold_the_exit_past_the_bound() {
     /// How long the stand-in for `getaddrinfo` stays on its thread.
@@ -645,8 +645,7 @@ fn a_parked_name_lookup_does_not_hold_the_exit_past_the_bound() {
     /// Scheduling margin on top of the bound, for a loaded test machine.
     const MARGIN: Duration = Duration::from_secs(5);
 
-    let grace = Duration::ZERO;
-    let bound = volto::shutdown::blocking_grace(grace);
+    let bound = volto::shutdown::EXIT_SLACK;
     assert!(
         bound + MARGIN < PARKED,
         "the bound plus its margin must be well under the parked task, or this \
@@ -682,7 +681,7 @@ fn a_parked_name_lookup_does_not_hold_the_exit_past_the_bound() {
     });
 
     let began = std::time::Instant::now();
-    volto::shutdown::stop_runtime(runtime, grace);
+    volto::shutdown::stop_runtime(runtime);
     let waited = began.elapsed();
 
     assert!(

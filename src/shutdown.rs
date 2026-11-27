@@ -11,7 +11,7 @@
 //! 3. wait for the tunnels to end on their own, up to `server.shutdown_grace`;
 //! 4. close the endpoint regardless, so a stuck tunnel cannot hold the process
 //!    open forever;
-//! 5. stop the runtime, waiting no longer than [`blocking_grace`] for the
+//! 5. stop the runtime, waiting no longer than [`EXIT_SLACK`] for the
 //!    blocking tasks that are still running.
 //!
 //! This module is mostly the signal: a one-way latch that many tasks can wait on
@@ -24,7 +24,8 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-/// The margin [`blocking_grace`] adds on top of the shutdown budget.
+/// How long [`stop_runtime`] waits for the blocking tasks once the server has
+/// stopped.
 ///
 /// A fixed second rather than a fraction of the grace period, because what it
 /// covers is fixed work: the scheduling between the accept loop returning and
@@ -38,8 +39,8 @@ pub const EXIT_SLACK: Duration = Duration::from_secs(1);
 const _: () = assert!(!EXIT_SLACK.is_zero());
 
 /// How long the endpoint waits for its `CONNECTION_CLOSE` frames to be flushed
-/// at step 4. [`blocking_grace`] adds it to the grace period: the two together
-/// are the whole of what the async side of the shutdown may spend.
+/// at step 4. With the grace period before it and [`EXIT_SLACK`] after it, this
+/// makes the exit bound: `shutdown_grace + CLOSE_FLUSH_TIMEOUT + EXIT_SLACK`.
 pub(crate) const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 // Added to a grace period an operator may set to zero, and the drain that
@@ -48,37 +49,24 @@ pub(crate) const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 // on the wire.
 const _: () = assert!(!CLOSE_FLUSH_TIMEOUT.is_zero());
 
-/// How long the blocking pool gets once the runtime's own work is over.
-///
-/// `server.shutdown_grace` plus the endpoint's close flush plus [`EXIT_SLACK`],
-/// so the allowance a blocking task gets is the whole allowance the connections
-/// get and no less. Raising the grace raises both halves, which is what an
-/// operator setting that key expects.
-///
-/// The number matters because the thing being waited for cannot be cancelled.
-/// Name resolution runs `getaddrinfo` on the blocking pool and stays there until
-/// the stub resolver gives up, tens of seconds on a black-holed nameserver, and
-/// the client picks the name (D90). Without a bound the process exits one
-/// resolver timeout after the grace period rather than one grace period after
-/// the signal, and `script/masque.service` turns that into a SIGKILL at
-/// `TimeoutStopSec`.
-pub fn blocking_grace(grace: Duration) -> Duration {
-    grace
-        .saturating_add(CLOSE_FLUSH_TIMEOUT)
-        .saturating_add(EXIT_SLACK)
-}
-
-/// Stops `runtime`, waiting at most [`blocking_grace`] for its blocking tasks.
+/// Stops `runtime`, waiting at most [`EXIT_SLACK`] for its blocking tasks.
 ///
 /// The replacement for dropping the runtime, which tokio documents as blocking
-/// indefinitely for blocking tasks that have started. What this buys is a
-/// bounded exit; what it costs is that a thread still inside the resolver is
-/// left running, and the process exits with it. That is sound because the thread
-/// owns nothing the exit needs: its permit is server state that dies with the
-/// process, and its answer is for a request that was abandoned when
-/// `connect_timeout` expired.
-pub fn stop_runtime(runtime: tokio::runtime::Runtime, grace: Duration) {
-    runtime.shutdown_timeout(blocking_grace(grace));
+/// indefinitely for blocking tasks that have started. Name resolution runs
+/// `getaddrinfo` on the blocking pool and stays there until the stub resolver
+/// gives up, tens of seconds on a black-holed nameserver, and the client picks
+/// the name (D90).
+///
+/// The wait is the slack alone because nothing can read a blocking task's
+/// result once `Server::run` has returned. The endpoint is closed by the drain,
+/// or was lost, and the connection tasks that awaited a lookup were aborted
+/// when `run` dropped their `JoinSet`. The pool's other user, the `SIGHUP`
+/// reload, reads files into a configuration nothing serves from any more. A
+/// thread still inside the resolver is left running and the
+/// process exits with it: its permit is server state that dies with the
+/// process, and its answer is for a request that no longer exists.
+pub fn stop_runtime(runtime: tokio::runtime::Runtime) {
+    runtime.shutdown_timeout(EXIT_SLACK);
 }
 
 /// Fires the shutdown signal. Cheap to clone; any clone can fire it.
@@ -209,33 +197,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The blocking pool's allowance is the whole of the async side's, so an
-    /// operator who raises `server.shutdown_grace` raises both halves.
-    #[test]
-    fn the_blocking_grace_covers_the_whole_shutdown_budget() {
-        // 3600 is `MAX_SHUTDOWN_GRACE`, the largest `Config::validate` accepts.
-        for seconds in [0, 5, 60, 3600] {
-            let grace = Duration::from_secs(seconds);
-            assert_eq!(
-                blocking_grace(grace),
-                grace + CLOSE_FLUSH_TIMEOUT + EXIT_SLACK,
-                "the allowance for a grace of {seconds}s must cover the drain, the \
-                 close flush and the slack"
-            );
-            assert!(
-                blocking_grace(grace) > grace,
-                "the allowance must be strictly longer than the drain it follows"
-            );
-        }
-    }
-
-    /// The largest configurable grace period is still an arithmetic that cannot
-    /// wrap, which is what makes the bound a bound.
-    #[test]
-    fn the_blocking_grace_cannot_overflow() {
-        assert!(blocking_grace(Duration::MAX) >= Duration::MAX - EXIT_SLACK);
-    }
-
     /// The whole-number value `script/masque.service` sets for `directive`.
     pub(crate) fn shipped_unit_value(directive: &str) -> u64 {
         let text = std::fs::read_to_string(concat!(
@@ -257,19 +218,19 @@ pub(crate) mod tests {
     /// SIGKILL.
     ///
     /// At the default grace, the exit is the drain (`shutdown_grace`), the close
-    /// flush (`CLOSE_FLUSH_TIMEOUT`) and then [`blocking_grace`] for a lookup
-    /// still running on the blocking pool. `TimeoutStopSec` has to be above that
-    /// sum, not above the grace alone.
+    /// flush (`CLOSE_FLUSH_TIMEOUT`) and then [`EXIT_SLACK`] for a lookup still
+    /// running on the blocking pool. `TimeoutStopSec` has to be above that sum,
+    /// not above the grace alone.
     #[test]
     fn the_shipped_unit_waits_out_the_longest_exit() {
         let grace = Duration::from_secs(crate::config::DEFAULT_SHUTDOWN_GRACE);
-        let exit = grace + CLOSE_FLUSH_TIMEOUT + blocking_grace(grace);
+        let exit = grace + CLOSE_FLUSH_TIMEOUT + EXIT_SLACK;
         let timeout = shipped_unit_value("TimeoutStopSec");
         assert!(
             Duration::from_secs(timeout) > exit,
             "script/masque.service sets TimeoutStopSec={timeout}, which is not above \
              the {}s the exit may take at the default shutdown_grace of {}s \
-             (2 * shutdown_grace + 2 * CLOSE_FLUSH_TIMEOUT + EXIT_SLACK)",
+             (shutdown_grace + CLOSE_FLUSH_TIMEOUT + EXIT_SLACK)",
             exit.as_secs(),
             grace.as_secs()
         );

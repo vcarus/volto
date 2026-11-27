@@ -11,7 +11,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -214,23 +213,14 @@ fn start() -> Result<()> {
         .build()
         .context("failed to build the async runtime")?;
 
-    // Only the fallback. `run` returns the grace that was in force when the
-    // server stopped, which a `SIGHUP` may have raised since startup. It fails
-    // before the server exists, where the file this process started on is the
-    // right answer, or when the endpoint was lost. No drain ran then, so the
-    // connections were given no grace at all, and the startup value is at least
-    // what the blocking pool is owed.
-    let startup_grace = config.server.shutdown_grace();
-
     let served = runtime.block_on(run(path, config));
-    let grace = served.as_ref().copied().unwrap_or(startup_grace);
 
     // Deliberately not an implicit drop: tokio's `Runtime::drop` waits without
     // limit for blocking tasks that have started, and a name lookup is one of
-    // those (D90). `volto::shutdown::blocking_grace` gives the bound and why.
-    volto::shutdown::stop_runtime(runtime, grace);
+    // those (D90). `volto::shutdown::stop_runtime` gives the bound and why.
+    volto::shutdown::stop_runtime(runtime);
 
-    served.map(|_| ())
+    served
 }
 
 /// Runs one of the ECH subcommands.
@@ -541,12 +531,9 @@ fn uname() -> String {
 
 /// Everything that needs a runtime, which is everything after the configuration.
 ///
-/// Returns `server.shutdown_grace` as it stood when the server stopped, which is
-/// what bounds the blocking pool once the runtime's own work is over. A reload
-/// can move that key, and `Server::drain` reads the same live value, which is
-/// the invariant [`volto::shutdown::blocking_grace`] states. Returns an error
-/// when the endpoint stopped without a shutdown; see [`served`].
-async fn run(path: PathBuf, config: Config) -> Result<Duration> {
+/// Returns an error when the endpoint stopped without a shutdown; see
+/// [`served`].
+async fn run(path: PathBuf, config: Config) -> Result<()> {
     // First, and synchronously: a signal stream records a signal from the
     // moment it is created, and until then `SIGHUP` and `SIGTERM` keep their
     // default action, which ends the process. A stream created inside a spawned
@@ -618,25 +605,20 @@ async fn run(path: PathBuf, config: Config) -> Result<Duration> {
     // in a task of its own: `with_keep_alive` says why that is the design.
     let stopped = volto::systemd::with_keep_alive(notifier.as_ref(), server.run()).await;
 
-    // After the drain, so a reload that arrived during the process's life is in
-    // it.
-    let grace = server.shutdown_grace();
-
-    served(stopped, grace)
+    served(stopped)
 }
 
-/// What [`run`] returns for the way the accept loop ended, with `grace` the
-/// grace in force at that moment.
+/// What [`run`] returns for the way the accept loop ended.
 ///
 /// A shutdown is the clean stop. A lost endpoint is an error, which [`main`]
 /// turns into the non-zero exit status a failed start already has, so that
 /// `Restart=on-failure` starts the service again. With status 0 systemd would
 /// count it as a clean exit and leave the service down (D124).
-fn served(stopped: Stopped, grace: Duration) -> Result<Duration> {
+fn served(stopped: Stopped) -> Result<()> {
     match stopped {
         Stopped::Shutdown => {
             info!(log_id = "fle471bm", "volto stopped");
-            Ok(grace)
+            Ok(())
         }
         Stopped::EndpointLost => {
             error!(
@@ -1059,6 +1041,7 @@ where
 mod tests {
     use std::assert_matches;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use tracing_subscriber::Registry;
     use tracing_subscriber::fmt::MakeWriter;
@@ -1172,13 +1155,8 @@ mod tests {
     /// with status 0.
     #[test]
     fn a_lost_endpoint_is_an_error_and_a_shutdown_is_not() {
-        let grace = Duration::from_secs(7);
-        assert_eq!(
-            served(Stopped::Shutdown, grace).expect("a shutdown is a clean stop"),
-            grace,
-            "a shutdown hands on the grace in force"
-        );
-        let error = served(Stopped::EndpointLost, grace)
+        served(Stopped::Shutdown).expect("a shutdown is a clean stop");
+        let error = served(Stopped::EndpointLost)
             .expect_err("a lost endpoint must end the process with an error");
         assert!(
             format!("{error:#}").contains("without a shutdown"),
