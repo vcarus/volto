@@ -92,9 +92,9 @@ use std::time::{Duration, Instant};
 use bytes::BytesMut;
 use common::rawstream::{
     DENIED_TARGET, FRAME_CANCEL_PUSH, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_MAX_PUSH_ID,
-    FRAME_PUSH_PROMISE, FRAME_SETTINGS, H3_CLOSED_CRITICAL_STREAM, H3_EXCESSIVE_LOAD,
+    FRAME_PUSH_PROMISE, FRAME_SETTINGS, FULL_SIZED_FRAMES_THAT_FIT, H3_CLOSED_CRITICAL_STREAM, H3_EXCESSIVE_LOAD,
     H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_MISSING_SETTINGS, H3_NO_ERROR, H3_REQUEST_CANCELLED,
-    H3_STREAM_CREATION_ERROR, SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL, STREAM_PUSH,
+    H3_STREAM_CREATION_ERROR, RESERVED_HTTP2_TYPES, SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL, STREAM_PUSH,
     STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER, announce_full_sized_headers, application_close,
     authenticate, authenticated_connect_headers_frame, close_reason, collect_refusals,
     connect_headers_frame, frame, grease_type, headers_frame, open_uni_stream, read_frame,
@@ -130,10 +130,6 @@ const GREASE: u64 = grease_type(7);
 /// it is a transport parameter: what it means is what the peer is granted, and
 /// that is what the test measures.
 const PEER_UNI_STREAMS: usize = 16;
-
-/// Field sections of the largest advertised size one connection may hold
-/// half-received at once: `HEADERS_BUFFER_BUDGET / MAX_FIELD_SECTION_SIZE`.
-const FULL_SIZED_FRAMES_THAT_FIT: usize = 16;
 
 /// The most reserved or unknown frames one request stream may make the server
 /// skip before its HEADERS (`frame::MAX_SKIPPED_FRAMES` in `src/h3/frame.rs`).
@@ -502,7 +498,7 @@ async fn a_second_qpack_stream_of_either_kind_ends_the_connection() {
 /// decoder that classified them per stream would answer with a reset instead.
 #[tokio::test]
 async fn frame_types_reserved_for_http2_end_the_connection() {
-    for kind in [0x02u64, 0x06, 0x08, 0x09] {
+    for kind in RESERVED_HTTP2_TYPES {
         let server = TestServer::start().await;
         let (_endpoint, connection) = connect_quic(&server).await;
 

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use common::rawstream::{
-    DENIED_TARGET, FRAME_HEADERS, H3_EXCESSIVE_LOAD, H3_REQUEST_CANCELLED,
+    DENIED_TARGET, FRAME_HEADERS, FULL_SIZED_FRAMES_THAT_FIT, H3_EXCESSIVE_LOAD, H3_REQUEST_CANCELLED,
     H3_STREAM_CREATION_ERROR, announce_full_sized_headers, authenticate, close_reason,
     collect_refusals, connect_headers_frame, read_frame, status_of, status_of_response,
     stopped_code,
@@ -919,15 +919,6 @@ async fn a_unidirectional_stream_that_never_names_its_type_is_abandoned() {
     let _tunnel = open_tcp_tunnel(&mut client, &target.to_string()).await;
 }
 
-/// Field sections of the largest advertised size one connection may hold
-/// half-received at once (D77).
-///
-/// The whole of the bound, and written out rather than derived: dividing
-/// `HEADERS_BUFFER_BUDGET` by `MAX_FIELD_SECTION_SIZE` is how the value was
-/// chosen, so a change to either of them belongs in a test that says what the
-/// number became.
-const FULL_SIZED_FRAMES_THAT_FIT: usize = 16;
-
 /// Request streams enough to run one connection past its buffering budget (D77).
 ///
 /// Each of them announces the largest field section the server advertises, which
@@ -963,13 +954,6 @@ async fn headers_buffered_across_a_connection_are_bounded() {
     // door. It costs the budget nothing: the frame it charges is complete
     // before the announcements below start.
     authenticate(&connection, None).await;
-
-    assert_eq!(
-        volto::h3::HEADERS_BUFFER_BUDGET / volto::h3::MAX_FIELD_SECTION_SIZE as usize,
-        FULL_SIZED_FRAMES_THAT_FIT,
-        "the budget is a number of full-sized frames, and the arithmetic below \
-         is written in terms of that number"
-    );
 
     // Every stream is held for the life of the test: a finished or reset one
     // would give its share of the budget back, which is precisely what this must
@@ -1016,7 +1000,7 @@ async fn headers_buffered_across_a_connection_are_bounded() {
 /// full-sized requests genuinely in flight meets is the test below this one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connection_of_complete_requests_never_reaches_the_budget() {
-    let server = TestServer::start_with(ALLOW_PRIVATE).await;
+    let server = TestServer::start().await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
@@ -1070,7 +1054,7 @@ fn full_sized_connect_section(authority: &str) -> BytesMut {
 /// connection — sixteen requests and sixteen tunnels still on it — carries on.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_past_the_buffering_budget_costs_only_that_request() {
-    let server = TestServer::start_with(ALLOW_PRIVATE).await;
+    let server = TestServer::start().await;
     let target = spawn_echo_target().await;
     let (_endpoint, connection) = connect_quic(&server).await;
 
@@ -1200,7 +1184,7 @@ const TINY_FIELDS_PAST_THE_SECTION_SIZE: usize = 2000;
 /// would cost the peer every tunnel on it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_field_section_decoding_past_the_advertised_size_costs_only_that_request() {
-    let server = TestServer::start_with(ALLOW_PRIVATE).await;
+    let server = TestServer::start().await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 

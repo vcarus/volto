@@ -655,3 +655,17 @@ async fn closed(
         other => panic!("at {caller}: expected the server to close, got {other}"),
     }
 }
+
+/// Field sections of the largest advertised size one connection may hold
+/// half-received at once (D77): what [`announce_full_sized_headers`] announces,
+/// counted against the connection's buffering budget.
+///
+/// Written out rather than derived, so a change to the budget or to the field
+/// section limit fails the build here and has to say what the number became.
+pub const FULL_SIZED_FRAMES_THAT_FIT: usize = 16;
+
+const _: () = assert!(
+    volto::h3::HEADERS_BUFFER_BUDGET / volto::h3::MAX_FIELD_SECTION_SIZE as usize
+        == FULL_SIZED_FRAMES_THAT_FIT,
+    "the HEADERS budget is no longer sixteen full-sized field sections"
+);
