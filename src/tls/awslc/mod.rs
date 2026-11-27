@@ -24,13 +24,12 @@
 //!
 //! # Callbacks and the state they share
 //!
-//! libssl calls back into Rust from inside `SSL_do_handshake`,
-//! `SSL_provide_quic_data` and `SSL_process_quic_post_handshake`: the five QUIC
-//! method callbacks, the ALPN and ClientHello callbacks, and the keylog
-//! callback when keylog is on. Those that need per-connection state reach it
-//! through the `SSL`'s ex_data slot, which holds the address of the session's
-//! `Arc<Mutex<Shared>>` allocation. A callback locks that mutex for the length
-//! of its own body; the session locks it only between libssl calls, never
+//! libssl calls back into Rust from inside `SSL_do_handshake` and
+//! `SSL_process_quic_post_handshake`: the five QUIC method callbacks, the ALPN
+//! and ClientHello callbacks, and the keylog callback when keylog is on. Those
+//! that need per-connection state reach it through the `SSL`'s ex_data slot,
+//! which holds the address of the session's `Arc<Mutex<Shared>>`
+//! allocation. A callback locks that mutex for the length of its own body; the session locks it only between libssl calls, never
 //! across one, so the lock is never taken twice on one thread. The two
 //! callbacks that need the configuration (ALPN, ClientHello) receive the
 //! address of the `ServerConfig`'s `Arc<CtxData>` allocation as their `arg`.
@@ -1129,8 +1128,9 @@ impl crypto::Session for Session {
         ffi::clear_errors();
         // SAFETY: `self.ssl` is valid and used by this thread alone (`&mut
         // self`); `buf` is readable for its length and AWS-LC copies it. The
-        // callbacks AWS-LC runs in here lock `shared`, which this function does
-        // not hold.
+        // callbacks run inside `SSL_do_handshake` and
+        // `SSL_process_quic_post_handshake` below and lock `shared`, which
+        // this function does not hold across either call.
         let rc = unsafe {
             sys::SSL_provide_quic_data(self.ssl.as_ptr(), level.to_ffi(), buf.as_ptr(), buf.len())
         };
