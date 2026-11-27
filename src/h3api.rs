@@ -6,11 +6,9 @@
 //! it is short.
 //!
 //! The vocabulary of an HTTP message ([`Request`], [`Status`], [`Fields`]) is
-//! [`crate::h3::message`]'s and is re-exported here rather than wrapped: a
-//! status is a status, and a second type in front of it would say nothing the
-//! first does not. The rule is about *where they are named*: nothing outside
-//! [`crate::h3`] reaches into it, so this module is the one place that has to
-//! be read to know what the rest of the crate may assume about HTTP/3.
+//! [`crate::h3::message`]'s, re-exported unwrapped. Nothing outside
+//! [`crate::h3`] reaches into it, so this module is the whole of what the crate
+//! may assume about HTTP/3.
 //!
 //! Inbound HTTP Datagrams (RFC 9297) are named here too, because the routing
 //! they need is *per request stream*: a datagram carries the Quarter Stream ID
