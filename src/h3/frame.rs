@@ -45,12 +45,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::varint::{TypeLength, len_u64, peek_varint, put_varint, take_from};
 
 use super::error::{Code, StreamError, Violation};
-use super::settings::parse_settings;
-pub(super) use super::settings::settings_payload;
-pub use super::settings::{
-    SETTING_ENABLE_CONNECT_PROTOCOL, SETTING_H3_DATAGRAM, SETTING_MAX_FIELD_SECTION_SIZE,
-    SETTING_QPACK_BLOCKED_STREAMS, SETTING_QPACK_MAX_TABLE_CAPACITY, Settings,
-};
+use super::settings::{Settings, parse_settings};
 use super::{HEADERS_BUFFER_BUDGET, MAX_FIELD_SECTION_SIZE};
 
 mod reader;

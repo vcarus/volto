@@ -602,7 +602,7 @@ mod tests {
     use super::*;
 
     fn settings(datagrams: bool) -> Item {
-        Item::Frame(Frame::Settings(frame::Settings { datagrams }))
+        Item::Frame(Frame::Settings(crate::h3::settings::Settings { datagrams }))
     }
 
     #[test]

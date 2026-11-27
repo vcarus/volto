@@ -821,7 +821,7 @@ fn well_formed_payload(kind: u64) -> BoxedStrategy<Vec<u8>> {
                     seen.push(identifier);
                     // RFC 9297 §2.1.1 restricts this one to 0 or 1; every other
                     // value is either ignored or acted on whatever it says.
-                    let value = if identifier == frame::SETTING_H3_DATAGRAM {
+                    let value = if identifier == volto::h3::settings::SETTING_H3_DATAGRAM {
                         value & 1
                     } else {
                         value

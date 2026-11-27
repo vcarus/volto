@@ -468,7 +468,7 @@ impl Handle {
     async fn open_critical_streams(&self) -> Result<[quinn::SendStream; 3], ConnectionError> {
         // The control stream goes out first, so that a peer reading streams in
         // the order they arrive sees SETTINGS before anything else.
-        let settings = frame::settings_payload();
+        let settings = super::settings::settings_payload();
         let mut preface = BytesMut::with_capacity(settings.len() + 2 * VARINT_MAX_LEN);
         put_varint(&mut preface, STREAM_CONTROL);
         frame::put_header(&mut preface, frame::SETTINGS, len_u64(settings.len()));

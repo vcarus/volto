@@ -71,6 +71,10 @@ use volto::h3::error::Violation;
 use volto::h3::frame::{self, BufferBudget, Frame, FrameReader, Item};
 use volto::h3::message;
 use volto::h3::qpack::{self, Field};
+use volto::h3::settings::{
+    SETTING_ENABLE_CONNECT_PROTOCOL, SETTING_H3_DATAGRAM, SETTING_MAX_FIELD_SECTION_SIZE,
+    SETTING_QPACK_BLOCKED_STREAMS, SETTING_QPACK_MAX_TABLE_CAPACITY,
+};
 use volto::h3::varint;
 use volto::h3api::{Code, FieldValue, Fields, Method, Request, Status, StreamError};
 
@@ -1153,13 +1157,13 @@ fn control_preface(datagrams: bool) -> BytesMut {
 
     let mut settings = BytesMut::new();
     for (identifier, value) in [
-        (frame::SETTING_QPACK_MAX_TABLE_CAPACITY, 0),
-        (frame::SETTING_QPACK_BLOCKED_STREAMS, 0),
-        (frame::SETTING_ENABLE_CONNECT_PROTOCOL, 1),
+        (SETTING_QPACK_MAX_TABLE_CAPACITY, 0),
+        (SETTING_QPACK_BLOCKED_STREAMS, 0),
+        (SETTING_ENABLE_CONNECT_PROTOCOL, 1),
         // Sent as an explicit 0 rather than left out: RFC 9297 §2.1.1 gives the
         // two the same meaning, and the explicit form also proves the server
         // reads the value rather than the identifier's presence.
-        (frame::SETTING_H3_DATAGRAM, u64::from(datagrams)),
+        (SETTING_H3_DATAGRAM, u64::from(datagrams)),
         (GREASE, 0),
     ] {
         put_varint(&mut settings, identifier);
@@ -1526,7 +1530,7 @@ fn max_field_section_size(mut payload: &[u8]) -> Option<u64> {
         let (value, used) = peek_varint(payload)?;
         payload = &payload[used..];
 
-        if identifier == frame::SETTING_MAX_FIELD_SECTION_SIZE {
+        if identifier == SETTING_MAX_FIELD_SECTION_SIZE {
             return Some(value);
         }
     }
