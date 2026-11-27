@@ -120,6 +120,7 @@ impl EchKey {
         config_id: u8,
         max_name_length: u8,
     ) -> Result<Self> {
+        ffi::clear_errors();
         check_public_name(public_name)?;
         let hpke = hpke_key(private)?;
         let config = marshal_config(&hpke, config_id, public_name, max_name_length)?;
@@ -164,6 +165,7 @@ impl EchKey {
     /// PEM parser's own base64 buffer, which held each block as text, is
     /// dropped uncleared by rustls-pki-types and cannot be reached from here.
     pub fn from_pem(pem: &[u8]) -> Result<Self> {
+        ffi::clear_errors();
         let mut key_der: Option<Zeroizing<Vec<u8>>> = None;
         let mut list: Option<Vec<u8>> = None;
         for item in <(SectionKind, Vec<u8>)>::pem_slice_iter(pem) {
@@ -1003,6 +1005,24 @@ mod tests {
         pem_block(&mut text, "PRIVATE KEY", &p256.serialize_der());
         pem_block(&mut text, "ECHCONFIG", &key.config_list());
         refused(&text, "not an X25519 key");
+    }
+
+    /// A refused key file reports only its own AWS-LC errors. An error an
+    /// earlier call left on the thread's queue is not reported as its cause:
+    /// here the one aws-lc-rs leaves when a packet does not open.
+    #[test]
+    fn a_refused_key_file_reports_no_stale_error() {
+        let key = EchKey::generate("public.example", 1, 0).expect("generate");
+        let other = EchKey::generate("public.example", 1, 0).expect("generate");
+        let keys = crate::tls::client_initial_keys(&[0u8; 8]);
+        let mut payload = bytes::BytesMut::from(&[0u8; 32][..]);
+        assert!(keys.packet.decrypt(0, &[0xc0], &mut payload).is_err());
+
+        let error = EchKey::from_pem(file_with(&key, &other.config_list()).as_bytes())
+            .expect_err("the key of one ECHConfig with the ECHConfig of another");
+        let message = format!("{error:#}");
+        assert!(message.contains("SSL_ECH_KEYS_add failed"), "{message}");
+        assert!(!message.contains("BAD_DECRYPT"), "{message}");
     }
 
     /// A set picks its key by config_id and refuses a previous key that shares
