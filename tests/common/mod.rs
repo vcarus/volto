@@ -140,6 +140,9 @@ pub struct TestServer {
     /// Certificate and key paths, so a rewritten config can point at them again.
     cert: PathBuf,
     key: PathBuf,
+    /// The `[log]` additions the server started with, which a rewritten config
+    /// keeps.
+    log_extra: String,
     /// Fires the graceful shutdown, exactly as the SIGTERM handler does.
     trigger: Trigger,
     /// Replaces the running configuration, exactly as the SIGHUP handler does.
@@ -292,6 +295,7 @@ impl TestServer {
             config_path,
             cert,
             key,
+            log_extra: log_extra.to_owned(),
             trigger,
             reload,
             open_connections,
@@ -300,13 +304,14 @@ impl TestServer {
         }
     }
 
-    /// Rewrites the configuration file with a new `extra` section.
+    /// Rewrites the configuration file with a new `extra` section and the
+    /// `[log]` additions the server started with.
     ///
     /// Does not apply it: call [`Self::reload`], which is what `SIGHUP` does.
     pub fn rewrite_config(&self, extra: &str) {
         std::fs::write(
             &self.config_path,
-            config_text(&self.cert, &self.key, extra, ""),
+            config_text(&self.cert, &self.key, extra, &self.log_extra),
         )
         .expect("rewrite config");
     }

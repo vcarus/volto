@@ -1214,3 +1214,21 @@ async fn a_reloaded_name_the_certificate_cannot_prove_draws_the_warning() {
     server.shutdown();
     server.wait_until_stopped(STOP_TIMEOUT).await;
 }
+
+/// A rewritten configuration keeps the `[log]` keys the server started with.
+///
+/// A harness check: `rewrite_config` once dropped them, so a test that started
+/// a server with `start_with_log` and then reloaded it lost those keys without
+/// being told.
+#[tokio::test]
+async fn a_rewritten_config_keeps_the_log_keys_the_server_started_with() {
+    let server = TestServer::start_with_log(ALLOW_PRIVATE, "keylog = true\n").await;
+
+    server.rewrite_config(ALLOW_PRIVATE);
+
+    let text = std::fs::read_to_string(server.dir().join("config.toml")).expect("the config");
+    assert!(
+        text.contains("keylog = true"),
+        "the rewritten config dropped the [log] keys; it was:\n{text}"
+    );
+}
