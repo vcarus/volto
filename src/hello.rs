@@ -13,9 +13,7 @@
 //!
 //! Every function takes a borrowed slice and answers with an `Option` or an
 //! enum, and every read is bounds-checked: all of these bytes are chosen by a
-//! peer that has not authenticated. Nothing here allocates except
-//! [`extensions`], whose list has one entry per extension the ClientHello
-//! declared and so is bounded by its length.
+//! peer that has not authenticated. Nothing here allocates.
 
 #![forbid(unsafe_code)]
 
@@ -53,7 +51,7 @@ const ECH_OUTER: u8 = 0;
 /// TLS structures are length-prefixed all the way down and every one of those
 /// lengths is peer-chosen, so each read is an `Option` and a `None` propagates.
 /// [`Reader::position`] says how far into the original slice the cursor is,
-/// which is how [`extensions`] reports where each extension's data lies.
+/// which is how `walk_extensions` reports where each extension's data lies.
 #[derive(Debug, Clone)]
 pub struct Reader<'a> {
     bytes: &'a [u8],
@@ -230,7 +228,18 @@ fn find_extension(body: &[u8], kind: u16) -> Option<&[u8]> {
 }
 
 /// Every extension in a ClientHello body: its type and the byte range of its
-/// data within `body`.
+/// data within `body`, under the framing rule of [`walk_extensions`]. For the
+/// tests, which find and alter extensions in ClientHellos a real client wrote.
+#[cfg(test)]
+pub(crate) fn extensions(body: &[u8]) -> Option<Vec<(u16, Range<usize>)>> {
+    let mut out = Vec::new();
+    walk_extensions(body, |kind, range| out.push((kind, range)))?;
+    Some(out)
+}
+
+/// Calls `visit` with the type and data range of every extension in `body`,
+/// in order. The one walk [`ech`] and the tests make, so the two cannot judge
+/// the framing differently.
 ///
 /// Stricter than the lookup [`server_name`] makes: the block has to end exactly where the
 /// body does and every extension in it has to parse, which is what libssl
@@ -243,19 +252,9 @@ fn find_extension(body: &[u8], kind: u16) -> Option<&[u8]> {
 /// libssl reads a ClientHello that ends after `legacy_compression_methods` as
 /// one without extensions, and this returns `None` for it. libssl refuses a
 /// ClientHello that repeats an extension type (`tls1_check_duplicate_extensions`),
-/// and this returns both entries. Neither ClientHello can complete a QUIC
+/// and this visits both entries. Neither ClientHello can complete a QUIC
 /// handshake: the first carries no `supported_versions` and no transport
 /// parameters, and libssl refuses the second.
-pub fn extensions(body: &[u8]) -> Option<Vec<(u16, Range<usize>)>> {
-    let mut out = Vec::new();
-    walk_extensions(body, |kind, range| out.push((kind, range)))?;
-    Some(out)
-}
-
-/// Calls `visit` with the type and data range of every extension in `body`,
-/// in order, under the framing rule of [`extensions`], and `None` where that
-/// returns `None`. The one walk both [`extensions`] and [`ech`] make, so the
-/// two cannot judge the framing differently.
 fn walk_extensions(body: &[u8], mut visit: impl FnMut(u16, Range<usize>)) -> Option<()> {
     let (start, block) = extension_block(body)?;
     if start.checked_add(block.len())? != body.len() {
@@ -342,7 +341,7 @@ pub enum Ech {
 
 /// What `body`'s `encrypted_client_hello` extension is, or `None` when the
 /// ClientHello's extension block is absent or its framing does not parse
-/// ([`extensions`]).
+/// (`walk_extensions`).
 ///
 /// libssl ignores an extension of the inner type in a ClientHello it reads as
 /// the outer one and alerts on an outer one it cannot parse
