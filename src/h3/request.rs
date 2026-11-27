@@ -98,63 +98,7 @@ pub fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
 
         (None, Some(uri_authority(&authority)?.into()), None, None)
     } else {
-        // Extended CONNECT and ordinary requests are built the same way; only
-        // where the authority may come from differs.
-        //
-        //= https://www.rfc-editor.org/rfc/rfc8441#section-4
-        //# On requests that contain the :protocol pseudo-header field, the
-        //# :scheme and :path pseudo-header fields of the target URI [...]
-        //# MUST also be included.
-        let scheme = scheme.ok_or_else(|| malformed("a request without :scheme"))?;
-        let target = target.ok_or_else(|| malformed("a request without :path"))?;
-
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
-        //# If the :scheme pseudo-header field identifies a scheme that has a
-        //# mandatory authority component [...] the request MUST contain
-        //# either an :authority pseudo-header field or a Host header field.
-        //# If these fields are present, they MUST NOT be empty. If both
-        //# fields are present, they MUST contain the same value.
-        //
-        // One table for both request shapes, because §4.3.1's agreement rule is
-        // the same rule either way: an extended CONNECT is still an HTTP/3
-        // request. RFC 8441 §4 does not make :authority mandatory on a request
-        // carrying :protocol; it says what :authority means when it is present:
-        //
-        //= https://www.rfc-editor.org/rfc/rfc8441#section-4
-        //# On requests bearing the :protocol pseudo-header field, the
-        //# :authority pseudo-header field is interpreted according to
-        //# Section 8.1.2.3 of [RFC7540] instead of Section 8.3 of that
-        //# document.
-        //
-        // The one requirement is RFC 9298 §3.4's, and it is connect-udp's
-        // alone:
-        //
-        //= https://www.rfc-editor.org/rfc/rfc9298#section-3.4
-        //# The :authority pseudo-header field SHALL contain the authority of
-        //# the UDP proxy.
-        //
-        // The comparison is exact, matching `tunnel::route`: a different case
-        // or spelling is an unsupported protocol, not a connect-udp request,
-        // and may name the proxy through Host.
-        let named = match (authority.as_deref(), fields.get("host")) {
-            (Some(authority), Some(host)) if authority != host.as_bytes() => {
-                return Err(malformed(":authority and Host disagree"));
-            }
-            (Some(authority), _) => authority,
-            (None, _) if protocol.as_deref() == Some(b"connect-udp".as_slice()) => {
-                return Err(malformed("a connect-udp request without :authority"));
-            }
-            (None, Some(host)) => host.as_bytes(),
-            (None, None) => return Err(malformed("a request with neither :authority nor Host")),
-        };
-
-        let (path, query) = split_target(&target, protocol.is_some())?;
-        (
-            Some(uri_scheme(&scheme)?.into()),
-            Some(uri_authority(named)?.into()),
-            Some(path.into()),
-            query.map(Into::into),
-        )
+        target_form(scheme, authority, target, protocol.as_deref(), &fields)?
     };
 
     let protocol = protocol
@@ -170,6 +114,79 @@ pub fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
         protocol,
         fields,
     })
+}
+
+/// The scheme, authority, path and query of a request.
+type Target = (
+    Option<Box<str>>,
+    Option<Box<str>>,
+    Option<Box<str>>,
+    Option<Box<str>>,
+);
+
+/// The target of an extended CONNECT or an ordinary request, which are built
+/// the same way; only where the authority may come from differs.
+fn target_form(
+    scheme: Option<Cow<'static, [u8]>>,
+    authority: Option<Cow<'static, [u8]>>,
+    target: Option<Cow<'static, [u8]>>,
+    protocol: Option<&[u8]>,
+    fields: &Fields,
+) -> Result<Target, Violation> {
+    //= https://www.rfc-editor.org/rfc/rfc8441#section-4
+    //# On requests that contain the :protocol pseudo-header field, the
+    //# :scheme and :path pseudo-header fields of the target URI [...]
+    //# MUST also be included.
+    let scheme = scheme.ok_or_else(|| malformed("a request without :scheme"))?;
+    let target = target.ok_or_else(|| malformed("a request without :path"))?;
+
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+    //# If the :scheme pseudo-header field identifies a scheme that has a
+    //# mandatory authority component [...] the request MUST contain
+    //# either an :authority pseudo-header field or a Host header field.
+    //# If these fields are present, they MUST NOT be empty. If both
+    //# fields are present, they MUST contain the same value.
+    //
+    // One table for both request shapes, because §4.3.1's agreement rule is
+    // the same rule either way: an extended CONNECT is still an HTTP/3
+    // request. RFC 8441 §4 does not make :authority mandatory on a request
+    // carrying :protocol; it says what :authority means when it is present:
+    //
+    //= https://www.rfc-editor.org/rfc/rfc8441#section-4
+    //# On requests bearing the :protocol pseudo-header field, the
+    //# :authority pseudo-header field is interpreted according to
+    //# Section 8.1.2.3 of [RFC7540] instead of Section 8.3 of that
+    //# document.
+    //
+    // The one requirement is RFC 9298 §3.4's, and it is connect-udp's
+    // alone:
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9298#section-3.4
+    //# The :authority pseudo-header field SHALL contain the authority of
+    //# the UDP proxy.
+    //
+    // The comparison is exact, matching `tunnel::route`: a different case
+    // or spelling is an unsupported protocol, not a connect-udp request,
+    // and may name the proxy through Host.
+    let named = match (authority.as_deref(), fields.get("host")) {
+        (Some(authority), Some(host)) if authority != host.as_bytes() => {
+            return Err(malformed(":authority and Host disagree"));
+        }
+        (Some(authority), _) => authority,
+        (None, _) if protocol == Some(b"connect-udp".as_slice()) => {
+            return Err(malformed("a connect-udp request without :authority"));
+        }
+        (None, Some(host)) => host.as_bytes(),
+        (None, None) => return Err(malformed("a request with neither :authority nor Host")),
+    };
+
+    let (path, query) = split_target(&target, protocol.is_some())?;
+    Ok((
+        Some(uri_scheme(&scheme)?.into()),
+        Some(uri_authority(named)?.into()),
+        Some(path.into()),
+        query.map(Into::into),
+    ))
 }
 
 /// Checks a `:protocol` value (RFC 8441 §4).
