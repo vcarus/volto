@@ -1573,21 +1573,23 @@ fn the_release_build_compiles_no_rustls() {
 /// unit is the only place that restriction is expressed.
 #[test]
 fn the_unit_allows_the_address_families_name_resolution_needs() {
-    let unit = read_text(&repo_root().join("script/masque.service"));
-    let line = unit
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("RestrictAddressFamilies="))
-        .expect("script/masque.service must restrict address families");
-
-    let families: Vec<&str> = line
-        .trim_start_matches("RestrictAddressFamilies=")
-        .split_whitespace()
+    // systemd applies a later `RestrictAddressFamilies=` line on top of the
+    // first, so there is exactly one.
+    let directives = unit_directives();
+    let lines: Vec<&str> = directives
+        .iter()
+        .filter_map(|line| line.strip_prefix("RestrictAddressFamilies="))
         .collect();
+    let [line] = lines[..] else {
+        panic!("script/masque.service must restrict address families on one line: {lines:?}");
+    };
+
+    let families: Vec<&str> = line.split_whitespace().collect();
     for family in ["AF_INET", "AF_INET6", "AF_UNIX", "AF_NETLINK"] {
         assert!(
             families.contains(&family),
-            "the unit must allow {family}, or libc name resolution can fail; it allows {families:?}"
+            "the unit must allow {family}, or readiness or name resolution can fail; it \
+             allows {families:?}"
         );
     }
 }
@@ -1629,31 +1631,57 @@ fn unit_directives() -> Vec<String> {
 #[test]
 fn the_unit_carries_the_safe_hardening_and_nothing_that_breaks_the_binary() {
     let directives = unit_directives();
+
+    // systemd keeps the last assignment of a single-valued key, so each of
+    // these is judged by its last line.
+    for (key, expected) in [
+        // Not `notify-reload`: it changes how `systemctl reload` reaches the
+        // server, and the server implements none of it (D124).
+        ("Type", "notify"),
+        ("TimeoutStartSec", "15"),
+        ("WatchdogSec", "60"),
+        ("Restart", "on-failure"),
+        ("UMask", "0077"),
+        ("ProcSubset", "pid"),
+        ("RemoveIPC", "yes"),
+        ("ProtectSystem", "strict"),
+        ("ProtectProc", "invisible"),
+        ("User", "volto"),
+        ("Group", "volto"),
+        ("SystemCallErrorNumber", "EPERM"),
+    ] {
+        let last = directives
+            .iter()
+            .rev()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='));
+        assert_eq!(
+            last,
+            Some(expected),
+            "the last {key}= in script/masque.service must be {expected}: {directives:#?}"
+        );
+    }
+
+    // A list-valued key accumulates its lines, and an empty assignment resets
+    // it, so each expected line is there and no reset is.
     for expected in [
-        "Type=notify",
-        "TimeoutStartSec=15",
-        "WatchdogSec=60",
-        "Restart=on-failure",
-        "UMask=0077",
-        "ProcSubset=pid",
-        "RemoveIPC=yes",
-        "ProtectSystem=strict",
-        "ProtectProc=invisible",
-        "User=volto",
-        "Group=volto",
         "AmbientCapabilities=CAP_NET_BIND_SERVICE",
         "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
         "RestartForceExitStatus=SIGHUP",
         "ExecReload=/bin/kill -HUP $MAINPID",
         "SystemCallFilter=@system-service",
         "SystemCallFilter=~@resources",
-        "SystemCallErrorNumber=EPERM",
     ] {
         assert!(
             directives.iter().any(|line| line == expected),
             "script/masque.service must set {expected}: {directives:#?}"
         );
+        let reset = &expected[..=expected.find('=').expect("a key")];
+        assert!(
+            !directives.iter().any(|line| line == reset),
+            "script/masque.service must not reset {reset}: {directives:#?}"
+        );
     }
+
     for absent in [
         "ReadOnlyPaths=",
         "ReadWritePaths=",
@@ -1662,14 +1690,9 @@ fn the_unit_carries_the_safe_hardening_and_nothing_that_breaks_the_binary() {
         "PrivateNetwork=",
         "IPAddressDeny=",
         "SocketBindDeny=",
-        "Type=simple",
-        "Type=exec",
         // `Type=notify` makes it `main`; `all` would let any process of the
         // unit report readiness for the server.
         "NotifyAccess=",
-        // It changes how `systemctl reload` reaches the server, and the
-        // server implements none of it (D124).
-        "Type=notify-reload",
         // A watchdog timeout is systemd's default SIGABRT, and whether it
         // leaves a core file is the host's setting, not the unit's (D124).
         "WatchdogSignal=",
