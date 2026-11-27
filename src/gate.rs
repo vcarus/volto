@@ -14,7 +14,8 @@
 //! quinn would answer never reaches it. It is off unless `[security]
 //! expected_sni` names at least one host or `[server] ech_key` names an ECH
 //! key: with neither, which is the shipped default, every datagram passes
-//! through untouched. Without a key the gate keeps no state and judges each
+//! through untouched until the drain begins ([`Expected::close`]). Without a
+//! key the gate keeps no state and judges each
 //! datagram on its own, as the next four sections describe. A key adds the
 //! hold of the section after them.
 //!
@@ -35,8 +36,9 @@
 //!   generator replaced (`quic::cid`), supports seven:
 //!   version 1 and the six draft numbers `0xff00001d` to `0xff000022`
 //!   (quinn-proto 0.11.x `src/lib.rs`, `DEFAULT_SUPPORTED_VERSIONS`). For a
-//!   version outside that list quinn would send a Version Negotiation packet,
-//!   and refusing removes the reply. For one of the six drafts quinn would
+//!   version outside that list quinn would send a Version Negotiation packet
+//!   in reply to a datagram of 1200 bytes or more, and refusing removes the
+//!   reply. For one of the six drafts quinn would
 //!   open a connection, and refusing removes the service. Nothing this server
 //!   interoperates with is affected, because Surge speaks version 1.
 //! * **Long header, not an Initial**: passes. quinn drops a Handshake or 0-RTT
@@ -288,7 +290,8 @@ const IMPOSSIBLE_CID_LENGTH: u8 = 0xff;
 /// Built from `[security] expected_sni`, `[security] require_ech` and the keys
 /// `server.ech_key` and `server.ech_previous_key` name, at bind and on every
 /// reload. The gate is on when the list holds a name or there is a key; with
-/// neither, every datagram passes untouched. A key turns on the hold the
+/// neither, every datagram passes untouched until the drain begins
+/// ([`Expected::close`]). A key turns on the hold the
 /// module documentation describes.
 #[derive(Debug)]
 pub struct Policy {
