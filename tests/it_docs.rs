@@ -65,7 +65,8 @@
 //! the `` `IDENT` = value `` notation, and a measured figure is not one.
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
-// allow: the counting is over the documentation this file scans.
+// allow: every `as` here widens a crate constant from `usize` to `u64`, which
+// loses nothing on any target the crate builds for.
 #![allow(clippy::as_conversions)]
 
 #[path = "common/scripts.rs"]
