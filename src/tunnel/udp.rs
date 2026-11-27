@@ -66,14 +66,61 @@ pub(super) const CONNECT_UDP: &str = "connect-udp";
 
 /// Establishes a UDP tunnel for a `connect-udp` request and runs it.
 pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
+    let Some((socket, inbound)) = establish(req, &mut stream, ctx).await else {
+        return;
+    };
+
+    let stream_id = stream.id();
+    let quarter_stream_id = datagram::quarter_stream_id(stream_id);
+    let (writer, reader) = stream.split();
+    let mut session = Session {
+        stream_id,
+        quarter_stream_id,
+        socket,
+        inbound,
+        reader,
+        writer,
+        decoder: CapsuleDecoder::new(),
+        // Zero is the operator's way of switching the mitigation off, so it means
+        // "uncapped" rather than "nothing may be sent".
+        amplification: match ctx.unanswered.per_session() {
+            0 => Amplification::Uncounted,
+            budget => Amplification::Unanswered {
+                remaining: budget,
+                charged: 0,
+            },
+        },
+        datagrams: ctx
+            .quic
+            .max_datagram_size()
+            .map(|limit| DatagramPath::new(stream_id, quarter_stream_id, limit)),
+        deadline: tokio::time::Instant::now() + ctx.stall_budget,
+        ctx,
+    };
+
+    session.run().await;
+
+    debug!(stream_id, quarter_stream_id, "udp session closed");
+}
+
+/// Validates the request, claims its datagrams, admits the target, opens the
+/// socket and answers the 200, or answers the refusal and returns `None`.
+///
+/// A step of its own so that what the setup holds (the host, the address
+/// lists, the other family's lookup) is dropped before the session starts.
+async fn establish(
+    req: &Request,
+    stream: &mut Stream,
+    ctx: &Context,
+) -> Option<(UdpSocket, DatagramReceiver)> {
     let stream_id = stream.id();
     // The start of what the established line reports as `setup_ms`.
     let started = tokio::time::Instant::now();
 
     if let Err(reason) = validate(req) {
         debug!(stream_id, reason, "malformed connect-udp request");
-        tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
-        return;
+        tunnel::refuse(stream, Status::BAD_REQUEST).await;
+        return None;
     }
 
     let path = req.path.as_deref().unwrap_or_default();
@@ -81,8 +128,8 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
         Ok(target) => target,
         Err(reason) => {
             debug!(stream_id, path, reason, "malformed connect-udp request");
-            tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
-            return;
+            tunnel::refuse(stream, Status::BAD_REQUEST).await;
+            return None;
         }
     };
 
@@ -118,8 +165,8 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
             stream_id,
             "the datagrams of this stream are already claimed"
         );
-        tunnel::refuse(&mut stream, Status::INTERNAL_SERVER_ERROR).await;
-        return;
+        tunnel::refuse(stream, Status::INTERNAL_SERVER_ERROR).await;
+        return None;
     };
 
     // Port policy, resolution and destination policy, in that order and with
@@ -136,10 +183,7 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     // whatever the client sent optimistically. The router then drops later
     // datagrams for that id silently, as it does for a session that has just
     // closed.
-    let Some(admitted) = tunnel::admit_target(&host, port, ctx, &mut stream, capsule_fields).await
-    else {
-        return;
-    };
+    let admitted = tunnel::admit_target(&host, port, ctx, stream, capsule_fields).await?;
     let tunnel::Admitted {
         addresses: first,
         mut later,
@@ -193,8 +237,8 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
                 error = %failure.error,
                 "failed to open target UDP socket"
             );
-            tunnel::refuse_unreachable(&mut stream, &failure).await;
-            return;
+            tunnel::refuse_unreachable(stream, &failure).await;
+            return None;
         }
     };
 
@@ -216,12 +260,12 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     }
 
     // Bounded exactly as every refusal is, and for the reason
-    // [`tunnel::respond`] gives: the session below does not exist until this
+    // [`tunnel::respond`] gives: the session does not exist until this
     // write returns, so nothing else would ever end the wait. On expiry the
     // stream has already been reset with H3_REQUEST_CANCELLED, and returning
     // here drops the socket and the Quarter Stream ID claim with it.
     let sent = tunnel::respond(
-        &mut stream,
+        stream,
         Status::OK,
         capsule_fields(),
         "failed to send 200 for connect-udp",
@@ -229,7 +273,7 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     )
     .await;
     if !sent {
-        return;
+        return None;
     }
 
     let target = socket.peer_addr().ok();
@@ -253,36 +297,7 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
         setup_ms = started.elapsed().as_millis(),
         "udp session established"
     );
-
-    let (writer, reader) = stream.split();
-    let mut session = Session {
-        stream_id,
-        quarter_stream_id,
-        socket,
-        inbound,
-        reader,
-        writer,
-        decoder: CapsuleDecoder::new(),
-        // Zero is the operator's way of switching the mitigation off, so it means
-        // "uncapped" rather than "nothing may be sent".
-        amplification: match ctx.unanswered.per_session() {
-            0 => Amplification::Uncounted,
-            budget => Amplification::Unanswered {
-                remaining: budget,
-                charged: 0,
-            },
-        },
-        datagrams: ctx
-            .quic
-            .max_datagram_size()
-            .map(|limit| DatagramPath::new(stream_id, quarter_stream_id, limit)),
-        deadline: tokio::time::Instant::now() + ctx.stall_budget,
-        ctx,
-    };
-
-    session.run().await;
-
-    debug!(stream_id, quarter_stream_id, "udp session closed");
+    Some((socket, inbound))
 }
 
 /// Where a UDP session stands against the RFC 9298 §7 amplification limit.
