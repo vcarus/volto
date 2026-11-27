@@ -101,7 +101,7 @@ use common::rawstream::{
     settings_frame, status_of, status_of_response, still_serving, varint_frame,
 };
 use common::{
-    ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section, basic_credentials,
+    ALLOW_PRIVATE, DELIBERATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section, basic_credentials,
     client_endpoint, client_endpoint_with_transport, connect_quic, echoes, finish_connect,
     open_tcp_tunnel, send_udp_payload, silent_peer, spawn_echo_target, windowless_transport,
 };
@@ -268,12 +268,9 @@ async fn sixteen_is_all_the_unidirectional_streams_a_peer_gets() {
 /// run concurrently -- a server that read for one type at a time would abandon
 /// the sixteenth of these sixteen idle timeouts late, not one -- and once the
 /// peer answers the STOP_SENDING with the reset RFC 9000 §3.5 requires of it,
-/// every abandoned stream hands its credit back. A peer that withholds that
-/// reset parks its own allowance and nothing else: the server's task ended
-/// with the `stop`, so what stays behind is quinn's per-stream state, bounded
-/// at sixteen. Authenticated first, so what is measured is this bound and not
-/// D76's absolute deadline, which would close an unproven connection at about
-/// the same moment and swallow the case.
+/// every abandoned stream hands its credit back. Authenticated first, so what
+/// is measured is this bound and not D76's absolute deadline, which would close
+/// an unproven connection at about the same moment and swallow the case.
 ///
 /// The bidirectional mirror of this batch is
 /// `it_handshake::a_batch_of_stalled_requests_is_reset_stream_by_stream`:
@@ -281,13 +278,12 @@ async fn sixteen_is_all_the_unidirectional_streams_a_peer_gets() {
 /// deadline in `Resolver::resolve`, so each direction has its own pin.
 #[tokio::test]
 async fn a_stalled_uni_stream_allowance_is_reclaimed() {
-    /// Two seconds of idle timeout, keep-alives off: long enough that parking
-    /// all sixteen streams and asking for a seventeenth fits comfortably
-    /// before the first deadline fires, short enough to wait out sixteen of
-    /// them concurrently inside [`TIMEOUT`].
-    const UNHURRIED: &str = "[limits]\nmax_idle_timeout = 2\nkeep_alive_interval = 0\n";
+    /// [`DELIBERATE`]'s idle timeout, which bounds each type read: long enough
+    /// that parking all sixteen streams and asking for a seventeenth fits
+    /// before the first deadline fires.
+    const IDLE: Duration = Duration::from_secs(2);
 
-    let server = TestServer::start_with(UNHURRIED).await;
+    let server = TestServer::start_with(DELIBERATE).await;
     let (_endpoint, connection) = silent_peer(&server).await;
 
     // No `[auth]` section, so this answered request authenticates the
@@ -308,6 +304,10 @@ async fn a_stalled_uni_stream_allowance_is_reclaimed() {
             .expect("send half a stream type");
         parked.push(stream);
     }
+    // One deadline for all sixteen stops. Read concurrently, every type read
+    // ends one idle timeout from here. Read one at a time, the stops arrive one
+    // idle timeout apart, and the fourth is past this instant.
+    let all_stopped_by = tokio::time::Instant::now() + 3 * IDLE;
 
     // With the whole allowance parked there is no credit for another stream:
     // the seventeenth is not refused, it is never granted (row h).
@@ -318,17 +318,16 @@ async fn a_stalled_uni_stream_allowance_is_reclaimed() {
         "while sixteen streams are parked there is no credit for a seventeenth"
     );
 
-    // Every stream is abandoned with the code a single one draws. Sixteen
-    // waits bounded by TIMEOUT apiece only fit because the deadlines run
-    // concurrently: the first `stopped` pays the idle timeout and the rest
-    // have already fired.
+    // Every stream is abandoned with the code a single one draws, and all of
+    // them by the one deadline above.
     for (index, stream) in parked.iter_mut().enumerate() {
-        let stopped = tokio::time::timeout(TIMEOUT, stream.stopped())
+        let stopped = tokio::time::timeout_at(all_stopped_by, stream.stopped())
             .await
             .unwrap_or_else(|_| {
                 panic!(
-                    "stream {index} of {PEER_UNI_STREAMS}: the server must not read for a \
-                     stream type indefinitely"
+                    "stream {index} of {PEER_UNI_STREAMS} was not stopped within {:?} of \
+                     parking: the server must read the stream types concurrently",
+                    3 * IDLE
                 )
             })
             .expect("the stalled stream must be stopped, not broken");
