@@ -463,38 +463,9 @@ the 1280 bytes any practical path carries, and below what Chromium (1250) and
 quic-go (1280) send everywhere. Over IPv6 the same packets are 1290 bytes, past
 that guarantee, so put it back to 1200 if clients reach the server over IPv6.
 
-**A probe that gets through is not the same as a path that carries the size.**
-Discovery adopts a size once one probe of it is acknowledged, and a path can
-deliver that probe while losing most traffic at that size under load. On a
-measured relay path, IPv4 packets above 1464 bytes (UDP payload above 1436) arrived with
-the DF bit cleared. Single probes of those sizes got through, so discovery
-adopted 1452 or 1464, and at bulk rate 62 to 89 percent of the packets at that
-size were lost. The black-hole detector then dropped the size to 1200, and
-after its one-minute cooldown the same probe succeeded again. Packets of up to
-1464 IP bytes kept DF set and lost about what 1200-byte packets lost. 1436 is
-the largest UDP payload whose IPv4 packet crosses that path with DF set, which
-is why it is both the default and the shipped value. quinn's 1452, the value
-that fits both IPv4 and IPv6 on Ethernet, is a 1480-byte IPv4 packet, above that
-boundary, and in one of two runs with that ceiling 85
-percent of the 1452-byte packets were lost. The example shipped 1464 before:
-what an IPv4 uplink behind a 1492-byte first-hop IP MTU leaves. That uplink was
-measured correctly, but it is not the segment that limits the relay path. Over
-IPv6, 1452 is what an Ethernet frame leaves and 1436 is below it, so the default
-holds on either family.
+**A probe that gets through is not the same as a path that carries the size.** Discovery adopts a size once one probe of it is acknowledged, and a path can deliver that probe while losing most traffic at that size under load, for example a path that clears the DF bit on larger packets. 1436 is the default and the shipped value because it is the largest UDP payload whose IPv4 packet, 1464 bytes, crossed a measured relay path with DF set. quinn's own 1452 is a 1480-byte IPv4 packet, above that boundary. Over IPv6, 1452 is what an Ethernet frame leaves and 1436 is below it, so the default holds on either family.
 
-**The counter to watch is `mtu_black_holes=` in the connection close line.** A
-ceiling above what the path carries costs failed probes on a path that drops
-oversize packets. On a path that delivers single probes but not bulk traffic at
-that size, it costs lost traffic until the black-hole detector fires, and shows
-up as connections that carried bulk traffic and close with the counter non-zero.
-On the measured path, a ceiling of 1400 ran with no black-hole event. 1472,
-clean Ethernet over IPv4, is the most volto accepts, and `ping -M do` alone does
-not justify raising the ceiling toward it, because a path that clears DF
-delivers that probe too. An operator who has measured their own path can raise
-it, but only after a bulk transfer at the new size has run with
-`mtu_black_holes=0`. Neither
-value is a measurement of *your* path: lower `initial_mtu` on the first sign
-that a handshake is not getting through.
+**The counter to watch is `mtu_black_holes=` in the connection close line.** A ceiling above what the path carries costs failed probes on a path that drops oversize packets. On a path that delivers single probes but not bulk traffic at that size, it costs lost traffic until the black-hole detector fires, and shows up as connections that carried bulk traffic and close with the counter non-zero. 1472, clean Ethernet over IPv4, is the most volto accepts, and `ping -M do` alone does not justify raising the ceiling toward it, because a path that clears DF delivers that probe too. Raise it only after a bulk transfer at the new size has run with `mtu_black_holes=0`. Neither value is a measurement of *your* path: lower `initial_mtu` on the first sign that a handshake is not getting through.
 
 **`ip_family_preference` decides which half of a dual-stack target is tried
 first, and it is an operator's call rather than the resolver's.** `getaddrinfo`
