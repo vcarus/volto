@@ -32,16 +32,11 @@ use volto::h3api::Status;
 /// resolver returns, and the only thing `is_dns_blackhole` accepts.
 const BLACKHOLED: &str = "0.0.0.0:443";
 
-/// Loopback, which the default policy refuses. A different authority from
-/// [`BLACKHOLED`] so the two scenarios' lines can never be confused.
-const PROHIBITED: &str = "127.0.0.1:443";
-
 #[tokio::test]
 async fn tunnel_refusals_and_drops_are_logged_at_the_level_they_were_graded() {
     let buffer = SharedBuffer::shared("volto=info");
 
     blackhole_is_information(&buffer).await;
-    policy_refusal_is_information(&buffer).await;
     the_oversize_sentinel_reports_on_a_doubling_schedule(&buffer).await;
 }
 
@@ -50,8 +45,8 @@ async fn tunnel_refusals_and_drops_are_logged_at_the_level_they_were_graded() {
 ///
 /// The server runs the *default* policy, which is the point: the unspecified
 /// address is in the never-allowed bucket, so this branch is reached the same way
-/// whatever `allow_private_networks` says, and the comparison against the next
-/// scenario is between two refusals of the same server.
+/// whatever `allow_private_networks` says. The policy refusal, the other INFO
+/// refusal, is held by `it_log_amplification`'s policy storm.
 async fn blackhole_is_information(buffer: &SharedBuffer) {
     let server = TestServer::start_with("").await;
     let mut client = H3Client::connect(&server).await;
@@ -83,47 +78,6 @@ async fn blackhole_is_information(buffer: &SharedBuffer) {
     assert!(
         warnings.is_empty(),
         "a blackholed name must produce no warning at all, got:\n{}",
-        warnings.join("\n")
-    );
-}
-
-/// The policy refusal is INFO, and nothing about it may reach WARN.
-///
-/// D44 left this line at WARN when it demoted the blackhole line. The user
-/// ruling of 2026-11-12 (D111) moved it to INFO: the refusal is the intended
-/// answer to a client that names a private target, and a WARN for it failed the
-/// deploy acceptance window whenever a client inside the tunnel tried one. The
-/// line still names the target and still carries the running count, so a scan
-/// stays visible at the shipped `volto=info` filter.
-async fn policy_refusal_is_information(buffer: &SharedBuffer) {
-    let server = TestServer::start_with("").await;
-    let mut client = H3Client::connect(&server).await;
-    let mark = buffer.mark();
-
-    let response = respond_to(&mut client, connect_request(PROHIBITED)).await;
-    assert_eq!(response.status, Status::FORBIDDEN);
-
-    let line = buffer
-        .wait_for_line(
-            mark,
-            &[
-                " INFO ",
-                "every address of the target is prohibited by policy",
-            ],
-        )
-        .await;
-    assert_eq!(
-        (field_text(&line, "host"), numeric_field(&line, "port")),
-        ("\"127.0.0.1\"", 443),
-        "the line must name the authority it is about: {line}"
-    );
-
-    // Matched on the authority so an unrelated warning from another scenario
-    // cannot satisfy it.
-    let warnings = buffer.lines_since(mark, &[" WARN ", PROHIBITED]);
-    assert!(
-        warnings.is_empty(),
-        "a policy refusal must produce no warning at all, got:\n{}",
         warnings.join("\n")
     );
 }

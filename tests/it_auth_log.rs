@@ -57,12 +57,12 @@ async fn a_rejected_password_is_never_logged(buffer: &SharedBuffer) {
 
     let logged = buffer.since(mark);
 
-    // The failure is visible, and says who and why.
+    // The failure is visible, and says why; `it_log_fields` reads its
+    // `username`.
     let failure = logged
         .lines()
         .find(|line| line.contains("authentication failed"))
         .unwrap_or_else(|| panic!("the failure must be logged; log was:\n{logged}"));
-    assert!(failure.contains(USERNAME), "{failure}");
     assert!(failure.contains("credentials rejected"), "{failure}");
 
     // But it carries nothing derived from the secret.

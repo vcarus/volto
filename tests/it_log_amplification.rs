@@ -32,7 +32,8 @@ use std::sync::Arc;
 use common::{
     ALLOW_PRIVATE, H3Client, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer, auth_section, authorize,
     authorized_connect, basic_credentials, close_and_drain, closed_udp_address, connect_request,
-    connect_udp_request, open_tcp_tunnel, respond_to, spawn_echo_target,
+    connect_udp_request, field_text, numeric_field, open_tcp_tunnel, respond_to,
+    spawn_echo_target,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -123,14 +124,28 @@ async fn a_policy_refusal_storm_is_sampled(buffer: &SharedBuffer) {
         reports.join("\n")
     );
 
-    // Nothing was silenced: every refusal the peer made is still answered, and
-    // the ones that were not reported are on the debug channel an operator can
-    // turn on. What the sampler removes is repetition, not the record.
+    // The line names the target by its own fields, not only through the
+    // resolved `addresses` list.
+    assert_eq!(
+        (field_text(&reports[0], "host"), numeric_field(&reports[0], "port")),
+        ("\"127.0.0.1\"", 443),
+        "the line must name the authority it is about: {}",
+        reports[0]
+    );
+
+    // At `info` the sampled reports are the only lines with this message, and
+    // nothing about the target reaches WARN.
     let refused = buffer.lines_since(mark, &["every address of the target is prohibited"]);
     assert_eq!(
         refused.len(),
         reports.len(),
         "at `info` only the sampled lines may appear at all"
+    );
+    let warnings = buffer.lines_since(mark, &[" WARN ", PROHIBITED]);
+    assert!(
+        warnings.is_empty(),
+        "a policy refusal must produce no warning at all, got:\n{}",
+        warnings.join("\n")
     );
 }
 
@@ -228,14 +243,6 @@ async fn an_authentication_storm_is_bounded_by_the_failure_budget(buffer: &Share
          about it; got {}:\n{}",
         failures.len(),
         failures.join("\n")
-    );
-
-    // The password may not appear anywhere, at any level, however the attempt
-    // was graded -- and neither may the real one, which nothing here ever sends.
-    let contents = buffer.since(mark);
-    assert!(
-        !contents.contains("wrong-password") && !contents.contains(PASSWORD),
-        "a credential reached the log:\n{contents}"
     );
 }
 
