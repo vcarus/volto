@@ -12,13 +12,9 @@
 //!   STOP_SENDING;
 //! * [`Connection::accept`], which hands request streams to the caller.
 //!
-//! The background task makes the peer's SETTINGS usable when they arrive. The
-//! control stream has a reader of its own, and the flag it writes is the one
-//! the sessions hold ([`Connection::peer_settings`]). So there is no moment at
-//! which the peer's answer is known and not yet acted on. If the control stream
-//! were read only while an accept is polled, a CONNECT-UDP session started
-//! right after the handshake could read a stale "datagrams not allowed" and
-//! stay on the RFC 9297 capsule fallback for its whole life.
+//! The background task reads the peer's control stream on its own, so the flag
+//! the sessions hold ([`Connection::peer_settings`]) changes when SETTINGS is
+//! read.
 //!
 //! A request can still be served before that reader has run, although the
 //! peer sent its SETTINGS first: the request has a task of its own, and
@@ -45,11 +41,6 @@
 //! connection, and handed to the session if it claims its Quarter Stream ID
 //! within a fraction of a second ([`EARLY_DATAGRAMS`], [`EARLY_DATAGRAM_HOLD`],
 //! D114).
-//!
-//! Only the receiving half is here. A datagram goes *out* on the
-//! [`quinn::Connection`] itself, which the UDP sessions hold anyway for the
-//! send-buffer and datagram-size questions they ask per packet, and which has
-//! no HTTP/3 in it to consult.
 //!
 //! # How a connection error is signalled
 //!
@@ -112,7 +103,7 @@ const REQUEST_STREAM_STEP: u64 = 4;
 /// control stream has run. The bound is for the two other cases. A peer that
 /// sends no SETTINGS must not hold a request for good. And when the packet
 /// that carried the frame was lost, the request is served without it after
-/// the bound, as it was before this wait existed.
+/// the bound.
 ///
 /// The figure is our own choice. It is the one RFC 9002 §6.2.2 gives for a
 /// round trip that has not been measured, quoted on
@@ -167,9 +158,6 @@ impl PeerSettings {
     /// the caller reads [`Self::datagrams`] afterwards, which says `false`
     /// for SETTINGS that did not come in time just as it does for SETTINGS
     /// that do not allow datagrams, and the caller acts the same on both.
-    ///
-    /// The frame is marked as read after the datagram flag is written, so a
-    /// caller this wakes reads the flag as the frame set it.
     pub async fn read(&self) {
         let mut read = self.read.clone();
         // The error is the sender dropped, which is the connection gone. The
@@ -202,17 +190,12 @@ impl PeerSettings {
 pub(crate) struct Shared {
     /// Whether the peer's SETTINGS enabled HTTP Datagrams (RFC 9297 §2.1.1).
     ///
-    /// Its own `Arc` because it is the one piece of connection state that
-    /// leaves this layer: the sessions in `tunnel::udp` hold the same flag and
-    /// read it per packet, so the moment the control stream reports it, every
-    /// session on the connection is already looking at the new value.
+    /// Its own `Arc` because every [`PeerSettings`] holds it.
     peer_datagrams: Arc<AtomicBool>,
     /// Whether the peer's SETTINGS frame has been read, whatever it said.
     ///
     /// A watch and not a second flag, because a request waits on it
-    /// ([`PeerSettings::read`]). [`Shared::settings_arrived`] sets it after
-    /// `peer_datagrams`, so whoever it wakes reads that flag as the frame set
-    /// it.
+    /// ([`PeerSettings::read`]).
     settings_read: watch::Sender<bool>,
     /// What this connection may hold in half-received frames at once (D77).
     ///
@@ -264,14 +247,13 @@ impl Shared {
     /// enabled HTTP Datagrams.
     ///
     /// The datagram flag starts false, so it is written only when `datagrams`
-    /// is true. It is written before the mark that the frame was read, for the
-    /// reason the comment below gives.
+    /// is true.
     pub(super) fn settings_arrived(&self, datagrams: bool) {
         if datagrams {
             self.peer_datagrams.store(true, Ordering::Relaxed);
         }
-        // After the flag: a request this wakes reads the flag next
-        // (`PeerSettings::read`).
+        // After the flag, so a request this wakes reads the flag as the frame
+        // set it.
         self.settings_read.send_replace(true);
     }
 
@@ -431,12 +413,9 @@ impl Handle {
     /// [`Connection::_qpack`]); three of this endpoint's streams write through
     /// here and all three are critical.
     ///
-    /// Routed through [`Self::fail`] rather than merely returned, because a
-    /// connection error in this layer *is* the CONNECTION_CLOSE that carries the
-    /// code (RFC 9114 §8). If the violation were only returned, the peer would
-    /// see whatever close came next, in practice the H3_NO_ERROR that
-    /// [`Connection`]'s `Drop` sends. That would report no error for a fault
-    /// the RFC makes a MUST.
+    /// It goes through [`Self::fail`], so the CONNECTION_CLOSE carries the code
+    /// (RFC 9114 §8); a returned violation would leave the wire to the
+    /// H3_NO_ERROR of `Drop`.
     fn critical_write(&self, error: quinn::WriteError) -> ConnectionError {
         match error {
             quinn::WriteError::ConnectionLost(error) => error.into(),
@@ -1071,11 +1050,7 @@ mod tests {
     async fn a_quiet_close_does_not_hide_an_earlier_violation() {
         let (_client, server) =
             crate::quic::tests::loopback_pair(quinn::TransportConfig::default()).await;
-        let handle = Handle {
-            quic: server.clone(),
-            idle: Duration::from_secs(5),
-            shared: Arc::new(Shared::default()),
-        };
+        let handle = Handle::for_tests(server.clone());
         let uni = || async { server.open_uni().await.expect("open a stream") };
         let connection = Connection {
             handle,
@@ -1108,11 +1083,7 @@ mod tests {
     async fn a_close_for_a_reason_of_our_own_is_not_renamed_by_a_later_violation() {
         let (client, server) =
             crate::quic::tests::loopback_pair(quinn::TransportConfig::default()).await;
-        let handle = Handle {
-            quic: server,
-            idle: Duration::from_secs(5),
-            shared: Arc::new(Shared::default()),
-        };
+        let handle = Handle::for_tests(server);
 
         let _ = handle.close_for(
             Code::H3_REQUEST_REJECTED,
