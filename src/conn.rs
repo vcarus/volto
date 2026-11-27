@@ -45,9 +45,6 @@ pub struct Counts {
 /// Returns `Err` only for connection-level failures; per-request problems are
 /// logged and confined to their own stream.
 ///
-/// `tunnels` counts the requests that get a tunnel slot here; it belongs to
-/// [`crate::quic`], which reads it after this returns (D72).
-///
 /// # Shutdown
 ///
 /// When `shutdown` fires this sends a GOAWAY and then keeps the connection alive
@@ -98,22 +95,11 @@ pub struct Counts {
 ///
 /// # The unauthenticated bound
 ///
-/// A connection has `SILENCE_FACTOR` idle timeouts *from the handshake* to get
-/// one request past the credentials check, after which it is closed with
-/// H3_NO_ERROR. Without it a peer that completes the QUIC handshake and then
-/// says nothing holds a `max_connections` slot for as long as it keeps its
-/// socket open, since its QUIC stack answers our keep-alive PINGs and so keeps
-/// the transport's idle timeout from ever firing (D76). Once a request
-/// authenticates the bound is gone for the life of the connection.
-///
-/// The deadline is absolute rather than rearmed on each wait. A request stream
-/// is accepted the moment the peer opens it, so with a rearmed timer a peer
-/// that opened one every other idle timeout (a byte apiece, never a credential)
-/// would hold the slot for ever. Nothing legitimate is near the deadline: a
-/// client that has just completed two handshakes sends its first request within
-/// a round trip. How much of this server such a connection may occupy meanwhile
-/// is bounded by the stream clamp `quic::INITIAL_BIDI_STREAMS`, lifted by the
-/// same request.
+/// A connection that has not authenticated has `SILENCE_FACTOR` idle timeouts
+/// from the handshake to get one request past the credentials check, and is
+/// then closed with H3_NO_ERROR (D76). The deadline is absolute, so opening
+/// streams without credentials does not rearm it (D92), and authentication
+/// lifts it for the life of the connection.
 ///
 /// `generation` is the configuration the connection was accepted under, with
 /// the credentials and destination rules built from it. `resolver` is the
@@ -220,13 +206,9 @@ pub async fn handle(
 
             accepted = next_request(&mut connection, &context, deadline) => match accepted {
                 NextRequest::Stream(resolver) => {
-                    // Taken here rather than inside the task, and before the
-                    // spawn: what it records is that this connection has
-                    // accepted a request, which is true from this line on
-                    // whether or not the task has been polled yet. Held for the
-                    // task's whole life, so the drain cannot mistake a request
-                    // whose headers are still arriving for a connection with
-                    // nothing left to do (see [`crate::tunnel::Pending`]).
+                    // Taken before the spawn and held for the task's life, so
+                    // the drain counts a request whose headers are still
+                    // arriving (see [`crate::tunnel::Pending`]).
                     let pending = context.quota.enter();
                     let context = Arc::clone(&context);
                     requests.spawn(async move {
@@ -279,12 +261,8 @@ pub async fn handle(
 /// sending packets of its own. The cost of the factor is that such a peer holds
 /// its slot for two idle timeouts rather than one, which is bounded either way.
 ///
-/// Visible to the crate because [`crate::config`]'s test for D86 multiplies by
-/// it: the ceiling on `max_idle_timeout` is what keeps `Instant::now() + idle *
-/// this` inside what the arithmetic can take, and a ceiling pinned against a
-/// copy of the factor would stop meaning anything the day the factor moved.
-/// `validate` itself never multiplies. It compares against the ceiling
-/// constant, and this is the number that ceiling was chosen for.
+/// `pub(crate)` because `config`'s D86 test multiplies by it: the ceiling on
+/// `max_idle_timeout` keeps `Instant::now() + idle * SILENCE_FACTOR` in range.
 pub(crate) const SILENCE_FACTOR: u32 = 2;
 
 /// Whether a connection still has work to do once its GOAWAY is out.
@@ -379,34 +357,11 @@ impl From<Result<h3api::Resolver, h3api::ConnectionError>> for NextRequest {
 /// point in time rather than a duration to count down, so a caller may poll this
 /// inside a `select!` and lose nothing at all by doing so.
 ///
-/// The flag is read on every pass rather than once, because it is written by the
-/// request tasks: a request accepted a moment ago may be authenticating right
-/// now, and a deadline that has just expired must not close the connection out
-/// from under it. That re-read is the *only* place the verdict is reached, which
-/// is why a lapsed wait goes back round the loop instead of deciding for itself.
-///
-/// # Why the clock is read as well as awaited
-///
-/// `tokio::time::timeout_at` polls the future it wraps **first** and returns its
-/// value without ever consulting the clock, so a lapsed deadline is only noticed
-/// on a poll where nothing was ready. [`h3api::Connection::accept`] is ready the
-/// moment the peer has opened a stream, and a peer may always have another one
-/// queued. With `max_streams_bidi` raised, a peer that opens request streams
-/// and finishes each one empty (a stream error apiece, so the connection
-/// survives every one and the allowance comes straight back) can keep the loop
-/// supplied indefinitely, and the deadline is then never measured. Reading the
-/// clock stops it being skipped, as being absolute stops it being rearmed (D92).
-///
-/// A peer under the pre-authentication clamp (`quic::INITIAL_BIDI_STREAMS`)
-/// cannot keep a supply of that depth: the configured allowance does not reach
-/// it at all, and sixteen streams' worth of credit comes back three at a time.
-/// That makes this the second defence rather than the first. It stays, because
-/// hard to reach is not unreachable: the clamp is lifted by authentication and
-/// the deadline exists only until authentication, so neither can stand in for
-/// the other.
-///
-/// So the clock is read before each wait. The cost is one `Instant::now()` per
-/// accepted stream, and only while the connection has yet to authenticate.
+/// The flag is read on every pass, because a request task may authenticate
+/// while this waits, and that re-read is the only place the verdict is reached.
+/// The clock is read before each wait as well as awaited: `timeout_at` returns
+/// a ready inner future without consulting the clock, so a peer that always
+/// has another stream queued would never meet the deadline (D92).
 async fn next_request(
     connection: &mut h3api::Connection,
     context: &Context,
@@ -417,20 +372,14 @@ async fn next_request(
             return connection.accept().await.into();
         }
 
-        // The verdict, and the only place it is reached. The authentication
-        // flag has just been read above, so a request that is authenticating
-        // can race this only in the moment between that read and this one.
         if tokio::time::Instant::now() >= deadline {
             return NextRequest::Silent;
         }
 
         match tokio::time::timeout_at(deadline, connection.accept()).await {
             Ok(accepted) => return accepted.into(),
-            // Back round the loop rather than deciding here: the next pass
-            // re-reads the authentication flag, because a request may have
-            // authenticated while this waited, and then the clock, which has
-            // just reached the deadline. Deciding in this arm as well would be
-            // a second copy of that judgement to keep in step.
+            // Back round the loop: the next pass re-reads the flag, then the
+            // clock.
             Err(_elapsed) => {}
         }
     }
@@ -469,11 +418,8 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
 /// Reads a request's headers, or `None` when the stream has already been dealt
 /// with.
 async fn resolve(resolver: h3api::Resolver) -> Option<(Request, h3api::Stream)> {
-    // Bounded for the same reason the accept loop is: a peer may open a request
-    // stream, send one byte and stop, and `max_streams_bidi` of those would be
-    // `max_streams_bidi` parked tasks per connection, from a peer that has not
-    // authenticated. On expiry the stream is reset with H3_REQUEST_INCOMPLETE
-    // and the connection carries on (D76).
+    // `Resolver::resolve` bounds this wait at one idle timeout and resets the
+    // stream with H3_REQUEST_INCOMPLETE on expiry (D76).
     match resolver.resolve().await {
         Ok(resolved) => Some(resolved),
         Err(error) => {
@@ -527,9 +473,8 @@ fn refused_as_a_message(req: &Request) -> Option<MessageRefusal> {
         return Some(MessageRefusal::ConnectionSpecificField(field));
     }
 
-    // Before any credential is tried, and so before any of them is charged: a
-    // request carrying more values than `auth::MAX_CREDENTIAL_VALUES` is a batch
-    // of guesses answered by one 407.
+    // Before any credential is tried, so none is charged: without this check a
+    // request could carry a batch of guesses and draw a single 407.
     let offered = auth::credential_values(&req.fields);
     if offered > auth::MAX_CREDENTIAL_VALUES {
         return Some(MessageRefusal::TooManyCredentials(offered));
@@ -583,13 +528,8 @@ async fn authenticate(req: &Request, context: &Context, stream: &mut h3api::Stre
                 log_id = "3gmzhaq7",
                 stream_id,
                 remote = %context.remote,
-                // Recorded as a `str`, not through `or_dash`: these bytes are the
-                // peer's, and tracing prints a `str` field quoted and escaped, so
-                // a newline or a terminal escape in a guessed user-id cannot
-                // forge a journal line. See `logfmt`'s third rule. Their number
-                // is the peer's too, since a user-id is whatever it put before
-                // the first colon of a field section, and `auth` has already
-                // cut it to what a log line can carry.
+                // Recorded as a `str`, so tracing quotes and escapes the peer's
+                // bytes (`logfmt`'s third rule); `auth` has already cut the length.
                 username = denied.username().unwrap_or(crate::logfmt::ABSENT),
                 reason = denied.reason(),
                 "authentication failed"
@@ -649,12 +589,8 @@ async fn authenticate(req: &Request, context: &Context, stream: &mut h3api::Stre
 /// rather than trailing them.
 async fn take_slot(context: &Context, stream: &mut h3api::Stream) -> Option<tunnel::Slot> {
     let Some(slot) = context.quota.acquire() else {
-        // Sampled for the reason `tunnel::admit_target`'s refusal is: a
-        // connection that has reached its limit answers every further request
-        // this way, at one HEADERS frame apiece, for as long as the peer keeps
-        // asking. The first refusal is a warning and the reports carry the
-        // running total, so an operator sees both that the limit was hit and
-        // how hard (`crate::logfmt::Sampler`).
+        // Sampled (`crate::logfmt::Sampler`): a connection at its limit answers
+        // every further request this way, one HEADERS frame apiece.
         let stream_id = stream.id();
         let live = context.quota.live();
         match context.limit_refusals.record() {
@@ -689,8 +625,8 @@ async fn route(req: &Request, mut stream: h3api::Stream, context: &Context) {
                 tunnel::tcp::run(authority, stream, context).await;
             }
             None => {
-                // Unreachable: RFC 9114 §4.4 is enforced in the codec, which
-                // rejects "a CONNECT request without :authority" as malformed
+                // Unreachable: RFC 9114 §4.4 makes a CONNECT request whose
+                // `:authority` is missing malformed, the codec rejects it
                 // before `handle_request` is reached, and `Route::Tcp` is the
                 // same predicate the codec takes that branch on. Answered
                 // rather than asserted, for the reason `udp::run` gives its own
@@ -726,17 +662,9 @@ async fn route(req: &Request, mut stream: h3api::Stream, context: &Context) {
 
 /// Logs every inbound request at DEBUG, with credentials redacted.
 ///
-/// This is the primary tool for establishing empirically what Surge actually
-/// sends (which header it puts credentials in, which URI template it uses for
-/// CONNECT-UDP), so every header *line* is logged. What is redacted is only the
-/// secret itself: the header name and the auth scheme survive, because
-///
-/// * which of `Proxy-Authorization` and `Authorization` Surge uses is still
-///   unconfirmed (decision D3), and this log is how it gets confirmed;
-/// * the scheme distinguishes "Surge sent Basic as expected" from "Surge sent
-///   something we do not implement", which is a different bug entirely.
-///
-/// Neither of those needs the credential, so the credential does not appear.
+/// The header name and the auth scheme are kept and only the secret is
+/// redacted, so a client sending the wrong scheme or field is visible in the
+/// log.
 fn log_request(req: &Request, stream_id: u64) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
@@ -821,8 +749,7 @@ mod tests {
     }
 
     /// The redaction above and the acceptance in [`auth`] read the same list,
-    /// which is the point: two of them would let decision D3 be settled in one
-    /// place and print the credential in the other.
+    /// so a field accepted for credentials is never printed.
     #[test]
     fn both_credential_headers_are_recognised() {
         assert!(auth::is_credential_field("proxy-authorization"));
@@ -875,8 +802,8 @@ mod tests {
     }
 
     /// The scheme is attacker-controlled, so it cannot be echoed unconditionally:
-    /// this is what stops an unauthenticated peer writing arbitrary text — or a
-    /// forged log line — into the log through it.
+    /// this is what stops an unauthenticated peer writing arbitrary text, or a
+    /// forged log line, into the log through it.
     #[test]
     fn an_untrustworthy_scheme_is_not_echoed() {
         let long = "S".repeat(17);
