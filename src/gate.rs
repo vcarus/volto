@@ -393,18 +393,10 @@ impl Expected {
 
     /// Replaces the policy, for every datagram received from now on.
     ///
-    /// The policy is written first and the flag second, with a `Release` store
-    /// against the `Acquire` load in [`Expected::any`], so a reader that sees
-    /// the flag set also sees the policy the flag is about.
-    ///
-    /// The order matters in one direction only. A reader that has already
-    /// loaded the flag while it still said "off" judges its batch against the
-    /// policy that was in force a moment earlier, which is what a reload means
-    /// for every datagram that arrived just before it and is why the gate can
-    /// be reloaded at all. Storing the flag first would allow the opposite: a
-    /// reader seeing "the gate is on" and then reading a policy that is not yet
-    /// the new one, which is a judgement made against a policy no
-    /// configuration ever asked for.
+    /// The flag is a shortcut for a gate that is off, read without the lock.
+    /// A batch that reads a stale flag either passes as if it arrived before
+    /// the reload, or takes the lock and reads the policy in force, which
+    /// `screen_holding` checks again.
     ///
     /// The replay record is never emptied by a reload. An entry is the `enc`
     /// of a flight some key opened, and the copy it guards against is that
