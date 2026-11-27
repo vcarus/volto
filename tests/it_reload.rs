@@ -614,7 +614,8 @@ async fn reloading_swaps_the_certificate() {
     );
 
     // While a client trusting the new one connects and tunnels normally.
-    let mut trusting = H3Client::connect_with_ca(&server, reissued.cert.der().clone()).await;
+    let trusting = common::client_endpoint(reissued.cert.der(), &["h3"]);
+    let mut trusting = H3Client::connect_on(trusting, &server).await;
     assert_eq!(
         respond_to(&mut trusting, connect_request(&target.to_string()))
             .await

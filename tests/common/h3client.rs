@@ -43,7 +43,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use rustls::pki_types::CertificateDer;
 use tokio::task::{JoinHandle, JoinSet};
 
 use volto::h3::error::Violation;
@@ -63,7 +62,7 @@ use super::rawstream::{
     RESERVED_HTTP2_TYPES, STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
 };
 use super::{TIMEOUT, TestServer};
-use super::{client_endpoint_with_transport, connect_quic, connect_quic_with_ca, finish_connect};
+use super::{client_endpoint, client_endpoint_with_transport, finish_connect};
 
 /// Largest control-stream frame payload this client will buffer.
 ///
@@ -237,7 +236,7 @@ impl H3Client {
 
     /// Connects and completes the HTTP/3 handshake, advertising datagram support.
     pub async fn connect(server: &TestServer) -> Self {
-        Self::connect_with_datagrams(server, true).await
+        Self::over(client_endpoint(&server.ca, &["h3"]), server, true).await
     }
 
     /// [`H3Client::connect`] with every field name and value Huffman-coded.
@@ -252,18 +251,12 @@ impl H3Client {
         client
     }
 
-    /// Connects while trusting `ca` rather than the server's original certificate.
-    pub async fn connect_with_ca(server: &TestServer, ca: CertificateDer<'static>) -> Self {
-        let (endpoint, connection) = connect_quic_with_ca(server, ca).await;
-        Self::from_quic(endpoint, connection, true).await
-    }
-
     /// Connects without advertising `SETTINGS_H3_DATAGRAM`.
     ///
     /// RFC 9297 §2.1.1 then forbids the server from sending QUIC datagrams, so
     /// the session has to fall back to DATAGRAM capsules on the request stream.
     pub async fn connect_without_datagrams(server: &TestServer) -> Self {
-        Self::connect_with_datagrams(server, false).await
+        Self::over(client_endpoint(&server.ca, &["h3"]), server, false).await
     }
 
     /// [`H3Client::connect`] on a peer whose transport parameters the test chose.
@@ -277,11 +270,7 @@ impl H3Client {
         transport: quinn::TransportConfig,
     ) -> Self {
         let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], transport);
-        let connection = finish_connect(&endpoint, server.addr)
-            .await
-            .expect("handshake");
-
-        Self::from_quic(endpoint, connection, true).await
+        Self::over(endpoint, server, true).await
     }
 
     /// [`H3Client::connect_without_datagrams`] with a per-stream receive window
@@ -297,25 +286,22 @@ impl H3Client {
         let mut transport = quinn::TransportConfig::default();
         transport.stream_receive_window(window.into());
         let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], transport);
-        let connection = finish_connect(&endpoint, server.addr)
-            .await
-            .expect("handshake");
-
-        Self::from_quic(endpoint, connection, false).await
+        Self::over(endpoint, server, false).await
     }
 
-    /// [`H3Client::connect`] over an endpoint the caller built, for a client
-    /// TLS configuration no constructor here builds (rustls with ECH in
-    /// `it_tls`). The handshake asks for `localhost`, as the others do.
+    /// [`H3Client::connect`] over an endpoint the caller built: one trusting
+    /// another CA (`it_reload`), or a client TLS configuration no constructor
+    /// here builds (rustls with ECH in `it_tls`).
     pub async fn connect_on(endpoint: quinn::Endpoint, server: &TestServer) -> Self {
+        Self::over(endpoint, server, true).await
+    }
+
+    /// The QUIC handshake over `endpoint`, asking for `localhost`, then the
+    /// client half of the HTTP/3 one. Every constructor above ends here.
+    async fn over(endpoint: quinn::Endpoint, server: &TestServer, datagrams: bool) -> Self {
         let connection = finish_connect(&endpoint, server.addr)
             .await
             .expect("handshake");
-        Self::from_quic(endpoint, connection, true).await
-    }
-
-    async fn connect_with_datagrams(server: &TestServer, datagrams: bool) -> Self {
-        let (endpoint, connection) = connect_quic(server).await;
         Self::from_quic(endpoint, connection, datagrams).await
     }
 
@@ -461,7 +447,7 @@ impl H3Client {
         server: &TestServer,
         within: Duration,
     ) -> Result<Self, NoClient> {
-        let endpoint = super::client_endpoint(&server.ca, &["h3"]);
+        let endpoint = client_endpoint(&server.ca, &["h3"]);
         let connecting = endpoint
             .connect(server.addr, "localhost")
             .expect("start connecting");

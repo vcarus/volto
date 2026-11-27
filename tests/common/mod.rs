@@ -855,17 +855,7 @@ pub fn endpoint_from(
 
 /// Opens a raw QUIC connection to the server, without HTTP/3 on top.
 pub async fn connect_quic(server: &TestServer) -> (quinn::Endpoint, quinn::Connection) {
-    connect_quic_with_ca(server, server.ca.clone()).await
-}
-
-/// Opens a raw QUIC connection, trusting `ca` instead of the server's original.
-///
-/// Used to prove a reloaded certificate really took effect.
-pub async fn connect_quic_with_ca(
-    server: &TestServer,
-    ca: CertificateDer<'static>,
-) -> (quinn::Endpoint, quinn::Connection) {
-    let endpoint = client_endpoint(&ca, &["h3"]);
+    let endpoint = client_endpoint(&server.ca, &["h3"]);
     let connection = finish_connect(&endpoint, server.addr)
         .await
         .expect("handshake");
