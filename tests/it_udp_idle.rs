@@ -43,7 +43,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::{
-    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, open_udp_session, spawn_silent_udp_target,
+    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, counted_at_least, open_udp_session,
+    spawn_silent_udp_target,
 };
 use tokio::time::Instant;
 use volto::datagram;
@@ -138,9 +139,7 @@ async fn a_flooded_session_closes_once_the_flood_stops_and_the_flood_crosses_not
     // Waited for at the target, so the deadline is known to be armed — and
     // armed by the flood's first packet, the only one the budget forwards —
     // with the flood already at full rate behind it.
-    while received.load(Ordering::Relaxed) == 0 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    counted_at_least(&received, 1).await;
     let armed = Instant::now();
 
     // Hold the flood over the whole deadline window and past it, then stop it

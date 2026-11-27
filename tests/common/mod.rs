@@ -1996,3 +1996,26 @@ pub async fn windowless_connection_at(
 
     (endpoint, connection)
 }
+
+/// Waits until `counter` has reached `n`, within [`TIMEOUT`].
+///
+/// For a target that counts what reaches it, such as the one
+/// [`spawn_silent_udp_target`] returns. The sends that feed it are
+/// fire-and-forget, so the count is waited for rather than read once. A count
+/// past `n` is not a failure here; a caller that means exactly `n` asserts that
+/// afterwards.
+#[track_caller]
+pub fn counted_at_least(counter: &AtomicU64, n: u64) -> impl Future<Output = ()> + '_ {
+    let caller = Location::caller();
+    async move {
+        let deadline = Instant::now() + TIMEOUT;
+        while counter.load(Ordering::Relaxed) < n {
+            assert!(
+                Instant::now() < deadline,
+                "at {caller}: the count was {} of {n} after {TIMEOUT:?}",
+                counter.load(Ordering::Relaxed)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}

@@ -14,10 +14,10 @@ use common::rawstream::{
 };
 use common::{
     ALLOW_PRIVATE, DELIBERATE, H3Client, TIMEOUT, TestServer, closed_udp_address,
-    connect_udp_request, open_udp_session, open_udp_session_to, respond_to, send_udp_payload,
-    spawn_bursting_udp_target, spawn_flooding_udp_target, spawn_pushing_udp_target,
-    spawn_silent_udp_target, spawn_tagged_udp_target, spawn_udp_echo_target, spawn_udp_target,
-    udp_round_trip,
+    connect_udp_request, counted_at_least, open_udp_session, open_udp_session_to, respond_to,
+    send_udp_payload, spawn_bursting_udp_target, spawn_flooding_udp_target,
+    spawn_pushing_udp_target, spawn_silent_udp_target, spawn_tagged_udp_target,
+    spawn_udp_echo_target, spawn_udp_target, udp_round_trip,
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
@@ -1189,13 +1189,7 @@ async fn payloads_reaching_a_silent_target_postpone_the_session_timeout() {
     // All eight arrived: the session was alive to forward the last of them,
     // 3.2 s into a 1 s timeout. Waited out rather than asserted immediately,
     // since the sends are fire-and-forget.
-    tokio::time::timeout(TIMEOUT, async {
-        while received.load(std::sync::atomic::Ordering::Relaxed) < 8 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("all eight payloads must reach the silent target");
+    counted_at_least(&received, 8).await;
 
     // And once the sends stop, the timeout still does its job.
     ends_cleanly(&mut stream, "the quiesced session").await;
@@ -1387,13 +1381,7 @@ async fn a_session_whose_200_never_landed_forwards_nothing() {
     let (control, _stream) = open_udp_session(&mut client, &server, target).await;
     send_udp_payload(&client.quic, control, b"the control packet");
 
-    tokio::time::timeout(TIMEOUT, async {
-        while received.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the control session's payload must reach the target");
+    counted_at_least(&received, 1).await;
 
     assert_eq!(
         received.load(std::sync::atomic::Ordering::Relaxed),

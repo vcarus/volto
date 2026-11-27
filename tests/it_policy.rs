@@ -15,9 +15,9 @@ use common::rawstream::H3_REQUEST_CANCELLED;
 use common::{
     ALLOW_PRIVATE, H3Client, TIMEOUT, TestServer, assert_peer_reset, auth_section, authorize,
     authorized_connect, basic_credentials, close_and_drain, connect_request, connect_udp_request,
-    echoes, open_tcp_tunnel, open_udp_session, proxy_status, respond_to, send_and_respond,
-    send_udp_payload, spawn_echo_target, spawn_silent_udp_target, spawn_udp_echo_target,
-    udp_round_trip,
+    counted_at_least, echoes, open_tcp_tunnel, open_udp_session, proxy_status, respond_to,
+    send_and_respond, send_udp_payload, spawn_echo_target, spawn_silent_udp_target,
+    spawn_udp_echo_target, udp_round_trip,
 };
 use volto::h3api::{FieldValue, Request, Status};
 
@@ -801,15 +801,7 @@ async fn packets_to_a_silent_target_are_capped() {
 
     // Wait for the budget to be spent, then keep waiting to catch any leak past
     // it. Without the cap all 20 packets would arrive.
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    while received.load(std::sync::atomic::Ordering::Relaxed) < BUDGET {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "only {} of the {BUDGET} budgeted packets arrived",
-            received.load(std::sync::atomic::Ordering::Relaxed)
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    counted_at_least(&received, BUDGET).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert_eq!(
@@ -856,15 +848,7 @@ async fn a_churn_of_sessions_cannot_restore_the_unanswered_budget() {
 
     // Wait for the total to be spent, then keep waiting to catch any leak past
     // it. Without a connection-level total all 40 packets would arrive.
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    while received.load(std::sync::atomic::Ordering::Relaxed) < connection_total {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "only {} of the {connection_total} budgeted packets arrived",
-            received.load(std::sync::atomic::Ordering::Relaxed)
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    counted_at_least(&received, connection_total).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert_eq!(
