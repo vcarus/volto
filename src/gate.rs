@@ -352,7 +352,7 @@ fn follow(memory: &mut Memory, new: Arc<Policy>) {
 ///
 /// The flag beside it answers "is the gate on at all" without taking the lock,
 /// because a gate that is off is the shipped default. A gate that is off then
-/// costs a receive batch one atomic load.
+/// costs a receive batch three atomic loads and no lock.
 #[derive(Clone)]
 pub struct Expected(Arc<Held>);
 
@@ -957,7 +957,7 @@ impl AsyncUdpSocket for Gate {
         metas: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         // A closed gate admits no Initial and delivers nothing from the hold;
-        // `Expected::close` says why. One atomic load per batch otherwise.
+        // `Expected::close` says why.
         if self.expected.closed() {
             let count = match self.inner.poll_recv(cx, bufs, metas) {
                 Poll::Ready(Ok(count)) => count,
@@ -992,8 +992,7 @@ impl AsyncUdpSocket for Gate {
             other => return other,
         };
 
-        // The flag first, so a gate that is off pays one atomic load per batch
-        // and takes no lock.
+        // A gate that is off takes no lock.
         if !self.expected.any() {
             return Poll::Ready(Ok(count));
         }
