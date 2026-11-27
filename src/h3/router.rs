@@ -23,10 +23,6 @@ use super::error::{Code, Violation};
 
 /// Which way an inbound HTTP Datagram was dropped, and so which of [`Router`]'s
 /// four samplers keeps its schedule.
-///
-/// Naming the shape rather than passing [`Router::count_drop`] one of its own
-/// fields keeps the choice of sampler in one place. A fifth shape then fails to
-/// compile until it has a sampler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DropKind {
     /// A Context ID this server has no extension for (RFC 9298 §5).
@@ -71,15 +67,8 @@ pub(super) struct Router {
     /// How often each way of dropping has been reported, on a doubling
     /// schedule.
     ///
-    /// Drops arrive at whatever rate the peer sends, so a line per drop would
-    /// amplify the log under a debug subscriber and cost formatting on the
-    /// routing task either way. [`crate::logfmt::Sampler`] is this crate's one
-    /// mechanism for that. The first drop of each shape is reported at once,
-    /// and later reports give the running count. There are four samplers
-    /// because the shapes have different diagnoses, and each doubles at its
-    /// own rate: an extension this server does not speak, a session racing its
-    /// own close (or a misdirected flood), a target not draining, and a
-    /// datagram cut short of its Context ID.
+    /// One [`crate::logfmt::Sampler`] per [`DropKind`], so a flood of one shape
+    /// cannot silence the first report of another.
     ///
     /// The closing line's `dropped_datagrams` is still the total across all
     /// four. These bound the debug lines, not the count.
@@ -372,16 +361,9 @@ pub const EARLY_DATAGRAMS: usize = 8;
 //# starting with a PTO of 1 second, as recommended for TCP's initial
 //# RTO; see Section 2 of [RFC6298].
 ///
-/// The wait it has to cover is short. A session claims its Quarter Stream ID
-/// as soon as its request is decoded, authenticated and known to be a
-/// well-formed CONNECT-UDP request, before its target name is resolved. The
-/// datagram and the request travel in the same flight, so the wait is that
-/// processing, which takes about a millisecond, or one retransmission of the
-/// request's packet if that packet was lost and the datagram's was not. 333 ms
-/// covers the first with a wide margin and the second on a path whose round
-/// trip is well below it. It is also well inside the 1 s after which a
-/// tunnelled QUIC client resends its Initial itself, so a longer hold would
-/// gain nothing.
+/// It covers the decoding and authentication of the request that travels with
+/// the datagram, and stays under the 1 s after which a tunnelled QUIC client
+/// resends its Initial itself (D114).
 ///
 /// This is how long a held datagram stays deliverable, not how long its memory
 /// is kept. Expiry runs when the hold is touched, by another early datagram or
@@ -541,45 +523,15 @@ fn enqueue(inbound: &mpsc::Sender<Bytes>, payload: Bytes) -> bool {
 /// §5 calls optimistically sent packets, and while it runs. So this constant is
 /// the whole per-session bound on queued datagrams.
 ///
-/// # What a session costs at the configured limits
-///
-/// A session holds three buffers, and this constant sizes only the first.
-///
-/// * The queue. A QUIC DATAGRAM frame cannot be fragmented, so a datagram never
-///   exceeds the `max_udp_payload_size` this server advertises (quinn's
-///   default, 1472 bytes): 64 of them are about 92 KiB. A payload that waits
-///   behind others is a copy, and the one in an empty queue may be a slice
-///   that keeps a whole GRO batch alive, at most 94208 bytes (`enqueue`), so
-///   the worst case is 63 copies and one batch, about 183 KiB.
-/// * The block a running session receives its *target's* packets into
-///   ([`crate::tunnel`]'s UDP path), 16 KiB, allocated only once the target
-///   first sends.
-/// * The [`crate::capsule::CapsuleDecoder`] on the request stream, which holds
-///   at most one DATAGRAM capsule value,
-///   [`crate::capsule::MAX_DATAGRAM_CAPSULE_VALUE`], about 64 KiB, until the
-///   session's idle timeout
-///   (`tests/it_bounds.rs::a_session_holds_one_unfinished_capsule_and_no_more`
-///   and `a_decoder_keeps_one_unfinished_capsule_of_a_large_chunk`).
-///
-/// A session therefore costs about 263 KiB at worst, 172 KiB without GRO (as
-/// on macOS), and a server that times `max_targets_per_conn` times
-/// `max_connections`: with the shipped defaults of 256 and 256, about 66 MiB
-/// per connection and 16.4 GiB across a server saturated at both limits.
-/// Lowering either limit lowers it proportionally. All three are released by
-/// dropping what owns them, on every path a session ends by
+/// A session holds three buffers: this queue (at most 63 copies and one GRO
+/// batch, see `enqueue`), the target receive block of `crate::tunnel`'s UDP
+/// path, and one DATAGRAM capsule value
+/// ([`crate::capsule::MAX_DATAGRAM_CAPSULE_VALUE`]). All three are released by
+/// dropping what owns them
 /// (`tests/it_bounds.rs::a_connection_keeps_nothing_for_the_sessions_it_has_closed`).
-///
-/// Registering a session before its target socket exists does **not** raise
-/// that ceiling: the queue is the same size in both phases, sessions are still
-/// capped by the per-connection tunnel quota, and a full queue is already
-/// reachable on a running session. It only bounds how long a full queue can
-/// stay undrained by how long name resolution takes.
-///
-/// Beside the sessions, each connection has one hold of about 11.5 KiB for
-/// datagrams that arrive before their session has claimed them
-/// ([`EARLY_DATAGRAMS`]). It does not grow with the number of sessions, and it
-/// is reachable before authentication: about 2.9 MiB across the default
-/// `max_connections` of 256.
+/// Registering a session before its target socket exists does not raise the
+/// bound. D99 holds the ledger and its totals at the shipped limits; the
+/// per-connection early-datagram hold is [`EARLY_DATAGRAMS`].
 pub const INBOUND_QUEUE_DEPTH: usize = 64;
 
 /// One session's inbound HTTP Datagrams, and its claim on a Quarter Stream ID.
@@ -680,12 +632,6 @@ pub(super) fn route_datagram(router: &Router, datagram: Bytes) -> Result<(), Vio
             Ok(())
         }
 
-        // The two conditions RFC 9297 §2.1 states as MUST-close. Returned
-        // for `serve_peer` to report through `fail` like every other
-        // connection error in this layer, so the code on the wire and the
-        // reason the caller is given cannot disagree, and a datagram violation
-        // racing with a stream one ends the connection once, with whichever
-        // was first.
         Err(error) if error.is_connection_error() => Err(Violation::connection(
             Code::H3_DATAGRAM_ERROR,
             format!("an unusable HTTP datagram: {error}"),
@@ -856,13 +802,8 @@ mod tests {
     /// The same claim over a churn of sessions: the table returns to its
     /// baseline every time, rather than to its baseline plus one.
     ///
-    /// The single-session test above proves the entry goes; this proves the
-    /// table is *flat*, which is the property a server that runs for weeks
-    /// depends on and the one a single cycle cannot tell apart from a leak. A
-    /// live session is held throughout so the baseline is non-empty: a table
-    /// that grew by an entry per session would still be "back to one" after the
-    /// first cycle and only diverge after many, which is exactly the shape that
-    /// hides at N = 1.
+    /// A live session is held throughout, so a table that grew by one entry per
+    /// session would show it.
     #[tokio::test]
     async fn the_routing_table_is_flat_across_a_churn_of_sessions() {
         const CHURN: u64 = 512;
@@ -906,30 +847,14 @@ mod tests {
     ///
     /// Bounded on both sides: the sessions do a fixed number of rounds, and the
     /// router stops on their last one or on its own deadline, whichever comes
-    /// first, so nothing here can spin. Each session also *waits* for its first
-    /// delivery rather than sampling for one (`FIRST_DELIVERY` below says why),
-    /// so that what the assertions judge is the table rather than how the
-    /// machine happened to schedule the router.
+    /// first, so nothing here can spin.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn delivery_racing_registration_neither_misroutes_nor_leaks() {
         const SESSIONS: u64 = 24;
         const ROUNDS: usize = 128;
-        /// How long a session waits for its first delivery before the run is
-        /// judged to have failed rather than to have been unlucky.
-        ///
-        /// The sessions and the router race by design, and on a loaded machine
-        /// the router can lose that race outright: it is one task against
-        /// `SESSIONS` of them, and a session that only ever `try_recv`s can run
-        /// all `ROUNDS` of its loop through an empty queue and finish having
-        /// received nothing. That is this test's own scheduling, not a routing
-        /// fault, and it would fail the "nothing was ever routed" assertion.
-        ///
-        /// Waiting once per session fixes the shape rather than the symptom:
-        /// every session now starts from a delivery it can account for, and the
-        /// churn of claims and drops that actually runs the race is unchanged
-        /// in the `ROUNDS - 1` rounds after it. Nothing here is being measured,
-        /// so the number only has to outlast any scheduling delay while staying
-        /// well inside the router's own 30s deadline.
+        /// How long a session waits once for its first delivery, so a session
+        /// cannot finish its rounds before the router has run; inside the
+        /// router's 30 s deadline.
         const FIRST_DELIVERY: Duration = Duration::from_secs(10);
 
         let router = Arc::new(Router::default());
@@ -1509,9 +1434,7 @@ mod tests {
     ///
     /// Eight drops, because the schedule itself is the assertion: a report has
     /// to land on the 1st, 2nd, 4th and 8th drop and on none of the others, and
-    /// each has to carry the running total. The two mutations a weaker test would let through, reporting always and
-    /// reporting on every call but the first, both produce a sequence this one
-    /// names as wrong.
+    /// each has to carry the running total.
     #[test]
     fn a_drop_shape_is_reported_on_a_doubling_schedule_and_counted_every_time() {
         let router = Router::default();
