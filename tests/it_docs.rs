@@ -1304,8 +1304,8 @@ fn the_manual_installation_is_written_the_same_way_in_both_places() {
 /// Keys whose default is written in both places, at the very least.
 ///
 /// Below the number of keys, because the three required `[server]` keys print
-/// no default and a key the example sets with no `# Default:` line above it,
-/// such as `users`, is never read by this gate.
+/// no default and the two keys the example sets with no `# Default:` line above
+/// them, `users` and `initial_rtt_ms`, have no promise to count.
 const DEFAULT_FLOOR: usize = 20;
 
 /// The `# Default: …` text the example writes above each key, as `(table, key)`.
@@ -1464,6 +1464,23 @@ fn every_default_the_example_promises_is_the_default_the_page_prints() {
              {stated:?}. The example is the file that lands on the host and the \
              page is the one an operator reads first; they cannot say different \
              numbers"
+        );
+    }
+
+    // The other direction. A Default cell with no `# Default:` line behind it
+    // drops out of the loop above, so a line deleted together with a changed
+    // cell would pass. These two keys are live in the example with a value of
+    // their own, and state their default in prose or not at all.
+    const SET_IN_THE_EXAMPLE: [(&str, &str); 2] = [("auth", "users"), ("limits", "initial_rtt_ms")];
+    for ((table, key), cell) in &printed {
+        if cell.is_none() || SET_IN_THE_EXAMPLE.contains(&(table.as_str(), key.as_str())) {
+            continue;
+        }
+        assert!(
+            promised.contains_key(&(table.clone(), key.clone())),
+            "docs/configuration.md prints a default for [{table}].{key}, and \
+             script/config.example.toml has no `# Default:` line above it, so \
+             nothing holds the two together"
         );
     }
 }
