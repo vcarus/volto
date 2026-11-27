@@ -89,9 +89,8 @@ jobs:
       # exists and bindgen finds no C headers for a musl target.
       # `Cross.toml` names each target's image by tag and digest.
       # `strip: true` is the action's own input and it is a no-op for a target
-      # this action cross-builds, which is how the first v0.10.0 release shipped
-      # an 8.62 MB aarch64 asset against 2.98 MB. What strips is `strip = true`
-      # in `[profile.release]`; this input is kept as a second layer for the
+      # this action cross-builds. What strips is `strip = true` in
+      # `[profile.release]`; this input is kept as a second layer for the
       # targets where it does something, and it guarantees nothing on its own.
       # The step after this one is what proves either of them ran.
       - uses: houseabsolute/actions-rust-cross@21b0f18dc621b25bfae556ff2791fca4173121e8 # v1.0.8

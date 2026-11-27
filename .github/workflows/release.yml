@@ -16,12 +16,8 @@ permissions:
 
 jobs:
   ci-passed:
-    # A tag is a push like any other, and nothing here used to ask whether the
-    # commit it names had ever been green: `git tag && git push --tags` on a
-    # commit whose CI was red published binaries anyway, and the failing run sat
-    # next to the release on the same commit page. The workflows are separate on
-    # purpose (ci.yml runs on pushes and pull requests, this one on tags), so the
-    # link has to be made explicitly, which is what this job is.
+    # A tag publishes only a commit whose ci.yml run on a push to main is green.
+    # The two workflows run on different events, so this job makes the link.
     #
     # Only a run triggered by a push to `main` counts. A pull-request run
     # reports the pull request's head commit as its SHA, so the same commit can
@@ -122,9 +118,8 @@ jobs:
       # exists and bindgen finds no C headers for a musl target.
       # `Cross.toml` names each target's image by tag and digest.
       # `strip: true` is the action's own input and it is a no-op for a target
-      # this action cross-builds, which is how the first v0.10.0 release shipped
-      # an 8.62 MB aarch64 asset against 2.98 MB. What strips is `strip = true`
-      # in `[profile.release]`; this input is kept as a second layer for the
+      # this action cross-builds. What strips is `strip = true` in
+      # `[profile.release]`; this input is kept as a second layer for the
       # targets where it does something, and it guarantees nothing on its own.
       # The step after this one is what proves either of them ran.
       - uses: houseabsolute/actions-rust-cross@21b0f18dc621b25bfae556ff2791fca4173121e8 # v1.0.8
@@ -166,12 +161,8 @@ jobs:
           # would make every timered host reinstall and restart daily, forever.
           grep -q "^version = \"${version}\"\$" Cargo.toml ||
             { echo "tag ${GITHUB_REF_NAME} does not match the version in Cargo.toml" >&2; exit 1; }
-          # The tarball example in docs/deployment.md carries a `version=` line
-          # the release checklist asks to be bumped by hand beside Cargo.toml,
-          # Cargo.lock and fuzz/Cargo.lock. The three manifests are pinned (the
-          # grep above, and it_release_assets for the fuzz lockfile); the page
-          # was the last hand-kept copy with no gate, and a stale one sends the
-          # reader of a fresh release at an archive that is not there.
+          # docs/deployment.md's tarball example names the version by hand; a
+          # stale one points the reader at an archive that does not exist.
           grep -qE "^version=${version}([[:space:]]|\$)" docs/deployment.md ||
             { echo "docs/deployment.md's tarball example does not name ${version}" >&2; exit 1; }
           name="volto-${version}-${{ matrix.target }}"
@@ -180,21 +171,12 @@ jobs:
           cp LICENSE README.md "dist/${name}/"
           cp script/install-selfsigned.sh script/deploy.sh \
              script/config.example.toml script/masque.service "dist/${name}/script/"
-          # Both scripts point the operator at `docs/configuration.md` or
-          # `docs/deployment.md` at the moment they refuse to install -- an
-          # unknown config key on a downgrade, a config the new binary cannot
-          # load, a host that is not Debian. That is the worst moment for the
-          # file to be absent, and on a host bootstrapped from a tarball it was:
-          # nothing but the binary, the licence, the README and `script/` ever
-          # reached it. Copied as a directory rather than by name, so a new page
-          # needs no change here.
+          # Both scripts point the operator at docs/ when they refuse to
+          # install, so the tarball carries the directory, copied whole so a new
+          # page needs no change here.
           cp -R docs "dist/${name}/"
-          # Nothing else proves the published binary is stripped. The first
-          # v0.10.0 release was deleted for an unstripped aarch64 asset, closed
-          # by `strip = true` in `[profile.release]`, and an edit to that profile
-          # (`debug = "line-tables-only"` was tried and reverted once) would
-          # silently reship the fat asset. readelf reads an ELF of any
-          # architecture, so this x86_64 runner judges both targets.
+          # Nothing else proves the published binary is stripped (`strip = true`
+          # in Cargo.toml). readelf reads an ELF of either architecture.
           command -v readelf >/dev/null ||
             { sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends binutils; }
           sections="$(readelf -S --wide "dist/${name}/volto")"
