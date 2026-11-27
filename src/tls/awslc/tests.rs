@@ -274,10 +274,8 @@ struct Outcome {
     server_messages: Vec<(usize, u8, usize)>,
     /// The bodies of the NewSessionTicket messages the server wrote.
     tickets: Vec<Vec<u8>>,
-    /// Whether the server's EncryptedExtensions carried an ECH extension
-    /// (the `retry_configs`).
-    retry_configs_sent: bool,
-    /// That extension's body, which is the ECHConfigList the server sent.
+    /// The body of the ECH extension in the server's EncryptedExtensions,
+    /// which is the ECHConfigList it sent as `retry_configs`.
     retry_configs: Option<Vec<u8>>,
     /// Whether the server sent a Certificate message.
     certificate_sent: bool,
@@ -445,7 +443,6 @@ fn handshake(
                 if kind == ENCRYPTED_EXTENSIONS
                     && let Some(list) = extension_body(body, EXT_ECH)
                 {
-                    out.retry_configs_sent = true;
                     out.retry_configs = Some(list.to_vec());
                 }
                 if kind == CERTIFICATE {
@@ -544,7 +541,7 @@ fn ech_with_the_right_config_is_accepted() {
         outcome.ech_accepted && outcome.server_done && outcome.client_done,
         "{outcome:?}"
     );
-    assert!(!outcome.retry_configs_sent);
+    assert!(outcome.retry_configs.is_none());
     assert_eq!(outcome.group, 0x11ec);
     assert_eq!(outcome.verified[0].0, "localhost");
     assert_eq!(outcome.verified[0].1, id.cert);
@@ -566,7 +563,7 @@ fn a_client_without_ech_gets_an_ordinary_handshake() {
         !outcome.ech_accepted && outcome.server_done && outcome.client_done,
         "{outcome:?}"
     );
-    assert!(!outcome.retry_configs_sent);
+    assert!(outcome.retry_configs.is_none());
     let body = hello::client_hello_body(&outcome.client_hellos[0]).expect("a ClientHello");
     assert!(hello::ech_outer(body).is_none());
 }
@@ -586,7 +583,7 @@ fn grease_ech_is_answered_on_the_outer_hello_with_retry_configs() {
         !outcome.ech_accepted && outcome.server_done && outcome.client_done,
         "{outcome:?}"
     );
-    assert!(outcome.retry_configs_sent);
+    assert!(outcome.retry_configs.is_some());
 }
 
 /// (d) ECH under a config_id the server does not hold: answered on the outer
@@ -608,7 +605,7 @@ fn ech_under_another_key_is_answered_on_the_outer_hello() {
         !outcome.ech_accepted && outcome.certificate_sent,
         "{outcome:?}"
     );
-    assert!(outcome.retry_configs_sent);
+    assert!(outcome.retry_configs.is_some());
     assert_eq!(retry_configs_in(&outcome.client_error), Some(true));
     // A rejected client checks the certificate against the public name.
     assert_eq!(outcome.verified[0].0, PUBLIC_NAME);
@@ -640,7 +637,7 @@ fn a_damaged_ech_payload_is_answered_on_the_outer_hello() {
         &corrupt_ech_payload,
     );
     assert!(
-        !outcome.ech_accepted && outcome.certificate_sent && outcome.retry_configs_sent,
+        !outcome.ech_accepted && outcome.certificate_sent && outcome.retry_configs.is_some(),
         "{outcome:?}"
     );
 }
@@ -818,7 +815,7 @@ fn the_second_ech_line_refuses_ech_it_did_not_accept_before_anything_is_sent() {
             outcome.server_done && outcome.client_done,
             "{what}: {outcome:?}"
         );
-        assert!(!outcome.retry_configs_sent, "{what}");
+        assert!(outcome.retry_configs.is_none(), "{what}");
     }
 }
 
@@ -849,7 +846,7 @@ fn a_previous_key_is_accepted_and_is_never_sent_as_a_retry_config() {
             outcome.ech_accepted && outcome.server_done && outcome.client_done,
             "{what}: {outcome:?}"
         );
-        assert!(!outcome.retry_configs_sent, "{what}");
+        assert!(outcome.retry_configs.is_none(), "{what}");
     }
 
     let outcome = run(
@@ -898,7 +895,7 @@ fn refused_before_anything(outcome: &Outcome, what: &str) {
         outcome.server_messages
     );
     assert!(
-        !outcome.retry_configs_sent && !outcome.certificate_sent,
+        outcome.retry_configs.is_none() && !outcome.certificate_sent,
         "{what}"
     );
     assert!(
