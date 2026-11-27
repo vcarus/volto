@@ -925,8 +925,8 @@ fn add_ech_key(config: &Path, key: &Path) {
     fs::write(config, text).expect("rewrite the config");
 }
 
-/// Standard padded base64 (RFC 4648 §4), decoded by hand: this binary links
-/// the standard library and nothing of volto's.
+/// Standard padded base64 (RFC 4648 §4), decoded by hand rather than by
+/// volto's decoder, so the two cannot agree by sharing a defect.
 fn base64_decode(text: &str) -> Vec<u8> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut bytes = Vec::new();
