@@ -1958,3 +1958,20 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
         self.clone()
     }
 }
+
+/// How long a client that is meant to hear nothing waits before it gives up.
+///
+/// The client's own idle timeout, which turns silence into
+/// `ConnectionError::TimedOut` rather than into quinn's 30-second default. Two
+/// seconds, so a loaded machine cannot pass a slow reply off as no reply.
+pub const CLIENT_IDLE: Duration = Duration::from_secs(2);
+
+/// Client transport parameters that give up on a silent server after
+/// [`CLIENT_IDLE`]. Keep-alives are off, or the client would keep alive a
+/// connection the server never opened.
+pub fn impatient_transport() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(CLIENT_IDLE.try_into().expect("a legal idle timeout")));
+    transport.keep_alive_interval(None);
+    transport
+}

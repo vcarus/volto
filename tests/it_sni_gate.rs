@@ -31,11 +31,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, Leg, Relay, Relayed, SharedBuffer, TestServer,
-    bulk_alpn, client_endpoint, client_endpoint_with_transport, echoes, finish_connect_as,
-    is_version_negotiation, open_tcp_tunnel, open_udp_session, spawn_echo_target,
-    spawn_udp_echo_target, udp_answer, udp_answers, udp_answers_on, udp_relay, udp_round_trip,
-    version_probe,
+    ALLOW_PRIVATE, CLIENT_IDLE, GATE_LOCALHOST, H3Client, Leg, Relay, Relayed, SharedBuffer,
+    TestServer, bulk_alpn, client_endpoint, client_endpoint_with_transport, echoes,
+    finish_connect_as, impatient_transport, is_version_negotiation, open_tcp_tunnel,
+    open_udp_session, spawn_echo_target, spawn_udp_echo_target, udp_answer, udp_answers,
+    udp_answers_on, udp_relay, udp_round_trip, version_probe,
 };
 use rustls::pki_types::CertificateDer;
 
@@ -53,14 +53,6 @@ const GATE_OFF: &str = ALLOW_PRIVATE;
 /// through [`SharedBuffer::shared`].
 const LOG_FILTER: &str = "volto::quic=info";
 
-/// How long a refused handshake is given to prove it is not coming back.
-///
-/// The client's own idle timeout, which is what turns silence into a
-/// `TimedOut` rather than into this test binary hanging for quinn's 30-second
-/// default. Two seconds so a loaded machine cannot mistake a slow reply for no
-/// reply.
-const CLIENT_IDLE: Duration = Duration::from_secs(2);
-
 /// A client that gives up quickly, so that "no answer" is a fast answer.
 fn impatient(ca: &CertificateDer<'static>) -> quinn::Endpoint {
     impatient_offering(ca, &["h3"])
@@ -73,11 +65,7 @@ fn impatient(ca: &CertificateDer<'static>) -> quinn::Endpoint {
 /// padding is in the ALPN list, so the client that sends it is the same client
 /// in every other respect.
 fn impatient_offering(ca: &CertificateDer<'static>, alpn: &[&str]) -> quinn::Endpoint {
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(CLIENT_IDLE.try_into().expect("a legal idle timeout")));
-    // Off, or the client would keep the connection it never opened alive.
-    transport.keep_alive_interval(None);
-    client_endpoint_with_transport(ca, alpn, transport)
+    client_endpoint_with_transport(ca, alpn, impatient_transport())
 }
 
 /// Asserts that asking for `name` gets no answer of any kind.

@@ -18,8 +18,8 @@ mod common;
 
 use common::{
     ALLOW_PRIVATE, H3Client, Offer, SharedBuffer, TempDir, TestServer, endpoint_from,
-    finish_connect, open_tcp_tunnel, open_udp_session, roots_of, rustls_client, spawn_echo_target,
-    spawn_udp_echo_target, udp_round_trip,
+    finish_connect, impatient_transport, open_tcp_tunnel, open_udp_session, roots_of,
+    rustls_client, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
 };
 use rustls::pki_types::CertificateDer;
 use volto::tls::EchKey;
@@ -29,18 +29,14 @@ const PUBLIC_NAME: &str = "public.example";
 /// A quinn client on rustls with ECH enabled for `list`, X25519MLKEM768 first
 /// as Surge orders its groups.
 fn ech_endpoint(ca: &CertificateDer<'static>, list: &[u8]) -> quinn::Endpoint {
-    ech_endpoint_idle(ca, list, None)
+    ech_endpoint_on(ca, list, None)
 }
 
-/// How long a client that is meant to hear nothing waits before it gives up,
-/// which turns the silence into `ConnectionError::TimedOut`.
-const CLIENT_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// [`ech_endpoint`] with its idle timeout set to `idle`, when given.
-fn ech_endpoint_idle(
+/// [`ech_endpoint`] on `transport`, when given.
+fn ech_endpoint_on(
     ca: &CertificateDer<'static>,
     list: &[u8],
-    idle: Option<std::time::Duration>,
+    transport: Option<quinn::TransportConfig>,
 ) -> quinn::Endpoint {
     use rustls::crypto::aws_lc_rs::kx_group;
 
@@ -50,12 +46,6 @@ fn ech_endpoint_idle(
         kx_group::SECP256R1,
         kx_group::SECP384R1,
     ];
-    let transport = idle.map(|idle| {
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(idle.try_into().expect("a legal idle timeout")));
-        transport.keep_alive_interval(None);
-        transport
-    });
     endpoint_from(
         rustls_client(
             &Offer::Ech(list.to_vec()),
@@ -230,7 +220,7 @@ async fn tunnels_run_over_the_servers_tls_with_and_without_ech() {
         "{reloaded}"
     );
     let error = finish_connect(
-        &ech_endpoint_idle(&server.ca, &list, Some(CLIENT_IDLE)),
+        &ech_endpoint_on(&server.ca, &list, Some(impatient_transport())),
         server.addr,
     )
     .await

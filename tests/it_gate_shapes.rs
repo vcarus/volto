@@ -49,9 +49,9 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, Leg, Offer, Relayed, SharedBuffer, TIMEOUT, TempDir, TestServer,
-    bulk_alpn, client_endpoint, endpoint_from, nameless_crypto, roots_of, rustls_client, udp_answer,
-    udp_answers, udp_relay,
+    ALLOW_PRIVATE, CLIENT_IDLE, GATE_LOCALHOST, Leg, Offer, Relayed, SharedBuffer, TIMEOUT,
+    TempDir, TestServer, bulk_alpn, client_endpoint, endpoint_from, impatient_transport,
+    nameless_crypto, roots_of, rustls_client, udp_answer, udp_answers, udp_relay,
 };
 use quinn::ConnectionId;
 use rustls::crypto::SupportedKxGroup;
@@ -3155,19 +3155,16 @@ async fn a_three_datagram_first_flight_that_loses_its_third_completes_through_th
     relay.task.abort();
 }
 
-/// A quinn client on rustls with `offer`, `groups` in that order, and an idle
-/// timeout of two seconds, so that silence is a fast `TimedOut`.
+/// A quinn client on rustls with `offer`, `groups` in that order, and
+/// [`impatient_transport`], so that silence is a fast `TimedOut`.
 fn quick_client(
     ca: &rustls::pki_types::CertificateDer<'static>,
     offer: &Offer,
     groups: &[&'static dyn SupportedKxGroup],
 ) -> quinn::Endpoint {
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(PATIENCE.try_into().expect("a legal idle timeout")));
-    transport.keep_alive_interval(None);
     endpoint_from(
         rustls_client(offer, Some(groups), roots_of(ca), &["h3"]),
-        Some(transport),
+        Some(impatient_transport()),
     )
 }
 
@@ -3181,7 +3178,7 @@ async fn handshake_with(
     let connecting = endpoint
         .connect(server.addr, "localhost")
         .expect("start connecting");
-    tokio::time::timeout(PATIENCE * 3, connecting)
+    tokio::time::timeout(CLIENT_IDLE * 3, connecting)
         .await
         .expect("a handshake ends one way or the other")
 }
