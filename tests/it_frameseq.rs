@@ -53,10 +53,6 @@
 //! file to a few seconds. Every case is bounded by [`CASE_TIMEOUT`], so a hang
 //! is a failure rather than an orphaned run.
 
-// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
-// allow: the frame lengths are ones this file writes out itself.
-#![allow(clippy::as_conversions)]
-
 mod common;
 
 #[path = "common/proptest_support.rs"]
@@ -68,7 +64,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use proptest::prelude::*;
 
-use props::config;
+use props::{config, pattern};
 
 use common::rawstream::{
     DENIED_TARGET, FRAME_CANCEL_PUSH, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_MAX_PUSH_ID,
@@ -134,10 +130,8 @@ where
     });
 }
 
-/// A deterministic fill for frame payloads whose bytes carry no meaning.
-fn pattern(length: usize) -> Vec<u8> {
-    (0..length).map(|index| (index as u8) ^ 0x5a).collect()
-}
+/// The seed of [`pattern`] for frame payloads whose bytes carry no meaning.
+const FILL: u8 = 0x5a;
 
 /// Opens a unidirectional stream of `stream_type` and writes `bytes` after the
 /// type varint, tolerating a connection that has already been closed.
@@ -285,12 +279,12 @@ impl ControlEvent {
                 frame(FRAME_MAX_PUSH_ID, &payload)
             }
             Self::CancelPush(id) => varint_frame(FRAME_CANCEL_PUSH, *id),
-            Self::Grease { n, len } => frame(grease_type(*n), &pattern(*len)),
+            Self::Grease { n, len } => frame(grease_type(*n), &pattern(*len, FILL)),
             // The payload of a HEADERS or PUSH_PROMISE frame is never parsed
             // on this stream -- the type is the offence -- so its bytes are
             // arbitrary.
             Self::Headers => frame(FRAME_HEADERS, b"never decoded"),
-            Self::Data(len) => frame(FRAME_DATA, &pattern(*len)),
+            Self::Data(len) => frame(FRAME_DATA, &pattern(*len, FILL)),
             Self::PushPromise => frame(FRAME_PUSH_PROMISE, b"\x00"),
             Self::ReservedH2(index) => frame(RESERVED_HTTP2_TYPES[*index], b"as HTTP/2"),
         }
@@ -1140,7 +1134,7 @@ async fn establish(
 
     let mut wire = Vec::new();
     for (n, len) in grease {
-        wire.extend_from_slice(&frame(grease_type(*n), &pattern(*len)));
+        wire.extend_from_slice(&frame(grease_type(*n), &pattern(*len, FILL)));
     }
     wire.extend_from_slice(&connect_headers_frame(authority));
     if let Some(early) = early_data {
@@ -1210,8 +1204,8 @@ async fn run_plan(
             for (index, op) in ops.iter().enumerate() {
                 match op {
                     TunnelOp::Data(len) => {
-                        let mut payload = pattern(*len + 1);
-                        payload[0] = tag as u8;
+                        let mut payload = pattern(*len + 1, FILL);
+                        payload[0] = u8::try_from(tag).expect("a small tag");
                         echo_round_trip(&mut tunnel, &payload).await;
                     }
                     TunnelOp::EmptyData => {
@@ -1224,7 +1218,7 @@ async fn run_plan(
                     TunnelOp::Grease(n, len) => {
                         tunnel
                             .send
-                            .write_all(&frame(grease_type(*n), &pattern(*len)))
+                            .write_all(&frame(grease_type(*n), &pattern(*len, FILL)))
                             .await
                             .expect("send a grease frame on the tunnel");
                     }
@@ -1277,7 +1271,7 @@ async fn run_plan(
             let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
             let mut wire = Vec::new();
             for (n, len) in grease {
-                wire.extend_from_slice(&frame(grease_type(*n), &pattern(*len)));
+                wire.extend_from_slice(&frame(grease_type(*n), &pattern(*len, FILL)));
             }
             send.write_all(&wire).await.expect("send the grease");
             send.finish().expect("finish without a request");
@@ -1328,7 +1322,7 @@ async fn commit_fatal(
 
     match fatal {
         RequestFatal::DataFirst { empty } => {
-            let payload = if empty { Vec::new() } else { pattern(9) };
+            let payload = if empty { Vec::new() } else { pattern(9, FILL) };
             let held = fresh(connection, &frame(FRAME_DATA, &payload)).await;
             drop(held);
         }

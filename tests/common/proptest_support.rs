@@ -9,10 +9,8 @@
 //! on its account (D66).
 //!
 //! What is deliberately *not* here: `it_props`'s and `it_fuzz`'s `any_varint`,
-//! which differ by two entries in their boundary lists, and `it_frameseq`'s
-//! `pattern`, which is a different fill from the other two. Sharing any of
-//! those would change what a binary generates rather than only where the code
-//! lives.
+//! which differ by two entries in their boundary lists. Sharing them would
+//! change what a binary generates rather than only where the code lives.
 
 #![allow(dead_code)]
 // Each property-test binary uses a subset of this.
