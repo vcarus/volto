@@ -256,8 +256,8 @@ pub async fn with_keep_alive<F: Future>(notifier: Option<&Notifier>, work: F) ->
 /// Pending for ever when there is no notifier or no heartbeat, so that
 /// [`with_keep_alive`] can poll it in every case. A failed send never ends the
 /// server: it is a WARN line on the doubling schedule of
-/// [`crate::logfmt::Sampler`] (D97), since a socket that refuses one keep-alive
-/// refuses every one after it.
+/// [`crate::logfmt::Sampler`] (D97), since a failure that lasts repeats every
+/// period.
 async fn keep_alive(notifier: Option<&Notifier>) -> std::convert::Infallible {
     #[cfg(unix)]
     if let Some((notifier, period)) = notifier.and_then(|n| Some((n, n.heartbeat?))) {

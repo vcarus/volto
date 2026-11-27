@@ -20,8 +20,12 @@
 #   3. With a short WatchdogSec the service stays active, under the same main
 #      PID and with no restart, over four intervals: the keep-alives pass the
 #      unit's sandbox.
-#   4. After `kill -STOP` on the main PID, systemd logs its watchdog timeout,
+#   4. After `systemctl daemon-reexec` the service stays active under the same
+#      main PID with no restart: the keep-alives reach the re-executed manager.
+#   5. After `kill -STOP` on the main PID, systemd logs its watchdog timeout,
 #      NRestarts grows, and the service is active again under a new main PID.
+#   6. With `WatchdogSec=0` in a drop-in the server's environment has
+#      NOTIFY_SOCKET and no WATCHDOG_USEC.
 # On any failure the script prints `systemctl status` and the unit's journal.
 #
 # Usage: tests/systemd-check.sh BINARY
@@ -33,9 +37,11 @@ UNIT=volto
 PORT=14443
 DROPINS=/etc/systemd/system/$UNIT.service.d
 
-# The timings of checks 2 to 4, in seconds.
+# The timings of checks 2 to 5, in seconds. The watchdog leaves a keep-alive 2 s
+# of delay on a busy runner before systemd acts, so check 3 does not fail on
+# scheduling alone.
 START_TIMEOUT=5
-WATCHDOG=2
+WATCHDOG=4
 ABORT_TIMEOUT=5
 RESTART_DELAY=1
 
@@ -110,7 +116,18 @@ active || fail "the service is not active after $((4 * WATCHDOG))s under Watchdo
 [ "$before" = 0 ] || fail "NRestarts is $before and not 0"
 echo "main PID $pid, NRestarts $before, after $((4 * WATCHDOG))s"
 
-echo "==> 4. a stopped process is restarted by the watchdog"
+echo "==> 4. the keep-alives still arrive after systemd re-executes itself"
+# volto connects its notification socket once, at startup. A package upgrade of
+# systemd runs daemon-reexec, and the keep-alives have to reach the manager
+# that comes out of it, or every such upgrade would end in a watchdog restart.
+sudo systemctl daemon-reexec
+sleep $((3 * WATCHDOG))
+active || fail "the service is not active $((3 * WATCHDOG))s after daemon-reexec"
+[ "$(main_pid)" = "$pid" ] || fail "the main PID moved from $pid to $(main_pid) after daemon-reexec"
+[ "$(restarts)" = "$before" ] || fail "NRestarts moved from $before to $(restarts) after daemon-reexec"
+echo "main PID $pid, NRestarts $before, $((3 * WATCHDOG))s after daemon-reexec"
+
+echo "==> 5. a stopped process is restarted by the watchdog"
 since="$(date +%s)"
 sudo kill -STOP "$pid"
 deadline=$((SECONDS + WATCHDOG + ABORT_TIMEOUT + RESTART_DELAY + 20))
@@ -129,4 +146,18 @@ grep -i 'watchdog\|abrt' <<<"$journal" || true
 echo "main PID $pid was replaced by $(main_pid), NRestarts $(restarts)"
 
 remove_dropin watchdog
+
+echo "==> 6. WatchdogSec=0 leaves the server without the watchdog variables"
+# docs/deployment.md gives this drop-in as the way to switch the watchdog off.
+write_dropin no-watchdog "WatchdogSec=0"
+sudo systemctl restart "$UNIT" || fail "the restart under WatchdogSec=0 failed"
+pid="$(main_pid)"
+environment="$(sudo cat "/proc/$pid/environ" | tr '\0' '\n')"
+grep -q '^NOTIFY_SOCKET=' <<<"$environment" ||
+    fail "the server's environment has no NOTIFY_SOCKET, so this check read the wrong process"
+if grep -q '^WATCHDOG_USEC=' <<<"$environment"; then
+    fail "WatchdogSec=0 still gives the server $(grep '^WATCHDOG_USEC=' <<<"$environment")"
+fi
+remove_dropin no-watchdog
+
 echo "==> every check passed"
