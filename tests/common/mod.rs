@@ -426,8 +426,7 @@ impl Drop for TestServer {
 /// A first flight larger than an Initial packet is what the SNI gate's
 /// socket-level check deliberately lets through, so this is the way to reach
 /// the branch behind it. `h3` stays on the list and is what gets negotiated:
-/// rustls picks the first of the *server's* protocols the client also offered,
-/// and the server offers only that one.
+/// the server offers only `h3`, so its ALPN callback can choose nothing else.
 pub fn bulk_alpn() -> Vec<String> {
     let mut alpn = vec!["h3".to_owned()];
     alpn.extend((0..8).map(|i| format!("{i}{}", "padding-".repeat(31))));
