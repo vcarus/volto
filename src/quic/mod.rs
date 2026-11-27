@@ -1198,6 +1198,22 @@ pub(crate) mod tests {
         config_path: PathBuf,
         cert: PathBuf,
         key: PathBuf,
+        /// Removes the files above when the test ends.
+        _dir: ScratchDir,
+    }
+
+    /// A directory that is removed with everything in it when dropped.
+    ///
+    /// A field of its own rather than `Drop for Bound`, so a test may still
+    /// move the server out of a [`Bound`].
+    struct ScratchDir(PathBuf);
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            // A failure leaves a directory behind and nothing else, so it is
+            // not worth failing a test over.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// Writes a configuration file naming `cert` and `key`, with `extra` after
@@ -1232,13 +1248,14 @@ pub(crate) mod tests {
         let dir =
             std::env::temp_dir().join(format!("volto-quic-test-{}-{serial}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create the directory");
+        let dir = ScratchDir(dir);
 
-        let cert = dir.join("cert.pem");
-        let key = dir.join("key.pem");
+        let cert = dir.0.join("cert.pem");
+        let key = dir.0.join("key.pem");
         std::fs::write(&cert, issued.cert.pem()).expect("write the certificate");
         std::fs::write(&key, issued.signing_key.serialize_pem()).expect("write the key");
 
-        let config_path = dir.join("config.toml");
+        let config_path = dir.0.join("config.toml");
         write_config(&config_path, &cert, &key, extra);
         let config = Config::load(&config_path).expect("the test configuration loads");
 
@@ -1247,7 +1264,26 @@ pub(crate) mod tests {
             config_path,
             cert,
             key,
+            _dir: dir,
         }
+    }
+
+    /// A test server leaves no files behind once it is dropped.
+    #[tokio::test]
+    async fn a_bound_server_removes_its_files_when_dropped() {
+        let bound = bound_server("");
+        let dir = bound
+            .config_path
+            .parent()
+            .expect("the configuration file has a directory")
+            .to_owned();
+        assert!(dir.exists(), "{} holds the test files", dir.display());
+        drop(bound);
+        assert!(
+            !dir.exists(),
+            "{} is left behind after the test",
+            dir.display()
+        );
     }
 
     /// Starts a reload on its own thread, and answers when it has begun.
