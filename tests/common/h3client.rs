@@ -826,6 +826,22 @@ impl ClientStream {
         }
     }
 
+    /// Reads one frame-layer item and requires it to be the end of the stream.
+    ///
+    /// [`Self::recv_data`] reads past an empty DATA frame, a trailer section
+    /// and a frame of unknown type before it returns. This reads exactly one
+    /// item, so only a clean finish is `Ok(None)`; anything else is named in
+    /// `Ok(Some(..))`.
+    pub async fn recv_end(&mut self) -> Result<Option<String>, StreamError> {
+        let next = self.frames.next().await;
+        self.peer.check();
+        Ok(next.map_err(convert)?.map(|item| match item {
+            Item::Data(data) => format!("a DATA frame carrying {} bytes", data.len()),
+            Item::Frame(frame) => format!("a frame after the response: {frame:?}"),
+            Item::Skipped { kind } => format!("a frame of unknown type {kind:#x}"),
+        }))
+    }
+
     /// Sends body data as one DATA frame.
     pub async fn send_data(&mut self, data: Bytes) -> Result<(), StreamError> {
         frame::put_header(&mut self.header, frame::DATA, data.len() as u64);
@@ -935,9 +951,11 @@ pub fn ends_cleanly<'a>(
 /// each of these tests exists: a status immediately followed by a RESET_STREAM
 /// is worse than useless, because the client is entitled to read the reset as
 /// "the proxy broke" and retry or fail over instead of surfacing the status,
-/// and `recv_response` succeeds either way. A refusal that then sends a body is
-/// wrong for the other reason, that it is not a refusal. Reading once and
-/// requiring the end of the stream catches both.
+/// and `recv_response` succeeds either way. A refusal that then sends anything
+/// at all, a body, an empty DATA frame or a trailer section, is not "400
+/// followed by a normal finish". Reading one frame-layer item with
+/// [`ClientStream::recv_end`] and requiring the end of the stream catches all
+/// of these.
 ///
 /// Not [`ends_cleanly`]: that one reads past whatever is in flight before it
 /// judges, which is right for a tunnel the server is closing and wrong here,
@@ -953,7 +971,7 @@ pub fn ends_with_no_body<'a>(
 ) -> impl Future<Output = ()> + 'a {
     let caller = Location::caller();
     async move {
-        let end = tokio::time::timeout(super::TIMEOUT, stream.recv_data())
+        let end = tokio::time::timeout(super::TIMEOUT, stream.recv_end())
             .await
             .unwrap_or_else(|_| {
                 panic!(
@@ -965,10 +983,9 @@ pub fn ends_with_no_body<'a>(
                 panic!("{what}, awaited at {caller}, must end cleanly, not with {error:?}")
             });
 
-        assert!(
-            end.is_none(),
-            "{what}, awaited at {caller}, carries no body: the next read is the end of the stream"
-        );
+        if let Some(found) = end {
+            panic!("{what}, awaited at {caller}, must end after its response, not carry {found}");
+        }
     }
 }
 
