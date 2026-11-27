@@ -104,9 +104,9 @@ pub const HOLD_TOTAL_BYTES: usize = HOLD_FLIGHTS * HOLD_FLIGHT_BYTES;
 /// a copy of that flight, sent from another address, draw a ServerHello. It is
 /// bounded by count instead, at 2^20 entries. At the limit the oldest entry
 /// goes, so a copy of a flight older than the last 2^20 admitted ones is no
-/// longer recognised. Only a flight a key opened adds an entry. One record
-/// serves the current and the previous key together, so this bound is the
-/// whole record's with one key or two. Our own value.
+/// longer recognised. One record serves the current and the previous key
+/// together, so this bound is the whole record's with one key or two. Our own
+/// value.
 ///
 /// An entry is two 64-bit tags in the map and one in the order queue. A full
 /// record is a map of 2^21 buckets of 17 bytes (the two tags and a control
@@ -599,13 +599,11 @@ impl Memory {
 /// The verdict on a flight whose CRYPTO stream starts with `contiguous`:
 /// `None` while the ClientHello is not whole, `Ok` to admit it.
 ///
-/// The rule table of D115's batch 2, in the order a ClientHello answers it:
+/// D115's rule table, in the order a ClientHello answers it:
 ///
 /// 1. An ECH extension that opens under the key its config_id names is
 ///    admitted, unless the replay record holds its `enc` from another address.
-///    The key is the current one or, during a rotation, the previous one; the
-///    two have different config_ids, so one ClientHello costs at most one HPKE
-///    open. The outer name is not consulted: the name a client asks for is the
+///    The outer name is not consulted: the name a client asks for is the
 ///    inner one, and the TLS layer judges that one against `expected_sni`.
 /// 2. An ECH extension that names neither key's config_id, that the named key
 ///    does not open, or that is not a well-formed outer one, is dropped,
@@ -615,9 +613,9 @@ impl Memory {
 ///    decrypt the extension, the client-facing server MUST ignore the extension
 ///    and proceed with the connection using ClientHelloOuter". Going on would
 ///    send this server's ECHConfigList as `retry_configs` to a peer without
-///    the key (D115, ruling 2 of 2026-11-20).
+///    the key (D115).
 /// 3. No ECH extension is dropped under `require_ech`, and otherwise judged by
-///    its name exactly as the stateless gate judges one, with an empty list
+///    its name by [`by_name`], the stateless gate's rule, with an empty list
 ///    admitting every name.
 ///
 /// A whole ClientHello whose extension block libssl would refuse to parse is
