@@ -32,10 +32,9 @@ Wants=network-online.target
 # notify: systemd counts the start as done only when volto sends READY=1, which
 # it does once its UDP listener is bound. So `systemctl start` and `restart`
 # return after the listener exists, and fail when the server exits first. A
-# missing or unexecutable binary still fails the start at once. deploy.sh's
-# rollback then acts on the failed restart instead of on the health check three
-# seconds later. NotifyAccess= is not set: under Type=notify it is main, so only
-# volto's own process is heard.
+# missing or unexecutable binary still fails the start at once. deploy.sh rolls
+# back on the failed restart. NotifyAccess= is not set: under Type=notify it is
+# main, so only volto's own process is heard.
 Type=notify
 ExecStart=/usr/local/bin/volto --config /etc/volto/config.toml
 # Startup reads the config file, the certificate and key, and binds one socket,
