@@ -1,13 +1,8 @@
 //! Operator-facing log fields print values, not Rust's `Option` spelling.
 //!
-//! The fields asserted here — `alpn`, `server_name`, `target` on both tunnel
-//! lines, `username` — used to be formatted with tracing's `?` sigil straight off
-//! an `Option`, so production lines read `alpn=Some("h3")` and
-//! `target=Some(104.16.132.229:80)`.
-//! Nothing pinned that shape, which is the failure mode D51 catalogued: the
-//! predicate is tested, the last hop to the observable output is not, and a
-//! change to it goes unnoticed until someone reads a log a week later. Hence this
-//! binary.
+//! The fields asserted here are `alpn`, `server_name`, `target` on both tunnel
+//! lines, and `username` (D51: the last hop to the output is what this binary
+//! tests).
 //!
 //! `username` is the exception that proves the rule: its bytes are the peer's, so
 //! "the value" is the quoted, Debug-escaped spelling tracing gives every `str`
@@ -28,8 +23,6 @@ use common::{
 };
 use volto::h3api::Status;
 
-/// One test function: `tracing_subscriber::fmt().init()` is process-wide, so
-/// splitting these would race over installing it.
 #[tokio::test]
 async fn operator_facing_fields_print_values_not_options() {
     let buffer = SharedBuffer::shared("volto=info");
@@ -68,9 +61,7 @@ async fn operator_facing_fields_print_values_not_options() {
         "the dialled address must print as its value; line was:\n{tunnel}"
     );
 
-    // The session line, same field, other tunnel. The first release of this
-    // test opened no UDP session, and `target=Some(…)` on this line reached
-    // production while the `!contains("Some(")` backstop below stayed green.
+    // The session line, same field, other tunnel.
     let session = logged
         .lines()
         .find(|line| line.contains("udp session established"))
@@ -166,9 +157,7 @@ async fn operator_facing_fields_print_values_not_options() {
 
     // The length of a claimed user-id is the peer's choice as much as its bytes
     // are: it is everything before the first colon of a base64 blob that may be
-    // a whole field section. Unbounded, one guess bought a 288 KB WARN line for
-    // 57 KB of upstream — five times the attacker's cost, aimed at the journal
-    // that is this server's only forensic channel (review H3).
+    // a whole field section.
     let request = authorized_connect("192.0.2.1:443", &"u".repeat(48_000), "wrong-guess");
     let response = respond_to(&mut caller, request).await;
     assert_eq!(response.status, Status::PROXY_AUTHENTICATION_REQUIRED);
