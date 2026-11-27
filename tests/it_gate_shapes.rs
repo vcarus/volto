@@ -548,43 +548,87 @@ fn an_unsealed_initial_with_a_short_connection_id_is_refused() {
     );
 }
 
-/// A refused name is carried raw and escaped where it is logged.
-///
-/// `Refusal::OtherName` holds the bytes the extension spelled, so a build that
-/// is not logging at DEBUG formats nothing for a flood of refused handshakes.
-/// The escaping did not leave the path, it moved later into it: `log_refusal`
-/// in `src/gate.rs` applies `logfmt::escaped_bytes` inside the `debug!` that
-/// prints the name.
-/// This drives both steps in that order on a name carrying the two characters
-/// escaping exists for, a quote and a newline, either of which would otherwise
-/// let an unauthenticated peer forge a journal entry.
+/// A refused name is carried as the bytes the extension spelled, so a build
+/// that is not logging at DEBUG formats nothing for a flood of refused
+/// handshakes. `a_refused_name_is_logged_escaped_by_both_gates` reads the line
+/// that escapes it.
 #[test]
-fn a_refused_name_is_carried_raw_and_escaped_where_it_is_logged() {
+fn a_refused_name_is_carried_as_the_bytes_the_peer_sent() {
     let crypto = nameless_crypto();
     let names = Names::new(&[LISTED.to_owned()]);
-
-    let hostile = "a\"b\nc.example";
     let datagram = initial(
         &*crypto,
         &CLIENT_CID,
-        &crypto_frame_at(0, &named_hello(hostile)),
+        &crypto_frame_at(0, &named_hello(HOSTILE)),
     );
 
-    let Verdict::Refuse(Refusal::OtherName(name)) = judgement(&datagram, &names) else {
-        panic!("a name that is not on the list must be refused for its name");
-    };
     assert_eq!(
-        name,
-        hostile.as_bytes(),
+        judgement(&datagram, &names),
+        Verdict::Refuse(Refusal::OtherName(HOSTILE.as_bytes().to_vec())),
         "the refusal must carry the bytes the peer sent, unrendered"
     );
+}
 
-    let logged = volto::logfmt::escaped_bytes(&name);
-    assert_eq!(logged, r#""a\"b\nc.example""#);
-    assert!(
-        !logged.contains('\n'),
-        "a newline must not survive into a log line"
+/// The filter of the one log subscriber this binary installs. The first
+/// caller of [`SharedBuffer::shared`] sets it, so every caller passes this.
+const LOG_FILTER: &str = "volto::tls=debug,volto::gate=debug";
+
+/// A name with the characters log escaping exists for: a quote, a newline, a
+/// carriage return and an escape byte. Any of them raw in a log line would let
+/// an unauthenticated peer forge a journal entry or a terminal sequence.
+const HOSTILE: &str = "a\"b\nc\r\u{1b}.example";
+
+/// The field the gate's log lines carry for [`HOSTILE`], written out here
+/// rather than computed with `logfmt::escaped_bytes`, so that the lines are
+/// judged against a second spelling.
+const HOSTILE_LOGGED: &str = r#"server_name="a\"b\nc\r\u{1b}.example""#;
+
+/// Both gates log a refused name escaped: the stateless gate's refusal
+/// (`log_refusal`) and the hold's drop (`log_drop`). Each line is found by
+/// the probe's own address and must carry the escaped name whole, which a raw
+/// newline would cut in two, and the log must hold no raw carriage return or
+/// escape byte.
+#[tokio::test]
+async fn a_refused_name_is_logged_escaped_by_both_gates() {
+    let log = SharedBuffer::shared(LOG_FILTER);
+    let crypto = nameless_crypto();
+    let datagram = initial(
+        &*crypto,
+        &CLIENT_CID,
+        &crypto_frame_at(0, &named_hello(HOSTILE)),
     );
+    let stateless = TestServer::start_with(GATE_LOCALHOST).await;
+    let (holding, _keys) = ech_server(&ech_key(45), false, &["localhost"]).await;
+
+    for (server, text) in [
+        (
+            &stateless,
+            "dropping a handshake: its server_name is not one this server answers to",
+        ),
+        (
+            &holding,
+            "dropping a first flight: its server_name is not one this server answers to",
+        ),
+    ] {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind a probe");
+        let remote = format!(
+            "remote={}",
+            probe.local_addr().expect("the probe's address")
+        );
+        let mark = log.mark();
+        probe
+            .send_to(&datagram, server.addr)
+            .await
+            .expect("send the probe");
+        let line = log.wait_for_line(mark, &[text, &remote]).await;
+        assert!(line.contains(HOSTILE_LOGGED), "{text}: {line}");
+        assert!(
+            !log.since(mark).contains(['\r', '\u{1b}']),
+            "{text}: a raw control byte reached the log"
+        );
+    }
 }
 
 /// An Initial whose Length field leaves no room for a packet number is passed
@@ -3334,7 +3378,7 @@ async fn a_datagram_that_disagrees_with_itself_leaves_the_server_answering() {
 /// is how the line is told apart from the lines of the tests beside it.
 #[tokio::test]
 async fn a_hello_retry_request_under_ech_completes_through_the_hold() {
-    let log = SharedBuffer::shared("volto::tls=debug");
+    let log = SharedBuffer::shared(LOG_FILTER);
     let key = ech_key(43);
     let (server, _keys) = ech_server(&key, true, &["localhost"]).await;
     let groups = [kx_group::SECP256R1MLKEM768, kx_group::X25519];
