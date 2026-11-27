@@ -180,6 +180,14 @@ impl Peer {
         panic!("{rule}");
     }
 
+    /// [`Self::broke`], unless the connection has closed: every stream ends
+    /// with its connection, and that ending is not a fault.
+    fn broke_unless_closed(&self, quic: &quinn::Connection, rule: impl Into<String>) {
+        if quic.close_reason().is_none() {
+            self.broke(rule.into());
+        }
+    }
+
     /// Panics if the server has already broken a unidirectional-stream rule.
     ///
     /// Called at every request and response boundary, after every data read,
@@ -1329,12 +1337,13 @@ async fn read_qpack(
             //# Closure of either unidirectional stream type MUST be treated as a
             //# connection error of type H3_CLOSED_CRITICAL_STREAM.
             Ok(None) | Err(_) => {
-                if quic.close_reason().is_none() {
-                    peer.broke(format!(
+                peer.broke_unless_closed(
+                    &quic,
+                    format!(
                         "the server closed or reset its QPACK {name} stream, which is \
                          H3_CLOSED_CRITICAL_STREAM"
-                    ));
-                }
+                    ),
+                );
                 return;
             }
         };
@@ -1384,6 +1393,7 @@ async fn read_qpack(
 /// read, and at [`H3Client`] teardown, and [`H3Client::closed_by_server`] does
 /// so after the server's close.
 async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>, quic: quinn::Connection) {
+    const MID_FRAME: &str = "the server's control stream ended in the middle of a frame";
     let mut settings_seen = false;
 
     loop {
@@ -1393,26 +1403,20 @@ async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>, quic: quinn:
             //# If either control stream is closed at any point, this MUST be
             //# treated as a connection error of type H3_CLOSED_CRITICAL_STREAM.
             VarintRead::EndedBefore => {
-                if quic.close_reason().is_none() {
-                    peer.broke(
-                        "the server closed its control stream at a frame boundary, which is \
-                         H3_CLOSED_CRITICAL_STREAM"
-                            .into(),
-                    );
-                }
+                peer.broke_unless_closed(
+                    &quic,
+                    "the server closed its control stream at a frame boundary, which is \
+                     H3_CLOSED_CRITICAL_STREAM",
+                );
                 return;
             }
             VarintRead::EndedInside => {
-                if quic.close_reason().is_none() {
-                    peer.broke("the server's control stream ended in the middle of a frame".into());
-                }
+                peer.broke_unless_closed(&quic, MID_FRAME);
                 return;
             }
         };
         let Some(length) = read_varint(&mut recv).await else {
-            if quic.close_reason().is_none() {
-                peer.broke("the server's control stream ended in the middle of a frame".into());
-            }
+            peer.broke_unless_closed(&quic, MID_FRAME);
             return;
         };
         if length > MAX_CONTROL_FRAME {
@@ -1424,9 +1428,7 @@ async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>, quic: quinn:
 
         let mut payload = vec![0u8; length as usize];
         if recv.read_exact(&mut payload).await.is_err() {
-            if quic.close_reason().is_none() {
-                peer.broke("the server's control stream ended in the middle of a frame".into());
-            }
+            peer.broke_unless_closed(&quic, MID_FRAME);
             return;
         }
 
