@@ -38,19 +38,19 @@ use socket::{RequestedBuffers, SocketBuffers, warn_if_fd_budget_is_tight};
 
 /// What the handshake revealed about a peer, for logging.
 #[derive(Debug, Clone)]
-pub struct PeerInfo {
+struct PeerInfo {
     /// The peer's address. Behind a UDP relay this is the relay's address.
-    pub remote: SocketAddr,
+    remote: SocketAddr,
     /// The negotiated ALPN identifier, lossily decoded for display.
-    pub alpn: Option<String>,
+    alpn: Option<String>,
     /// The SNI the client sent. The inner name when ECH was accepted.
-    pub server_name: Option<String>,
+    server_name: Option<String>,
     /// Whether the handshake ran on an accepted ECH extension.
-    pub ech: bool,
+    ech: bool,
 }
 
 /// Extracts loggable handshake metadata from an established connection.
-pub fn peer_info(conn: &quinn::Connection) -> PeerInfo {
+fn peer_info(conn: &quinn::Connection) -> PeerInfo {
     let handshake = conn
         .handshake_data()
         .and_then(|data| data.downcast::<HandshakeData>().ok());
@@ -60,9 +60,6 @@ pub fn peer_info(conn: &quinn::Connection) -> PeerInfo {
             data.protocol
                 .as_deref()
                 .map(|p| String::from_utf8_lossy(p).into_owned()),
-            // Moved rather than cloned: the first element has finished
-            // borrowing `data` by the time this one is evaluated, and this is
-            // one `String` per accepted connection.
             data.server_name,
             data.ech_accepted,
         ),
@@ -493,10 +490,6 @@ impl Server {
         // registration, and an evicted one leaves the roster before its task
         // ends, so the set holds everything the roster does and sometimes
         // more.
-        //
-        // Read once and reused by the two log lines below, which takes one
-        // mutex acquisition off every arrival at the cap, the path a flood
-        // takes.
         let live = self.roster.len();
         if live < ceiling {
             return Some(incoming);
@@ -526,33 +519,13 @@ impl Server {
         //# (see Section 8.1.2) or in a previous connection
         //# using the NEW_TOKEN frame (see Section 8.1.3).
         //
-        // The second of those is why the round trip is rarer than it looks.
-        // quinn's `bloom` feature is on (see `Cargo.toml`), so this server
-        // sends two NEW_TOKEN frames on every connection whose path it
-        // validated, and a client that keeps them (quinn's own default token
-        // store does) comes back already validated and evicts without a
-        // Retry. The extra round trip falls on an address this server holds
-        // no token from: a first contact, a token past its two-week lifetime,
-        // or one sealed by a key this process no longer has, since
-        // `ServerConfig::with_crypto` draws a fresh one every time
-        // `server_config` builds a config, at startup and again on every
-        // `SIGHUP`. And it is paid only while the server is full: below the
-        // cap this branch is not entered at all, so an ordinary Surge
-        // handshake is untouched.
-        //
-        // quinn has no `retry_with`, so the Retry token is sealed with the
-        // `token_key` of the configuration quinn-proto pinned to this
-        // `Incoming`, and `with_crypto` draws a fresh key on every `SIGHUP`. A
-        // Retry that crosses a reload therefore fails to decode, and if the
-        // server is still full the second Retry is discarded by the client:
-        //
-        //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
-        //# A client MUST accept and process at most one Retry packet for each
-        //# connection attempt.
-        //
-        // That attempt fails and the client starts a new one. It needs a full
-        // server and a reload inside one round trip, and D31 records key
-        // rotation on reload as the current behaviour.
+        // With quinn's `bloom` feature (on, see `Cargo.toml`) the server sends
+        // two NEW_TOKEN frames per validated connection, so a returning client
+        // arrives validated and evicts without a Retry. The round trip falls on
+        // first contacts and on expired or foreign tokens, and only while the
+        // server is full. A Retry that crosses a `SIGHUP` fails to decode,
+        // because `with_crypto` draws a fresh token key per configuration
+        // (D31).
         if !incoming.remote_address_validated() {
             match incoming.retry() {
                 Ok(()) => {
@@ -593,21 +566,12 @@ impl Server {
             return None;
         }
 
-        // A loop rather than a single eviction, because the cap this is
-        // measured against can move; `evict_until_below` carries the whole of
-        // that argument and is what the roster's own tests run. A connection
-        // that has never had a request pass the credentials check is not owed
-        // the slot it is sitting on, and a peer that completes a handshake a
-        // second and never authenticates would otherwise hold every slot there
-        // is for as long as it wanted. Each one is bounded, but each one that
-        // ends is replaced.
+        // Evict the oldest connections that have never authenticated;
+        // [`Roster::evict_until_below`] says why it loops.
         let (victims, remaining) = self.roster.evict_until_below(ceiling);
         for victim in victims {
-            // DEBUG, not INFO: this fires once per arrival for as long as a
-            // flood lasts, which is exactly the shape the refusal beside it is
-            // DEBUG for. The victim's own closing line stays at INFO: that one
-            // is once per connection actually lost, and it is what an operator
-            // is looking for.
+            // DEBUG: once per arrival during a flood. The victim's own closing
+            // line is INFO.
             debug!(
                 evicted = %victim,
                 %remote,
@@ -685,18 +649,10 @@ impl Server {
     /// allowed to say nothing at all is not going to finish it. Dropping the
     /// future ends the connection and frees the slot with it.
     ///
-    /// What that drop is *not* is a refusal. The `Incoming` was accepted by
-    /// [`Self::accept_on_one_generation`] before this task existed, and
-    /// `Incoming::accept_with` returns a `Connecting`, so by the time either arm
-    /// of the select below can run there is a `Connecting` rather than an
-    /// `Incoming`: quinn has answered the client's Initial and the TLS server
-    /// flight is already on its way. [`Handshake`] is the wrapper that carries
-    /// it here, and it starts nothing of its own.
-    /// Dropping a `Connecting` closes the connection the way an application
-    /// close does, and RFC 9000 §10.2.3 has an application close sent before the
-    /// handshake completes go out as a transport one, so what the peer receives
-    /// is `CONNECTION_CLOSE` with APPLICATION_ERROR and an empty reason. That is
-    /// not the CONNECTION_REFUSED that `Incoming::refuse` sends, and not silence.
+    /// The drop is not a refusal: by then quinn has answered the Initial
+    /// ([`Self::accept_on_one_generation`]), so dropping the `Connecting` sends
+    /// CONNECTION_CLOSE with APPLICATION_ERROR and an empty reason (RFC 9000
+    /// §10.2.3), not CONNECTION_REFUSED.
     ///
     /// # Eviction
     ///
@@ -740,14 +696,10 @@ impl Server {
             // connection is over.
             let counts = conn::Counts::default();
 
-            // Written once the handshake completes, so the closing line can tell
-            // an eviction during the handshake from one after it. `conn::handle`
-            // consumes the connection; the handle kept here lets the close logs
-            // report what the connection learned about its path: the RTT it
-            // measured, the address the peer ended on, and the MTU.
-            // `remote_now` differing from `remote` is the only externally
-            // visible trace of a migration or NAT rebind during the
-            // connection's life.
+            // Set once the handshake completes: the closing line reads the path
+            // from it, and its absence marks an eviction during the handshake.
+            // `remote_now` differing from `remote` is the only trace of a
+            // migration.
             let mut established: Option<(SocketAddr, quinn::Connection)> = None;
 
             // One wait on the eviction for the whole connection, handshake and
@@ -773,8 +725,6 @@ impl Server {
                             // Through `peer_error` because a peer that closes
                             // during the handshake writes the reason phrase
                             // inside this error, and `Display` escapes nothing.
-                            // An established connection has the same exposure,
-                            // and both use the same function.
                             debug!(
                                 %remote,
                                 error = %crate::logfmt::peer_error(error),
@@ -864,21 +814,8 @@ impl Server {
         // unaffected. A client that arrives now hears nothing and gives up at
         // its own handshake timeout: the gate is closed first, so the Stateless
         // Reset quinn would send an Initial once the server configuration is
-        // gone is never drawn (D106 addendum 2026-11-20, user ruling). The
-        // order of the two calls is load-bearing and `Expected::close` says
-        // why.
-        //
-        // "New" counts from the first Initial. A handshake quinn had already
-        // queued as an `Incoming` keeps the server configuration it arrived
-        // under (quinn-proto 0.11.x), so this call neither completes nor
-        // refuses it. Nothing here ever accepts one: the accept loop has left by
-        // the time this runs, and a queued `Incoming` goes away with the
-        // endpoint.
-        //
-        // Deliberately not paired with a write to `self.live`. Its quinn half
-        // exists for `accept_on_one_generation`, and by the time this runs the
-        // accept loop that calls it has returned. Emptying it would mean making
-        // it an `Option` and giving that method a branch nothing can take.
+        // gone is never drawn (D106). The order of the two calls is
+        // load-bearing and `Expected::close` says why.
         //
         // Under the swap, because the latch this drain runs on is read by
         // `ReloadHandle::reload` as a plain predicate: without it a reload that
