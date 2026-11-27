@@ -32,11 +32,11 @@ use common::rawstream::{
     server_control_stream, status_of, still_serving,
 };
 use common::{
-    ALLOW_PRIVATE, H3Client, IMPATIENT, Leg, Relayed, TIMEOUT, TestServer, auth_section,
-    basic_credentials, client_endpoint, client_endpoint_with_transport, echoes, finish_connect,
-    open_tcp_tunnel, open_tcp_tunnel_as, silent_peer, spawn_echo_target, udp_relay,
+    ALLOW_PRIVATE, H3Client, IMPATIENT, Leg, Offer, Relayed, TIMEOUT, TestServer, auth_section,
+    basic_credentials, client_endpoint, client_endpoint_with_transport, echoes, endpoint_from,
+    finish_connect, open_tcp_tunnel, open_tcp_tunnel_as, roots_of, rustls_client, silent_peer,
+    spawn_echo_target, udp_relay,
 };
-use quinn::crypto::rustls::QuicClientConfig;
 use rustls::NamedGroup;
 use rustls::client::{
     ClientSessionMemoryCache, ClientSessionStore, Resumption, Tls12ClientSessionValue,
@@ -959,11 +959,10 @@ async fn the_server_does_not_permit_zero_rtt() {
 /// A client endpoint that keeps session tickets and is willing to use them for
 /// early data, with a count of the tickets that reach its store.
 ///
-/// Built here rather than through `common::client_endpoint` because it differs
-/// from every other client in this suite in exactly the way this one test needs.
-/// rustls leaves `enable_early_data` off, and quinn only sets it on the client
-/// configs it builds itself, so the shared helper's client would never offer
-/// 0-RTT and would agree with the server for the wrong reason.
+/// Not `common::client_endpoint`, because rustls leaves `enable_early_data`
+/// off and quinn sets it only on the client configs it builds itself, so that
+/// client would never offer 0-RTT and would agree with the server for the
+/// wrong reason.
 fn resuming_client_endpoint(ca: &CertificateDer<'static>) -> (quinn::Endpoint, Arc<AtomicUsize>) {
     let tickets = Arc::new(AtomicUsize::new(0));
     let store = Arc::new(CountingSessionStore {
@@ -976,27 +975,11 @@ fn resuming_client_endpoint(ca: &CertificateDer<'static>) -> (quinn::Endpoint, A
         tickets: tickets.clone(),
     });
 
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(ca.clone()).expect("trust the test CA");
-
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    crypto.alpn_protocols = vec![b"h3".to_vec()];
+    let mut crypto = rustls_client(&Offer::Plain, None, roots_of(ca), &["h3"]);
     crypto.resumption = Resumption::store(store);
     crypto.enable_early_data = true;
 
-    let client_config = quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(crypto).expect("quic tls"),
-    ));
-    let mut endpoint =
-        quinn::Endpoint::client("127.0.0.1:0".parse().expect("bind address")).expect("client");
-    endpoint.set_default_client_config(client_config);
-
-    (endpoint, tickets)
+    (endpoint_from(crypto, None), tickets)
 }
 
 /// rustls' own in-memory session cache, with a count of the tickets that reach
