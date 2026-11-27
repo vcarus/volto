@@ -1,4 +1,4 @@
-//! M6: `SIGHUP` configuration reload (spec §6).
+//! `SIGHUP` configuration reload (spec §6).
 //!
 //! The two properties that matter operationally:
 //!
@@ -165,8 +165,7 @@ async fn connect_attempt(server: &TestServer) -> bool {
 ///
 /// This is the knob an operator turns during an incident, and
 /// `docs/deployment.md#reloading` promises it applies to connections accepted
-/// from then on. It used to be copied into a local once, before the accept loop,
-/// so neither raising nor lowering it did anything until a restart.
+/// from then on.
 #[tokio::test]
 async fn reloading_replaces_the_connection_cap() {
     let server =
@@ -423,10 +422,7 @@ async fn a_broken_configuration_changes_nothing() {
         ),
         // Valid TOML whose integers are out of range. TOML deserializes across
         // the whole of the target type, so `u64::MAX` is something a typo can
-        // put in the file, and validation used to have no answer for either of
-        // these: the keep-alive check panicked on the arithmetic it did (which
-        // on this path is a panic *while a server is running*), and the grace
-        // period was accepted and quietly stopped bounding the drain (D86).
+        // put in the file. Both are refused by validation (D86).
         (
             "keep-alive past what its own check could double",
             format!(
@@ -791,12 +787,8 @@ async fn a_storm_of_failed_reloads_changes_nothing_and_leaves_the_next_one_worki
 
 /// A reload that raises the tunnel quota past `RLIMIT_NOFILE` says so.
 ///
-/// `warn_if_fd_budget_is_tight` ran at bind only, while both halves of the
-/// product it checks are reloadable and `docs/deployment.md` promises a reload
-/// applies a raised `limits.max_connections`. So the file that warned at startup
-/// was silent when the same numbers arrived by `SIGHUP`, which is the case D19
-/// wrote the check for: descriptor exhaustion is not a graceful failure mode,
-/// and an operator raising a quota during an incident is who meets it.
+/// Both halves of the product are reloadable, so the bind-time check (D19)
+/// runs on reload too.
 ///
 /// The numbers overshoot any host's limit by orders of magnitude, so the test
 /// does not depend on what `RLIMIT_NOFILE` happens to be here.
@@ -836,11 +828,7 @@ async fn a_reload_that_outgrows_the_fd_budget_says_so() {
 /// the same file still applies, which is what separates "this key is a no-op"
 /// from "the reload failed".
 ///
-/// The silence, though, was never the point. An operator who *did* mean to move
-/// the socket had nothing to read: the reload succeeded, the line said so, and
-/// the one key that did not apply was the one nothing mentioned. So the no-op
-/// carries a `warn!` naming both addresses, and this test pins it -- the
-/// promise is "does not rebind", not "does not tell you".
+/// The no-op is reported with a WARN naming both values.
 #[tokio::test]
 async fn a_reload_cannot_move_the_listening_socket() {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
@@ -1125,13 +1113,9 @@ async fn a_tunnel_abandoned_during_a_reload_storm_still_closes_its_target() {
 
 /// A gate name with an empty label is refused at reload, not held unmatchably.
 ///
-/// `expected_sni = ["local..host"]` used to pass validation, because the
-/// character class allows `.` and only one trailing dot was ever stripped. The
-/// gate then held a name no ClientHello can carry, so every client was dropped
-/// in silence, and the D106 warning that exists for that failure did not fire
-/// either: `tls::names_not_covered` stripped every trailing dot and found the
-/// name covered. The two spellings are now one helper, `names::root_relative`,
-/// and an empty label is refused where a misconfiguration can still be reported.
+/// A name with an empty label can never match a ClientHello, and the D106
+/// coverage check cannot see it, so validation refuses it
+/// (`names::root_relative`).
 #[tokio::test]
 async fn a_reloaded_gate_name_with_an_empty_label_is_refused() {
     let mut server = TestServer::start_with(GATE_LOCALHOST).await;
@@ -1165,8 +1149,7 @@ async fn a_reloaded_gate_name_with_an_empty_label_is_refused() {
 /// reported, because a gate that admits a name no certificate covers refuses the
 /// handshake at TLS and the operator has nothing else to go on; the covered one
 /// must be silent, or a configuration written the absolute way draws a warning
-/// it does not deserve. The warning had unit coverage in `src/config/warnings.rs` and
-/// none through `reload`, which is where an operator meets it.
+/// it does not deserve.
 ///
 /// Not a red proof of the trailing-dot helper. `rustls::pki_types::ServerName`
 /// parses `localhost.` and matches it against the certificate itself, so for
