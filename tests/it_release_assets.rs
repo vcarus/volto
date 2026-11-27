@@ -175,24 +175,32 @@ fn ignored_in_script_dir() -> BTreeSet<String> {
     }
 }
 
-/// Every file that sits in `script/`, apart from the ones git ignores.
+/// Every file under `script/`, subdirectories included, apart from the ones
+/// git ignores.
 ///
 /// The directory is listed rather than `git ls-files`, so a new asset fails
 /// this test before it is ever added to the index.
 fn assets_on_disk() -> BTreeSet<String> {
-    let dir = repo_root().join("script");
+    let root = repo_root();
     let ignored = ignored_in_script_dir();
     let mut assets = BTreeSet::new();
-    for entry in fs::read_dir(&dir).expect("script/ must exist") {
-        let entry = entry.expect("script/ must be readable");
-        if entry.file_type().expect("a file type").is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_str().expect("asset names are UTF-8");
-        let path = format!("script/{name}");
-        if !ignored.contains(&path) {
-            assets.insert(path);
+    let mut pending = vec![root.join("script")];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).expect("script/ must be readable") {
+            let path = entry.expect("script/ must be readable").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let path = path
+                .strip_prefix(&root)
+                .expect("under the repository")
+                .to_str()
+                .expect("asset names are UTF-8")
+                .to_owned();
+            if !ignored.contains(&path) {
+                assets.insert(path);
+            }
         }
     }
     assets
