@@ -29,9 +29,21 @@ impl Config {
     /// empty, so it is a blocking file read and not only a walk over the parsed
     /// configuration. `ReloadHandle::reload` calls it before it takes the
     /// `ConfigSwap` guard for that reason.
+    ///
+    /// The warnings come in groups, each from its own function, in this order.
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
+        self.access_warnings(&mut warnings);
+        self.handshake_warnings(&mut warnings);
+        self.tunnel_warnings(&mut warnings);
+        self.unbounded_peer_warnings(&mut warnings);
+        self.path_warnings(&mut warnings);
+        self.disabled_safeguard_warnings(&mut warnings);
+        warnings
+    }
 
+    /// Who can use this server, and who can read its passwords.
+    fn access_warnings(&self, warnings: &mut Vec<String>) {
         if self.auth.users.is_empty() {
             warnings.push(
                 "[auth].users is empty, so authentication is DISABLED: this is an open proxy and \
@@ -80,7 +92,11 @@ impl Config {
                 path.display()
             ));
         }
+    }
 
+    /// Settings under which every client, or every client but those sending
+    /// one name, fails its handshake with no explanation.
+    fn handshake_warnings(&self, warnings: &mut Vec<String>) {
         // `h3` is the identifier HTTP/3 is negotiated under, and HTTP/3 is the
         // only thing this server can serve once a connection is up. A list
         // without it is legal (the key exists for interop debugging), but it
@@ -116,7 +132,10 @@ impl Config {
                 ));
             }
         }
+    }
 
+    /// How long a tunnel lasts and what it may reach.
+    fn tunnel_warnings(&self, warnings: &mut Vec<String>) {
         if self.limits.udp_session_timeout < 120 {
             warnings.push(format!(
                 "limits.udp_session_timeout = {} is below the two minutes RFC 9298 §3.1 \
@@ -141,7 +160,10 @@ impl Config {
                 warnings.push(format!("security.denied_ports contains {port}: {reason}"));
             }
         }
+    }
 
+    /// A cap on what a peer can try that has been removed.
+    fn unbounded_peer_warnings(&self, warnings: &mut Vec<String>) {
         if self.limits.max_connections == 0 {
             warnings.push(
                 "limits.max_connections = 0 removes the cap on simultaneous connections: \
@@ -158,7 +180,10 @@ impl Config {
                     .to_owned(),
             );
         }
+    }
 
+    /// What keeps an idle connection alive on the path, and the packet size.
+    fn path_warnings(&self, warnings: &mut Vec<String>) {
         if self.limits.keep_alive_interval == 0 {
             let mut warning = "limits.keep_alive_interval = 0 disables QUIC keep-alives: \
                                behind a relay doing UDP DNAT, an idle connection will be \
@@ -196,7 +221,10 @@ impl Config {
                 upper_bound
             ));
         }
+    }
 
+    /// A protection that is on by default and has been switched off.
+    fn disabled_safeguard_warnings(&self, warnings: &mut Vec<String>) {
         if self.log.keylog {
             warnings.push(
                 "log.keylog is on: TLS secrets are being written to the file named by \
@@ -224,8 +252,6 @@ impl Config {
                     .to_owned(),
             );
         }
-
-        warnings
     }
 }
 
