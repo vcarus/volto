@@ -55,7 +55,6 @@ use common::{
 use quinn::ConnectionId;
 use rustls::crypto::SupportedKxGroup;
 use rustls::crypto::aws_lc_rs::kx_group;
-use volto::datagram::{peek_varint, put_varint};
 use volto::gate::{
     Dropped, FirstFlight, HOLD_FLIGHT_BYTES, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_LIFETIME,
     HOLD_TOTAL_BYTES, HoldInput, HoldStep, Names, Policy, REPLAY_ENTRIES, Refusal, Screened,
@@ -63,6 +62,7 @@ use volto::gate::{
     sealed_initial,
 };
 use volto::tls::{EchKey, EchKeySet};
+use volto::varint::{peek_varint, put_varint};
 
 /// How long a server is given to prove it is not answering.
 ///

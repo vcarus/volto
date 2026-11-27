@@ -24,6 +24,7 @@ use common::{
 use std::assert_matches;
 use volto::datagram;
 use volto::h3api::Status;
+use volto::varint;
 
 /// The eight ways a connection ends, each with the level and reason it earns.
 ///
@@ -265,7 +266,7 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
             .send_datagram(datagram::encode(qsid, 7, b"unknown context"))
             .expect("send an unknown-context datagram");
         let mut truncated = bytes::BytesMut::new();
-        datagram::put_varint(&mut truncated, qsid);
+        varint::put_varint(&mut truncated, qsid);
         client
             .quic
             .send_datagram(truncated.freeze())

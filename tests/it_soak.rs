@@ -104,6 +104,7 @@ use common::{
 };
 use fds::settled_fds;
 use volto::datagram;
+use volto::varint;
 
 /// Sequential mixed cycles the committed soak runs.
 ///
@@ -236,7 +237,7 @@ fn send_the_three_drop_shapes(client: &H3Client, live: u64) {
     // The one malformation RFC 9297 §2.1 does not make a connection error: the
     // Quarter Stream ID parses and the Context ID is simply not there.
     let mut truncated = bytes::BytesMut::new();
-    datagram::put_varint(&mut truncated, live);
+    varint::put_varint(&mut truncated, live);
     client
         .quic
         .send_datagram(truncated.freeze())

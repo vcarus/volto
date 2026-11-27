@@ -78,7 +78,7 @@ use common::rawstream::{
     settings_frame, status_of, varint_frame,
 };
 use common::{TIMEOUT, TestServer, connect_quic, spawn_echo_target};
-use volto::datagram;
+use volto::varint;
 
 /// Upper bound on one generated case, so a hang fails instead of orphaning
 /// the run.
@@ -151,7 +151,7 @@ async fn open_uni_tolerant(
 ) -> Option<quinn::SendStream> {
     let mut stream = connection.open_uni().await.ok()?;
     let mut wire = BytesMut::new();
-    datagram::put_varint(&mut wire, stream_type);
+    varint::put_varint(&mut wire, stream_type);
     wire.extend_from_slice(bytes);
     let _ = stream.write_all(&wire).await;
     Some(stream)
@@ -254,7 +254,7 @@ impl ControlEvent {
                 // An identifier with no value behind it, inside a length that
                 // is honest about it: the payload itself ends mid-pair.
                 let mut payload = BytesMut::new();
-                datagram::put_varint(&mut payload, SETTINGS_MAX_FIELD_SECTION_SIZE);
+                varint::put_varint(&mut payload, SETTINGS_MAX_FIELD_SECTION_SIZE);
                 frame(FRAME_SETTINGS, &payload)
             }
             Self::Goaway(id) => varint_frame(FRAME_GOAWAY, *id),
@@ -262,7 +262,7 @@ impl ControlEvent {
             Self::MaxPushId(id) => varint_frame(FRAME_MAX_PUSH_ID, *id),
             Self::MaxPushIdTrailingBytes => {
                 let mut payload = BytesMut::new();
-                datagram::put_varint(&mut payload, 4);
+                varint::put_varint(&mut payload, 4);
                 payload.extend_from_slice(b"\x00");
                 frame(FRAME_MAX_PUSH_ID, &payload)
             }
@@ -479,8 +479,8 @@ async fn drive_control_script(events: &[ControlEvent], end: ControlEnd) -> (u64,
                 // A grease frame announcing five bytes, of which two arrive
                 // before the FIN.
                 let mut partial = BytesMut::new();
-                datagram::put_varint(&mut partial, grease_type(3));
-                datagram::put_varint(&mut partial, 5);
+                varint::put_varint(&mut partial, grease_type(3));
+                varint::put_varint(&mut partial, 5);
                 partial.extend_from_slice(b"\x00\x01");
                 let _ = stream.write_all(&partial).await;
                 let _ = stream.finish();
@@ -1293,8 +1293,8 @@ async fn commit_fatal(
         RequestFatal::FinMidHeaders => {
             if let Ok((mut send, _recv)) = connection.open_bi().await {
                 let mut wire = BytesMut::new();
-                datagram::put_varint(&mut wire, FRAME_HEADERS);
-                datagram::put_varint(&mut wire, 8);
+                varint::put_varint(&mut wire, FRAME_HEADERS);
+                varint::put_varint(&mut wire, 8);
                 wire.extend_from_slice(b"\x00\x01\x02");
                 let _ = send.write_all(&wire).await;
                 let _ = send.finish();
@@ -1313,8 +1313,8 @@ async fn commit_fatal(
         RequestFatal::FinMidData => {
             let mut tunnel = a_live_tunnel(connection, live).await;
             let mut wire = BytesMut::new();
-            datagram::put_varint(&mut wire, FRAME_DATA);
-            datagram::put_varint(&mut wire, 32);
+            varint::put_varint(&mut wire, FRAME_DATA);
+            varint::put_varint(&mut wire, 32);
             wire.extend_from_slice(b"\x00\x01");
             let _ = tunnel.send.write_all(&wire).await;
             let _ = tunnel.send.finish();

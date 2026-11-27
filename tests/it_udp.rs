@@ -18,6 +18,7 @@ use common::{
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
+use volto::varint;
 
 /// Waits for the server to close the QUIC connection, returning its error code.
 ///
@@ -447,7 +448,7 @@ async fn an_out_of_range_quarter_stream_id_closes_the_connection() {
     let server = TestServer::start().await;
     let target = spawn_udp_echo_target().await;
 
-    for quarter_stream_id in [datagram::MAX_QUARTER_STREAM_ID + 1, datagram::VARINT_MAX] {
+    for quarter_stream_id in [datagram::MAX_QUARTER_STREAM_ID + 1, varint::VARINT_MAX] {
         let mut client = H3Client::connect(&server).await;
 
         // With a live session on the connection: the datagram must take the
@@ -514,7 +515,7 @@ async fn a_truncated_context_id_is_dropped_without_closing_the_connection() {
 
     // A well-formed Quarter Stream ID and nothing after it.
     let mut truncated = bytes::BytesMut::new();
-    datagram::put_varint(&mut truncated, qsid);
+    varint::put_varint(&mut truncated, qsid);
     client
         .quic
         .send_datagram(truncated.freeze())
@@ -800,8 +801,8 @@ async fn an_oversized_datagram_capsule_is_reset_as_a_parse_error() {
     // for a single byte of the value, which is the point — buffering 64 KiB to
     // find out it was never valid is exactly what the limit prevents.
     let mut wire = bytes::BytesMut::new();
-    datagram::put_varint(&mut wire, capsule::CAPSULE_TYPE_DATAGRAM);
-    datagram::put_varint(&mut wire, capsule::MAX_DATAGRAM_CAPSULE_VALUE + 1);
+    varint::put_varint(&mut wire, capsule::CAPSULE_TYPE_DATAGRAM);
+    varint::put_varint(&mut wire, capsule::MAX_DATAGRAM_CAPSULE_VALUE + 1);
     stream
         .send_data(wire.freeze())
         .await
@@ -935,7 +936,7 @@ async fn a_session_closed_on_the_spot_stops_the_client_with_no_error() {
 /// An unknown capsule type must be skipped, leaving the session usable.
 #[tokio::test]
 async fn unknown_capsule_types_are_skipped() {
-    use volto::{capsule, datagram as dg};
+    use volto::capsule;
 
     let server = TestServer::start().await;
     let target = spawn_udp_echo_target().await;
@@ -948,8 +949,8 @@ async fn unknown_capsule_types_are_skipped() {
     // byte would be read as the *first byte of a two-byte varint*, which is a
     // different capsule type entirely.
     let mut wire = bytes::BytesMut::new();
-    dg::put_varint(&mut wire, 0x41); // an unknown capsule type
-    dg::put_varint(&mut wire, 3); // its value length
+    varint::put_varint(&mut wire, 0x41); // an unknown capsule type
+    varint::put_varint(&mut wire, 3); // its value length
     wire.extend_from_slice(b"xyz");
     wire.extend_from_slice(&capsule::encode_datagram(0, b"after unknown"));
     stream

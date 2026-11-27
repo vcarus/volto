@@ -41,8 +41,8 @@ use common::{
     ClientStream, H3Client, TIMEOUT, TestServer, close_and_drain, connect_request, open_tcp_tunnel,
     open_udp_session, send_and_respond, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
 };
-use volto::datagram::put_varint;
 use volto::h3api::{FieldValue, Request, Status};
+use volto::varint::put_varint;
 
 // ---------------------------------------------------------------------------
 // The scales

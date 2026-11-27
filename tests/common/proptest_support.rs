@@ -84,7 +84,7 @@ pub fn cut_offsets(len: usize, cuts: &[u16]) -> Vec<usize> {
 ///
 /// `length` must be able to hold `value`; the caller chooses it, which is the
 /// point — RFC 9000 §16 explicitly permits an encoding longer than the
-/// shortest, and `datagram::put_varint`, which only ever emits the shortest,
+/// shortest, and `varint::put_varint`, which only ever emits the shortest,
 /// cannot produce one.
 pub fn put_varint_in(buf: &mut BytesMut, value: u64, length: usize) {
     match length {

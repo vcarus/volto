@@ -106,6 +106,7 @@ use common::{
     open_tcp_tunnel, send_udp_payload, silent_peer, spawn_echo_target, windowless_transport,
 };
 use volto::datagram;
+use volto::varint;
 
 // ---------------------------------------------------------------------------
 // The numbers this file spells out for itself
@@ -176,8 +177,8 @@ async fn announce_frame(
     let (mut send, recv) = connection.open_bi().await.expect("open a request stream");
 
     let mut announcement = BytesMut::new();
-    datagram::put_varint(&mut announcement, kind);
-    datagram::put_varint(&mut announcement, length);
+    varint::put_varint(&mut announcement, kind);
+    varint::put_varint(&mut announcement, length);
     // A write that fails is the connection already gone, which is one of the
     // answers these tests wait for rather than a failure of the test.
     let _ = send.write_all(&announcement).await;
@@ -578,8 +579,8 @@ async fn oversized_control_stream_frames_are_refused_by_type() {
 
         let mut control = BytesMut::new();
         control.extend_from_slice(&harmless_settings());
-        datagram::put_varint(&mut control, kind);
-        datagram::put_varint(&mut control, PAST_ONE_FRAME);
+        varint::put_varint(&mut control, kind);
+        varint::put_varint(&mut control, PAST_ONE_FRAME);
         let _control = open_uni_stream(&connection, STREAM_CONTROL, &control).await;
 
         let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
@@ -612,8 +613,8 @@ async fn an_oversized_frame_before_settings_is_still_missing_settings() {
         let (_endpoint, connection) = connect_quic(&server).await;
 
         let mut first = BytesMut::new();
-        datagram::put_varint(&mut first, kind);
-        datagram::put_varint(&mut first, PAST_ONE_FRAME);
+        varint::put_varint(&mut first, kind);
+        varint::put_varint(&mut first, PAST_ONE_FRAME);
         let _control = open_uni_stream(&connection, STREAM_CONTROL, &first).await;
 
         let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
@@ -706,8 +707,8 @@ async fn a_frame_refused_for_its_type_is_never_charged_for() {
     }
 
     let mut announcement = BytesMut::new();
-    datagram::put_varint(&mut announcement, FRAME_PUSH_PROMISE);
-    datagram::put_varint(&mut announcement, volto::h3::MAX_FIELD_SECTION_SIZE);
+    varint::put_varint(&mut announcement, FRAME_PUSH_PROMISE);
+    varint::put_varint(&mut announcement, volto::h3::MAX_FIELD_SECTION_SIZE);
 
     let mut announced = Vec::new();
     for (mut send, recv) in streams {
@@ -762,8 +763,8 @@ async fn a_field_section_on_an_established_tunnel_ends_the_connection() {
     );
 
     let mut announcement = BytesMut::new();
-    datagram::put_varint(&mut announcement, FRAME_HEADERS);
-    datagram::put_varint(&mut announcement, volto::h3::MAX_FIELD_SECTION_SIZE);
+    varint::put_varint(&mut announcement, FRAME_HEADERS);
+    varint::put_varint(&mut announcement, volto::h3::MAX_FIELD_SECTION_SIZE);
     send.write_all(&announcement)
         .await
         .expect("announce a field section on the tunnel");
@@ -1194,8 +1195,8 @@ async fn an_unfinished_unknown_first_frame_is_refused_from_its_header() {
     /// (2^62-1), of which one byte is sent.
     fn endless_unknown_frame() -> Vec<u8> {
         let mut wire = BytesMut::new();
-        datagram::put_varint(&mut wire, GREASE);
-        datagram::put_varint(&mut wire, (1u64 << 62) - 1);
+        varint::put_varint(&mut wire, GREASE);
+        varint::put_varint(&mut wire, (1u64 << 62) - 1);
         wire.extend_from_slice(b"\x00");
         wire.to_vec()
     }

@@ -39,10 +39,11 @@ use volto::capsule::{
     self, CAPSULE_TYPE_DATAGRAM, Capsule, CapsuleDecoder, MAX_DATAGRAM_CAPSULE_VALUE,
 };
 use volto::datagram::{
-    self, CONTEXT_ID_UDP_PAYLOAD, DecodeError, MAX_QUARTER_STREAM_ID, MAX_UDP_PAYLOAD, VARINT_MAX,
+    self, CONTEXT_ID_UDP_PAYLOAD, DecodeError, MAX_QUARTER_STREAM_ID, MAX_UDP_PAYLOAD,
 };
 use volto::policy::Policy;
 use volto::tunnel::udp::parse_target;
+use volto::varint::{self, VARINT_MAX};
 
 /// The RFC 9298 §2 default template prefix.
 const PREFIX: &str = "/.well-known/masque/udp/";
@@ -87,7 +88,7 @@ fn any_quarter_stream_id() -> impl Strategy<Value = u64> {
 fn put_padded_varint(buf: &mut BytesMut, value: u64, length: prop::sample::Index) {
     let lengths: Vec<usize> = [1usize, 2, 4, 8]
         .into_iter()
-        .filter(|candidate| *candidate >= datagram::varint_len(value))
+        .filter(|candidate| *candidate >= varint::varint_len(value))
         .collect();
 
     put_varint_in(buf, value, *length.get(&lengths));
@@ -124,18 +125,18 @@ proptest! {
         tail in payload(64),
     ) {
         let mut buf = BytesMut::new();
-        datagram::put_varint(&mut buf, value);
-        let encoded_len = datagram::varint_len(value);
+        varint::put_varint(&mut buf, value);
+        let encoded_len = varint::varint_len(value);
         prop_assert_eq!(buf.len(), encoded_len);
 
         buf.put_slice(&tail);
         let mut bytes = buf.freeze();
 
-        let (peeked, peeked_len) = datagram::peek_varint(&bytes).expect("a whole varint");
+        let (peeked, peeked_len) = varint::peek_varint(&bytes).expect("a whole varint");
         prop_assert_eq!(peeked, value);
         prop_assert_eq!(peeked_len, encoded_len);
 
-        prop_assert_eq!(datagram::take_varint(&mut bytes), Some(value));
+        prop_assert_eq!(varint::take_varint(&mut bytes), Some(value));
         prop_assert_eq!(&bytes[..], &tail[..], "the remainder must be untouched");
     }
 
@@ -144,15 +145,15 @@ proptest! {
     #[test]
     fn every_proper_prefix_of_a_varint_needs_more_bytes(value in any_varint()) {
         let mut buf = BytesMut::new();
-        datagram::put_varint(&mut buf, value);
+        varint::put_varint(&mut buf, value);
         let encoded = buf.freeze();
 
         for cut in 0..encoded.len() {
             let prefix = encoded.slice(..cut);
-            prop_assert_eq!(datagram::peek_varint(&prefix), None, "peek at {} bytes", cut);
+            prop_assert_eq!(varint::peek_varint(&prefix), None, "peek at {} bytes", cut);
 
             let mut taking = prefix.clone();
-            prop_assert_eq!(datagram::take_varint(&mut taking), None, "take at {} bytes", cut);
+            prop_assert_eq!(varint::take_varint(&mut taking), None, "take at {} bytes", cut);
             prop_assert_eq!(&taking[..], &prefix[..], "a failed take must not consume");
         }
     }
@@ -286,11 +287,11 @@ proptest! {
                 // encoding for both varints: RFC 9000 §16 permits longer forms
                 // and `peek_varint` accepts them, so `encode` is a normaliser
                 // rather than an inverse. That is deliberate, not a defect.
-                let (_, quarter_len) = datagram::peek_varint(&raw).expect("it decoded");
+                let (_, quarter_len) = varint::peek_varint(&raw).expect("it decoded");
                 let (_, context_len) =
-                    datagram::peek_varint(&raw[quarter_len..]).expect("it decoded");
-                let minimal = quarter_len == datagram::varint_len(decoded.quarter_stream_id)
-                    && context_len == datagram::varint_len(decoded.context_id);
+                    varint::peek_varint(&raw[quarter_len..]).expect("it decoded");
+                let minimal = quarter_len == varint::varint_len(decoded.quarter_stream_id)
+                    && context_len == varint::varint_len(decoded.context_id);
                 if minimal {
                     prop_assert_eq!(&re_encoded[..], &raw[..]);
                 }
@@ -327,8 +328,8 @@ fn any_spec() -> impl Strategy<Value = Spec> {
 /// Encodes a capsule of a type the decoder does not know.
 fn encode_unknown(capsule_type: u64, value: &[u8]) -> Bytes {
     let mut buf = BytesMut::new();
-    datagram::put_varint(&mut buf, capsule_type);
-    datagram::put_varint(&mut buf, value.len() as u64);
+    varint::put_varint(&mut buf, capsule_type);
+    varint::put_varint(&mut buf, value.len() as u64);
     buf.put_slice(value);
     buf.freeze()
 }
@@ -554,8 +555,8 @@ proptest! {
         length in (MAX_DATAGRAM_CAPSULE_VALUE + 1)..=VARINT_MAX,
     ) {
         let mut header = BytesMut::new();
-        datagram::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
-        datagram::put_varint(&mut header, length);
+        varint::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
+        varint::put_varint(&mut header, length);
 
         let mut decoder = CapsuleDecoder::new();
         decoder.push(header.freeze());
@@ -595,8 +596,8 @@ proptest! {
         length in 1..=MAX_DATAGRAM_CAPSULE_VALUE,
     ) {
         let mut header = BytesMut::new();
-        datagram::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
-        datagram::put_varint(&mut header, length);
+        varint::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
+        varint::put_varint(&mut header, length);
 
         let mut decoder = CapsuleDecoder::new();
         decoder.push(header.freeze());
@@ -617,8 +618,8 @@ fn a_datagram_capsule_at_exactly_the_maximum_decodes() {
     let encoded = capsule::encode_datagram(context_id, &payload);
 
     let mut header = BytesMut::new();
-    datagram::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
-    datagram::put_varint(&mut header, MAX_DATAGRAM_CAPSULE_VALUE);
+    varint::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
+    varint::put_varint(&mut header, MAX_DATAGRAM_CAPSULE_VALUE);
     assert_eq!(
         &encoded[..header.len()],
         &header[..],
@@ -646,12 +647,12 @@ fn a_datagram_capsule_at_exactly_the_maximum_decodes() {
 fn the_decoder_resumes_at_the_next_capsule_after_an_error() {
     let mut wire = BytesMut::new();
     // A DATAGRAM capsule with no room for its Context ID: malformed.
-    datagram::put_varint(&mut wire, CAPSULE_TYPE_DATAGRAM);
-    datagram::put_varint(&mut wire, 0);
+    varint::put_varint(&mut wire, CAPSULE_TYPE_DATAGRAM);
+    varint::put_varint(&mut wire, 0);
     // A DATAGRAM capsule that declares more than a UDP payload can hold. Its
     // value never arrives, because the header alone is the error.
-    datagram::put_varint(&mut wire, CAPSULE_TYPE_DATAGRAM);
-    datagram::put_varint(&mut wire, MAX_DATAGRAM_CAPSULE_VALUE + 1);
+    varint::put_varint(&mut wire, CAPSULE_TYPE_DATAGRAM);
+    varint::put_varint(&mut wire, MAX_DATAGRAM_CAPSULE_VALUE + 1);
     wire.extend_from_slice(&capsule::encode_datagram(9, b"still readable"));
 
     let mut decoder = CapsuleDecoder::new();
@@ -685,8 +686,8 @@ fn the_decoder_resumes_at_the_next_capsule_after_an_error() {
     // boundary at a clean EOF), but a caller that tried to recover from an error
     // would have to keep the error, not the flag.
     let mut header = BytesMut::new();
-    datagram::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
-    datagram::put_varint(&mut header, MAX_DATAGRAM_CAPSULE_VALUE + 1);
+    varint::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
+    varint::put_varint(&mut header, MAX_DATAGRAM_CAPSULE_VALUE + 1);
 
     let mut decoder = CapsuleDecoder::new();
     decoder.push(header.freeze());

@@ -64,13 +64,14 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use props::{config, pattern, payload, put_varint_in};
 
 use volto::capsule::{self, CapsuleDecoder};
-use volto::datagram::{self, DecodeError, VARINT_MAX};
+use volto::datagram::{self, DecodeError};
 use volto::h3::error::Code;
 use volto::h3::frame::{self, BufferBudget, Frame, FrameDecoder, FrameReader, Item, StreamKind};
 use volto::h3::message::{self, FieldValue, Fields, Method, Request, Status};
 use volto::h3::qpack::{self, Field};
 use volto::h3::stream::build_request;
 use volto::h3::{MAX_FIELD_SECTION_SIZE, huffman};
+use volto::varint::{self, VARINT_MAX};
 
 /// The per-field overhead in RFC 9114 §4.2.2's field-section size formula.
 ///
@@ -152,7 +153,7 @@ proptest! {
             1 => prop::collection::vec(any::<u8>(), 0..600),
         ],
     ) {
-        match datagram::peek_varint(&raw) {
+        match varint::peek_varint(&raw) {
             None => {
                 // The only reason to need more is that the length the first
                 // byte announced has not all arrived.
@@ -193,7 +194,7 @@ proptest! {
         value in any_varint(),
         tail in payload(16),
     ) {
-        let minimum = datagram::varint_len(value);
+        let minimum = varint::varint_len(value);
         for length in [1usize, 2, 4, 8] {
             if length < minimum {
                 continue;
@@ -203,12 +204,12 @@ proptest! {
             put_varint_in(&mut buf, value, length);
             buf.put_slice(&tail);
 
-            let (decoded, used) = datagram::peek_varint(&buf).expect("a whole varint");
+            let (decoded, used) = varint::peek_varint(&buf).expect("a whole varint");
             prop_assert_eq!(decoded, value, "in {} bytes", length);
             prop_assert_eq!(used, length);
 
             let mut taking = buf.freeze();
-            prop_assert_eq!(datagram::take_varint(&mut taking), Some(value));
+            prop_assert_eq!(varint::take_varint(&mut taking), Some(value));
             prop_assert_eq!(&taking[..], &tail[..]);
         }
     }
@@ -243,20 +244,16 @@ fn every_short_varint_and_every_class_boundary_round_trips() {
 
     for value in values {
         let mut buf = BytesMut::new();
-        datagram::put_varint(&mut buf, value);
-        assert_eq!(buf.len(), datagram::varint_len(value), "{value:#x}");
+        varint::put_varint(&mut buf, value);
+        assert_eq!(buf.len(), varint::varint_len(value), "{value:#x}");
         assert_eq!(
-            datagram::peek_varint(&buf),
+            varint::peek_varint(&buf),
             Some((value, buf.len())),
             "{value:#x}"
         );
 
         let mut taking = buf.freeze();
-        assert_eq!(
-            datagram::take_varint(&mut taking),
-            Some(value),
-            "{value:#x}"
-        );
+        assert_eq!(varint::take_varint(&mut taking), Some(value), "{value:#x}");
         assert!(taking.is_empty(), "{value:#x}");
     }
 }
@@ -826,8 +823,8 @@ fn well_formed_payload(kind: u64) -> BoxedStrategy<Vec<u8>> {
                     } else {
                         value
                     };
-                    datagram::put_varint(&mut out, identifier);
-                    datagram::put_varint(&mut out, value);
+                    varint::put_varint(&mut out, identifier);
+                    varint::put_varint(&mut out, value);
                 }
                 out.to_vec()
             })
@@ -835,7 +832,7 @@ fn well_formed_payload(kind: u64) -> BoxedStrategy<Vec<u8>> {
         frame::GOAWAY | frame::CANCEL_PUSH | frame::MAX_PUSH_ID => any_varint()
             .prop_map(|value| {
                 let mut out = BytesMut::new();
-                datagram::put_varint(&mut out, value);
+                varint::put_varint(&mut out, value);
                 out.to_vec()
             })
             .boxed(),
@@ -1933,8 +1930,8 @@ proptest! {
         body in payload(64),
     ) {
         let encoded = datagram::encode(quarter_stream_id, context_id, &body);
-        let quarter_len = datagram::varint_len(quarter_stream_id);
-        let context_len = datagram::varint_len(context_id);
+        let quarter_len = varint::varint_len(quarter_stream_id);
+        let context_len = varint::varint_len(context_id);
 
         for cut in 0..quarter_len + context_len {
             let prefix = Bytes::copy_from_slice(&encoded[..cut]);
@@ -1977,8 +1974,8 @@ proptest! {
         arriving in payload(256),
     ) {
         let mut header = BytesMut::new();
-        datagram::put_varint(&mut header, capsule_type);
-        datagram::put_varint(&mut header, length);
+        varint::put_varint(&mut header, capsule_type);
+        varint::put_varint(&mut header, length);
 
         let mut decoder = CapsuleDecoder::new();
         decoder.push(header.freeze());

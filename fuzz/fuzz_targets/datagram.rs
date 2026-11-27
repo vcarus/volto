@@ -3,8 +3,8 @@
 //! Even inputs: arbitrary bytes through [`datagram::decode`]. A successful
 //! decode is re-encoded and decoded again, and the two decodes must agree:
 //! the wire form may shorten (varints have non-canonical spellings) but the
-//! meaning must not move. [`datagram::peek_varint`] and
-//! [`datagram::take_varint`] must also agree with each other on the raw bytes.
+//! meaning must not move. [`varint::peek_varint`] and
+//! [`varint::take_varint`] must also agree with each other on the raw bytes.
 //!
 //! Odd inputs: a structured round trip through [`datagram::encode`], with
 //! [`datagram::encoded_len`] checked against the bytes actually produced.
@@ -13,7 +13,8 @@
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use volto::datagram::{self, MAX_QUARTER_STREAM_ID, VARINT_MAX};
+use volto::datagram::{self, MAX_QUARTER_STREAM_ID};
+use volto::varint::{self, VARINT_MAX};
 
 fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else {
@@ -21,9 +22,9 @@ fuzz_target!(|data: &[u8]| {
     };
 
     if mode & 1 == 0 {
-        match (datagram::peek_varint(rest), {
+        match (varint::peek_varint(rest), {
             let mut buf = Bytes::copy_from_slice(rest);
-            datagram::take_varint(&mut buf).map(|value| (value, rest.len() - buf.len()))
+            varint::take_varint(&mut buf).map(|value| (value, rest.len() - buf.len()))
         }) {
             (Some(peeked), Some(taken)) => assert_eq!(peeked, taken, "peek and take agree"),
             (None, None) => {}

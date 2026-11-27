@@ -13,7 +13,7 @@ use std::assert_matches;
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use volto::capsule::{self, Capsule, CapsuleDecoder, MAX_DATAGRAM_CAPSULE_VALUE};
-use volto::datagram::{VARINT_MAX, varint_len};
+use volto::varint::{VARINT_MAX, varint_len};
 
 fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else {

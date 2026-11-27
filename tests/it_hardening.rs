@@ -25,8 +25,8 @@ use common::{
     basic_credentials, connect_quic, connect_request, field_value, open_tcp_tunnel,
     spawn_echo_target, windowless_transport,
 };
-use volto::datagram;
 use volto::h3api::{Request, Status};
+use volto::varint;
 
 /// A server with `users` configured, private targets allowed and a failure
 /// budget of `failures`.
@@ -482,8 +482,8 @@ async fn a_431_the_peer_will_not_take_is_reset() {
     // rather than anything a tunnel decides.
     let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
     let mut frame = BytesMut::new();
-    datagram::put_varint(&mut frame, FRAME_HEADERS);
-    datagram::put_varint(&mut frame, 2 * volto::h3::MAX_FIELD_SECTION_SIZE);
+    varint::put_varint(&mut frame, FRAME_HEADERS);
+    varint::put_varint(&mut frame, 2 * volto::h3::MAX_FIELD_SECTION_SIZE);
     frame.extend_from_slice(b"\x00");
     send.write_all(&frame)
         .await

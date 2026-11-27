@@ -66,7 +66,6 @@ use bytes::{BufMut, Bytes, BytesMut};
 use rustls::pki_types::CertificateDer;
 use tokio::task::{JoinHandle, JoinSet};
 
-use volto::datagram::{peek_varint, put_varint};
 use volto::h3::error::Violation;
 use volto::h3::frame::{self, BufferBudget, Frame, FrameReader, Item};
 use volto::h3::message;
@@ -77,6 +76,7 @@ use volto::h3::settings::{
 };
 use volto::h3::varint;
 use volto::h3api::{Code, FieldValue, Fields, Method, Request, Status, StreamError};
+use volto::varint::{peek_varint, put_varint};
 
 use super::huffman;
 use super::rawstream::{

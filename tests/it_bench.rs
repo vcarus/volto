@@ -102,6 +102,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Semaphore, mpsc};
 use volto::datagram;
+use volto::varint;
 
 // ---------------------------------------------------------------------------
 // Counting allocator
@@ -1326,10 +1327,10 @@ fn sealed_flight(dcid: &[u8; 8], hello: &[u8], pieces: usize) -> Vec<Vec<u8>> {
         .map(|(index, part)| {
             let mut frame = vec![0x06];
             let mut offset = bytes::BytesMut::new();
-            datagram::put_varint(&mut offset, (index * run) as u64);
+            varint::put_varint(&mut offset, (index * run) as u64);
             frame.extend_from_slice(&offset);
             let mut length = bytes::BytesMut::new();
-            datagram::put_varint(&mut length, part.len() as u64);
+            varint::put_varint(&mut length, part.len() as u64);
             frame.extend_from_slice(&length);
             frame.extend_from_slice(part);
             volto::gate::sealed_initial(dcid, index as u8, &frame)

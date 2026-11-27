@@ -25,6 +25,7 @@ use common::{
 use volto::capsule::CapsuleDecoder;
 use volto::datagram;
 use volto::h3::connection::PEER_SETTINGS_WAIT;
+use volto::varint;
 
 /// The value the server must advertise, matching `h3api::MAX_FIELD_SECTION_SIZE`.
 const EXPECTED_MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
@@ -99,8 +100,8 @@ async fn an_oversized_header_section_is_refused() {
     // Twice the advertised limit, declared in the frame header: the server
     // refuses it from the length alone, so the payload never has to be sent.
     let mut frame = BytesMut::new();
-    datagram::put_varint(&mut frame, FRAME_HEADERS);
-    datagram::put_varint(&mut frame, 2 * EXPECTED_MAX_FIELD_SECTION_SIZE);
+    varint::put_varint(&mut frame, FRAME_HEADERS);
+    varint::put_varint(&mut frame, 2 * EXPECTED_MAX_FIELD_SECTION_SIZE);
     frame.extend_from_slice(&[0u8; 64]);
     send.write_all(&frame)
         .await

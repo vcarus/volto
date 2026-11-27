@@ -16,8 +16,7 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-// The varint primitives keep their old path here for `tests/` and `fuzz/`.
-pub use crate::varint::{VARINT_MAX, peek_varint, put_varint, take_varint, varint_len};
+use crate::varint::{put_varint, take_varint, varint_len};
 
 /// Context ID for an unmodified UDP payload (RFC 9298 §4).
 pub const CONTEXT_ID_UDP_PAYLOAD: u64 = 0;
@@ -178,6 +177,7 @@ pub fn decode(mut datagram: Bytes) -> Result<Datagram, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::varint::VARINT_MAX;
 
     #[test]
     fn quarter_stream_id_is_the_stream_id_over_four() {

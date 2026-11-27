@@ -35,7 +35,7 @@ use std::panic::Location;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use volto::datagram;
+use volto::varint;
 
 use super::TIMEOUT;
 
@@ -186,8 +186,8 @@ pub const QPACK_DECODER_STREAM_ERROR: u64 = 0x202;
 /// A frame with its type, length and payload, as RFC 9114 §7.1 lays it out.
 pub fn frame(kind: u64, payload: &[u8]) -> Vec<u8> {
     let mut out = BytesMut::new();
-    datagram::put_varint(&mut out, kind);
-    datagram::put_varint(&mut out, payload.len() as u64);
+    varint::put_varint(&mut out, kind);
+    varint::put_varint(&mut out, payload.len() as u64);
     out.extend_from_slice(payload);
     out.to_vec()
 }
@@ -197,8 +197,8 @@ pub fn frame(kind: u64, payload: &[u8]) -> Vec<u8> {
 pub fn settings_frame(pairs: &[(u64, u64)]) -> Vec<u8> {
     let mut payload = BytesMut::new();
     for (identifier, value) in pairs {
-        datagram::put_varint(&mut payload, *identifier);
-        datagram::put_varint(&mut payload, *value);
+        varint::put_varint(&mut payload, *identifier);
+        varint::put_varint(&mut payload, *value);
     }
     frame(FRAME_SETTINGS, &payload)
 }
@@ -209,7 +209,7 @@ pub fn settings_frame(pairs: &[(u64, u64)]) -> Vec<u8> {
 /// caller names which one it is sending and what identifier it carries.
 pub fn varint_frame(kind: u64, value: u64) -> Vec<u8> {
     let mut payload = BytesMut::new();
-    datagram::put_varint(&mut payload, value);
+    varint::put_varint(&mut payload, value);
     frame(kind, &payload)
 }
 
@@ -379,7 +379,7 @@ pub async fn open_uni_stream(
         .expect("open a unidirectional stream");
 
     let mut wire = BytesMut::new();
-    datagram::put_varint(&mut wire, stream_type);
+    varint::put_varint(&mut wire, stream_type);
     wire.extend_from_slice(bytes);
     stream.write_all(&wire).await.expect("send the stream");
 
@@ -412,8 +412,8 @@ pub async fn announce_full_sized_headers(
     let (mut send, recv) = connection.open_bi().await.expect("open a request stream");
 
     let mut announcement = BytesMut::new();
-    datagram::put_varint(&mut announcement, FRAME_HEADERS);
-    datagram::put_varint(&mut announcement, declared);
+    varint::put_varint(&mut announcement, FRAME_HEADERS);
+    varint::put_varint(&mut announcement, declared);
     announcement.extend_from_slice(b"\x00");
     send.write_all(&announcement)
         .await
@@ -531,11 +531,11 @@ pub async fn read_varint(recv: &mut quinn::RecvStream) -> u64 {
 
 /// Decodes a variable-length integer from a buffer, returning its byte length.
 ///
-/// Hand-written rather than `volto::datagram::peek_varint`, which is the same
+/// Hand-written rather than `volto::varint::peek_varint`, which is the same
 /// algorithm: what the server sends, its SETTINGS above all (`it_settings`),
 /// must be read independently of the code under test, so a bug in that decoder
 /// cannot make a test agree with it. The same reasoning as
-/// `basic_credentials` in `tests/common`. The `datagram::put_varint` calls in
+/// `basic_credentials` in `tests/common`. The `varint::put_varint` calls in
 /// the tests only *build* client bytes, where a broken encoder fails loudly
 /// instead of passing quietly.
 pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
@@ -578,9 +578,9 @@ pub fn status_of(block: &[u8]) -> String {
 /// [`status_of`] needs none, its own failures being `expect`s on the decoder.
 #[track_caller]
 pub fn status_of_response(response: &[u8]) -> String {
-    let (frame_type, used) = datagram::peek_varint(response).expect("a frame type");
+    let (frame_type, used) = varint::peek_varint(response).expect("a frame type");
     assert_eq!(frame_type, FRAME_HEADERS, "a response begins with HEADERS");
-    let (length, more) = datagram::peek_varint(&response[used..]).expect("a frame length");
+    let (length, more) = varint::peek_varint(&response[used..]).expect("a frame length");
 
     let payload = &response[used + more..];
     assert_eq!(
