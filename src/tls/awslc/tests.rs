@@ -1661,9 +1661,9 @@ fn crypto_ranges(datagram: &[u8], dcid_keys: &quinn_proto::crypto::Keys) -> Vec<
     out
 }
 
-/// The first flight of a quinn client on rustls, read off the wire: the
-/// datagram sizes, which datagram each CRYPTO range came in, and the
-/// reassembled ClientHello.
+/// The first flight of a quinn client on rustls, read off the wire up to the
+/// datagram that completes its ClientHello: the datagram sizes, which
+/// datagram each CRYPTO range came in, and the reassembled ClientHello.
 async fn first_flight(
     crypto: rustls::ClientConfig,
 ) -> (Vec<usize>, Vec<(usize, u64, usize)>, Vec<u8>) {
@@ -1677,37 +1677,43 @@ async fn first_flight(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic"),
     )));
     let connecting = endpoint.connect(addr, "localhost").expect("connect");
-    let mut datagrams = Vec::new();
     let mut buf = vec![0u8; 65536];
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
-    while let Ok(Ok((n, _))) = tokio::time::timeout_at(deadline, sink.recv_from(&mut buf)).await {
-        datagrams.push(buf[..n].to_vec());
-    }
-    drop(connecting);
-    endpoint.close(0u32.into(), b"");
-
-    let first = datagrams
-        .first()
-        .expect("the client sent no Initial within 150 ms");
-    let dcid_len = usize::from(first[5]);
-    let dcid = &first[6..6 + dcid_len];
-    let (client, server) = keys::initial_secrets(Version::V1, dcid);
-    let keys = keys::keys(&server, &client);
+    let mut keys = None;
     let mut sizes = Vec::new();
     let mut ranges = Vec::new();
     let mut hello = Vec::new();
-    for (index, datagram) in datagrams.iter().enumerate() {
-        sizes.push(datagram.len());
-        for (offset, data) in crypto_ranges(datagram, &keys) {
-            ranges.push((index, offset, data.len()));
+    // Which bytes of `hello` a CRYPTO range filled, so a gap is not read as
+    // part of the ClientHello.
+    let mut filled = Vec::new();
+    // Until the CRYPTO bytes hold a whole ClientHello. The ceiling is far
+    // above any first flight on loopback and only fails the test.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while hello::client_hello_body(&hello).is_none() || filled.contains(&false) {
+        let (n, _) = tokio::time::timeout_at(deadline, sink.recv_from(&mut buf))
+            .await
+            .expect("the client's ClientHello was not whole within 5 s")
+            .expect("receive a datagram");
+        let datagram = &buf[..n];
+        let keys = keys.get_or_insert_with(|| {
+            let dcid = &datagram[6..6 + usize::from(datagram[5])];
+            let (client, server) = keys::initial_secrets(Version::V1, dcid);
+            keys::keys(&server, &client)
+        });
+        for (offset, data) in crypto_ranges(datagram, keys) {
+            ranges.push((sizes.len(), offset, data.len()));
             let start = usize::try_from(offset).expect("offset");
             let end = start + data.len();
             if hello.len() < end {
                 hello.resize(end, 0);
+                filled.resize(end, false);
             }
             hello[start..end].copy_from_slice(&data);
+            filled[start..end].fill(true);
         }
+        sizes.push(n);
     }
+    drop(connecting);
+    endpoint.close(0u32.into(), b"");
     (sizes, ranges, hello)
 }
 
