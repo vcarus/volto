@@ -1,4 +1,4 @@
-//! M6: the `SSLKEYLOGFILE` switch (spec §0, decision D8).
+//! The `SSLKEYLOGFILE` switch (spec §0, decision D8).
 //!
 //! Debugging sovereignty sits on the server: Surge cannot export its TLS secrets,
 //! so the only way to read a real session's frames is for the server to write the
