@@ -995,22 +995,41 @@ async fn headers_buffered_across_a_connection_are_bounded() {
 /// The other half of the bound: a client that finishes what it starts, one
 /// request at a time, is never anywhere near it.
 ///
-/// Same number of streams as the test above, so the two differ in exactly one
-/// thing — whether the HEADERS frames are complete. What a client with many
-/// full-sized requests genuinely in flight meets is the test below this one.
+/// Same number of streams as the test above, each a full-sized field section,
+/// so the two differ in exactly one thing: whether the HEADERS frames are
+/// complete. Every tunnel is held open, so a completed frame whose charge was
+/// not given back would stay charged, and the seventeenth request would be
+/// refused. What a client with many full-sized requests genuinely in flight
+/// meets is the test below this one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connection_of_complete_requests_never_reaches_the_budget() {
     let server = TestServer::start().await;
     let target = spawn_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
+    let (_endpoint, connection) = connect_quic(&server).await;
+
+    let frame = common::rawstream::frame(
+        FRAME_HEADERS,
+        &full_sized_connect_section(&target.to_string()),
+    );
 
     let mut tunnels = Vec::with_capacity(streams_past_the_budget());
-    for _ in 0..streams_past_the_budget() {
-        tunnels.push(open_tcp_tunnel(&mut client, &target.to_string()).await);
+    for index in 0..streams_past_the_budget() {
+        let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+        send.write_all(&frame)
+            .await
+            .expect("send a full-sized request");
+        let (frame_type, payload) = read_frame(&mut recv).await;
+        assert_eq!(frame_type, FRAME_HEADERS);
+        assert_eq!(
+            status_of(&payload),
+            "200",
+            "request {index}: a request that arrived in full holds nothing of the budget"
+        );
+        tunnels.push((send, recv));
     }
 
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), client.quic.closed())
+        tokio::time::timeout(Duration::from_millis(200), connection.closed())
             .await
             .is_err(),
         "a client whose requests all arrived in full must not be disconnected"
