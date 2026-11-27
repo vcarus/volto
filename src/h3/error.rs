@@ -79,7 +79,7 @@ codes! {
     (0x109, H3_SETTINGS_ERROR);
     /// The control stream did not begin with SETTINGS (RFC 9114 §6.2.1).
     (0x10a, H3_MISSING_SETTINGS);
-    /// The request was rejected without being processed (RFC 9114 §5.2).
+    /// The request was rejected without being processed (RFC 9114 §4.1.1).
     (0x10b, H3_REQUEST_REJECTED);
     /// The request or its response is cancelled (RFC 9114 §8.1).
     ///
