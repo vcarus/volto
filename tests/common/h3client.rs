@@ -127,12 +127,8 @@ struct Peer {
     ///
     /// Recorded as well as panicked with, because a panic inside a spawned task
     /// is caught by tokio and stored in a `JoinHandle` nobody awaits: the
-    /// message would be printed and the test would still pass. Every request,
-    /// every response and every data read checks this, and so does
-    /// [`H3Client`] teardown, so a server that breaks a rule on its control or
-    /// QPACK streams fails the test even when the fault arrives after the last
-    /// exchange. Teardown sees only what has been read by then;
-    /// [`H3Client::closed_by_server`] waits for the rest.
+    /// message would be printed and the test would still pass. [`Peer::check`]
+    /// says where it is raised again.
     fault: Mutex<Option<String>>,
     /// Whether the server's first control stream has been seen.
     ///
@@ -346,9 +342,7 @@ impl H3Client {
     /// Waits for the server's GOAWAY and returns the identifier it carried.
     ///
     /// Polled rather than notified because the frame arrives on a task of its
-    /// own; written as a synchronous function returning a future so that
-    /// `#[track_caller]` survives to the poll that panics, the same reason
-    /// [`super::open_tcp_tunnel`] is shaped that way.
+    /// own.
     #[track_caller]
     pub fn await_goaway(&self) -> impl Future<Output = u64> + '_ {
         let caller = Location::caller();
@@ -370,38 +364,17 @@ impl H3Client {
     /// Waits for the server to close the connection, then judges everything the
     /// server sent on its unidirectional streams before the close.
     ///
-    /// For a test whose subject is the server ending the connection, and whose
-    /// last observation is not the close itself. A log line, for example, says
-    /// that the server has closed. It does not say that this client has read
-    /// what arrived before the close. Dropping the client at that point runs
-    /// the teardown check while a fault may still sit unread in the socket or
-    /// in a stream task that has not been polled. This helper waits instead.
+    /// For a test whose subject is the server ending the connection. The
+    /// connection must end with an application CONNECTION_CLOSE within
+    /// [`TIMEOUT`]; an idle timeout or a transport error fails the test. Then
+    /// the connection task must finish within [`TIMEOUT`], which it does once
+    /// every stream task has read its stream to the end, and the first fault
+    /// recorded is raised with the caller's location.
     ///
-    /// The steps are these. The connection must end with an application
-    /// CONNECTION_CLOSE within [`TIMEOUT`]. That is what the server sends when
-    /// it ends a connection on purpose. A QUIC idle timeout on either side
-    /// sends nothing, so it fails the test, and so does a transport error. Then
-    /// the connection task must finish within [`TIMEOUT`], and it finishes only
-    /// after every stream task it spawned has read its stream to the end.
-    /// Then the first fault recorded is raised, with the caller's location.
-    ///
-    /// What it sees: every byte the server's unidirectional streams delivered
-    /// before the CONNECTION_CLOSE, including a stream opened just before it.
-    /// quinn hands out stream data and incoming streams that were received
-    /// before a close, so the stream tasks read them after the connection has
-    /// ended.
-    ///
-    /// What it cannot see. Data the server queued but had not sent when it
-    /// closed never leaves the server, because quinn discards unsent stream
-    /// data at a close. A unidirectional stream that ends in the same flight as
-    /// the close is not a fault, because [`read_control`] and [`read_qpack`]
-    /// excuse every stream ending once the connection has closed. Request
-    /// streams are the test's to read. A connection the client closes itself
-    /// discards whatever the server still had in flight, so there is no
-    /// client-side variant of this helper.
-    ///
-    /// Written as a synchronous function returning a future so that
-    /// `#[track_caller]` survives to the poll that panics (D66).
+    /// Two things it cannot see. Data the server had not sent when it closed
+    /// is discarded by quinn at the close. A stream that ends in the same
+    /// flight as the close is excused, as every stream ending with its
+    /// connection is ([`Peer::broke_unless_closed`]).
     #[track_caller]
     pub fn closed_by_server(mut self) -> impl Future<Output = quinn::ApplicationClose> {
         let caller = Location::caller();
@@ -468,16 +441,10 @@ impl H3Client {
             Err(_elapsed) => return Err(NoClient::TooSlow(within)),
         };
 
-        // Deliberately *not* bounded. What is left is three `open_uni` calls and
-        // three short writes, none of which waits on the peer: the server's
-        // transport parameters grant sixteen unidirectional streams and a
-        // flow-control window vastly larger than the sixty-odd bytes written
-        // here, and both arrived with the handshake that has just completed. So
-        // this either finishes without a round trip or fails at once because the
-        // connection has gone. A bound would have to enforce itself by dropping
-        // the half-built client, and a dropped control stream *finishes* --
-        // handing the server the H3_CLOSED_CRITICAL_STREAM that
-        // [`H3Client::try_from_quic`] exists to keep off the wire.
+        // Not bounded: nothing here waits on the peer (the server grants 16
+        // unidirectional streams, and the 16 bytes written fit any window), and
+        // a bound would have to drop the half-built client, whose control
+        // stream would then finish.
         Self::try_from_quic(endpoint, connection, true)
             .await
             .map_err(NoClient::Lost)
@@ -496,13 +463,10 @@ impl H3Client {
 
     /// [`H3Client::from_quic`] for a connection that may not survive it.
     ///
-    /// The connection is closed rather than dropped on the way out of a failure,
-    /// and the reason is a rule the replay's central assertion depends on: a
-    /// dropped [`quinn::SendStream`] *finishes*, so letting a half-built client
-    /// fall out of scope would put a FIN on the control stream, which RFC 9114
-    /// §6.2.1 makes a connection error of type H3_CLOSED_CRITICAL_STREAM. The
-    /// server would be right to report it, and a run that manufactured it would
-    /// be accusing the server of a fault of the harness's own making.
+    /// The connection is closed rather than dropped on the way out of a
+    /// failure, because a dropped [`quinn::SendStream`] finishes (RFC 9114
+    /// §6.2.1, H3_CLOSED_CRITICAL_STREAM) and the server would rightly report
+    /// a fault the harness made.
     async fn try_from_quic(
         endpoint: quinn::Endpoint,
         connection: quinn::Connection,
@@ -578,29 +542,22 @@ fn abandon(
     connection: &quinn::Connection,
     error: quinn::ConnectionError,
 ) -> quinn::ConnectionError {
-    // Code 0 is what this client's plain endings use, so an abandoned
-    // half-handshake is indistinguishable on the wire from a peer that changed
-    // its mind -- which is exactly what it is. A connection already closed
-    // ignores this.
+    // A connection already closed ignores this.
     connection.close(quinn::VarInt::from_u32(0), b"");
     error
 }
 
 impl Drop for H3Client {
     fn drop(&mut self) {
-        // A control-stream fault recorded after the test's last request or
-        // response has nothing left to re-raise it, so teardown is the last
-        // place it can fail the test. It cannot await, so it judges only what
-        // the stream tasks have already read; `closed_by_server` is the form
-        // that waits. Skipped while unwinding: a second panic there would abort
-        // the process instead of reporting the first failure.
+        // Teardown is the last place a recorded fault can fail the test;
+        // skipped while unwinding, where a second panic would abort.
         if !std::thread::panicking() {
             self.send.peer.check();
         }
         // Closed before `_streams` drops: a dropped `quinn::SendStream`
         // finishes, and a control stream finished on a live connection is
         // H3_CLOSED_CRITICAL_STREAM (RFC 9114 §6.2.1). Code 0 is the plain
-        // ending [`abandon`] also uses.
+        // ending `abandon` also uses.
         self.quic.close(quinn::VarInt::from_u32(0), b"");
         self.driver.abort();
     }
@@ -608,18 +565,14 @@ impl Drop for H3Client {
 
 /// Opens requests on one connection.
 ///
-/// Named for the `h3` handle it replaces, and reached the same way
-/// (`client.send.send_request(..)`).
+/// Reached as `client.send.send_request(..)`.
 pub struct SendRequest {
     quic: quinn::Connection,
     peer: Arc<Peer>,
     /// This connection's frame-buffering budget (D77), shared by every request
     /// stream opened on it.
     ///
-    /// The client half of the same bound the server keeps. Nothing in the suite
-    /// approaches it -- a response is a status line and two short fields -- and
-    /// it is here because [`FrameReader`] takes one: a client that shares the
-    /// server's codec shares its accounting too.
+    /// [`FrameReader`] takes one; nothing a response holds comes near it.
     budget: Arc<BufferBudget>,
     /// Whether field names and values go on the wire Huffman-coded.
     ///
@@ -632,8 +585,8 @@ pub struct SendRequest {
 impl SendRequest {
     /// Opens a request stream and sends the request as one HEADERS frame.
     ///
-    /// `&mut self` although nothing here mutates: it mirrors the `h3` handle
-    /// this replaces, and every test holds its client by `&mut` because of it.
+    /// Takes `&mut self` though nothing mutates; every test holds its client
+    /// mutably.
     ///
     /// Fails without touching the network once the server has sent GOAWAY: RFC
     /// 9114 §5.2 says requests from there on are rejected, and a client that
@@ -902,10 +855,6 @@ impl ClientStream {
 /// the stream ends with an end of stream rather than a reset, within a bound.
 /// `what` names the session or tunnel being waited on, so the failure says
 /// which one did not end.
-///
-/// Written as a synchronous function returning a future so `#[track_caller]`
-/// survives to the poll that panics (D66) — the `.expect()` form each call site
-/// used to carry reported this line instead.
 #[track_caller]
 pub fn ends_cleanly<'a>(
     stream: &'a mut ClientStream,
@@ -955,9 +904,6 @@ pub fn ends_cleanly<'a>(
 /// judges, which is right for a tunnel the server is closing and wrong here,
 /// since a body would be drained rather than reported. `what` names the request
 /// being judged, so a table-driven caller can say which row failed.
-///
-/// Written as a synchronous function returning a future so `#[track_caller]`
-/// survives to the poll that panics (D66).
 #[track_caller]
 pub fn ends_with_no_body<'a>(
     stream: &'a mut ClientStream,
@@ -1378,20 +1324,13 @@ async fn read_qpack(
 /// Reads the server's control stream until the connection ends, holding it to
 /// the rules RFC 9114 states for one.
 ///
-/// Every connection this suite opens runs through here, so these are assertions
-/// the whole suite carries rather than one test's: a server that opened with the
-/// wrong frame, repeated its SETTINGS, or put a request-stream frame on its
-/// control stream used to be waved through by a `_ => {}` arm and every test
-/// still passed. Unknown and reserved-for-greasing types stay ignored, because
-/// §9 requires exactly that.
+/// Every connection this suite opens runs through here, so these are
+/// assertions the whole suite carries. Unknown and reserved-for-greasing types
+/// stay ignored, because §9 requires exactly that.
 ///
 /// Also recorded as faults: a second control stream, a control stream that
 /// the server closes at a frame boundary, and one that ends in the middle of a
-/// frame. A stream that ends because the connection itself has ended is not a
-/// fault, since every stream ends with its connection. [`Peer::check`]
-/// re-raises the first fault at the next request or response, after every data
-/// read, and at [`H3Client`] teardown, and [`H3Client::closed_by_server`] does
-/// so after the server's close.
+/// frame, unless the connection has ended ([`Peer::broke_unless_closed`]).
 async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>, quic: quinn::Connection) {
     const MID_FRAME: &str = "the server's control stream ended in the middle of a frame";
     let mut settings_seen = false;
@@ -1572,10 +1511,7 @@ async fn read_varint_or_end(recv: &mut quinn::RecvStream) -> VarintRead {
         return VarintRead::EndedInside;
     }
 
-    match peek_varint(&buf[..length]) {
-        Some((value, _)) => VarintRead::Value(value),
-        None => VarintRead::EndedInside,
-    }
+    VarintRead::Value(peek_varint(&buf[..length]).expect("a whole varint").0)
 }
 
 /// Reads a stream to its end, discarding everything on it.
