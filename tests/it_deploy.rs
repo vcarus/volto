@@ -190,96 +190,44 @@ fn the_script_documents_itself() {
     }
 }
 
-/// Garbage flags must be rejected before anything privileged is attempted.
+/// Arguments the script refuses before anything privileged or networked is
+/// attempted, each with the words that name what is wrong.
 #[test]
-fn unknown_options_are_rejected() {
-    let output = run_deploy(
-        &install_root("unknown-option"),
-        &["--definitely-not-a-flag"],
-    );
+fn arguments_that_cannot_be_acted_on_are_refused() {
+    let root = install_root("refused-arguments");
+    for (args, refusal) in [
+        // Garbage flags, named back.
+        (
+            &["--definitely-not-a-flag"][..],
+            "unknown option: --definitely-not-a-flag",
+        ),
+        // Caught before any download starts.
+        (&["--tag"][..], "--tag needs a value"),
+        // The shape check on the tag sits after the preflight, so only the dry
+        // run reaches it on a dev host.
+        (
+            &["--dry-run", "--tag", "0.2.4"][..],
+            "--tag expects the tag name as on the releases page",
+        ),
+        // Resolving "latest" is a network call, which a dry run never makes.
+        (&["--dry-run"][..], "--dry-run needs --tag"),
+        // `--force` puts a named release's bytes on the host, so it has to be
+        // told which release.
+        (&["--force"][..], "--force needs --tag"),
+        // An unsigned release is installed by name. Without a tag the run
+        // would resolve the latest release, the path the timer takes, which
+        // must never accept a release without a signature.
+        (&["--allow-unsigned"][..], "--allow-unsigned needs --tag"),
+    ] {
+        let output = run_deploy(&root, args);
 
-    assert!(!output.status.success(), "garbage flags must fail");
-    let stderr = stderr_of(&output);
-    assert!(
-        stderr.contains("unknown option: --definitely-not-a-flag"),
-        "the error must name the offending flag: {stderr}"
-    );
-}
-
-/// A `--tag` with no value must be caught before any download starts.
-#[test]
-fn a_tag_option_without_a_value_is_rejected() {
-    let output = run_deploy(&install_root("tag-no-value"), &["--tag"]);
-
-    assert!(!output.status.success(), "--tag without a value must fail");
-    let stderr = stderr_of(&output);
-    assert!(
-        stderr.contains("--tag needs a value"),
-        "the error must say what is missing: {stderr}"
-    );
-}
-
-/// The shape check on the tag itself. It sits after the preflight, so only the
-/// dry run can reach it on a dev host.
-#[test]
-fn a_tag_without_its_leading_v_is_rejected() {
-    let output = run_deploy(&install_root("tag-no-v"), &["--dry-run", "--tag", "0.2.4"]);
-
-    assert!(!output.status.success(), "a bare version must not be a tag");
-    let stderr = stderr_of(&output);
-    assert!(
-        stderr.contains("--tag expects the tag name as on the releases page"),
-        "the error must show the expected shape: {stderr}"
-    );
-}
-
-/// Resolving "latest" is a network call, which a dry run must never make.
-#[test]
-fn a_dry_run_without_a_tag_refuses_rather_than_resolving_one() {
-    let output = run_deploy(&install_root("dry-run-no-tag"), &["--dry-run"]);
-
-    assert!(!output.status.success(), "a dry run needs an explicit tag");
-    let stderr = stderr_of(&output);
-    assert!(
-        stderr.contains("--dry-run needs --tag"),
-        "the error must say a tag is required: {stderr}"
-    );
-}
-
-/// `--force` puts a named release's bytes on the host, so it has to be told
-/// which release. The same reason `--dry-run` needs a tag, refused in the same
-/// words.
-#[test]
-fn forcing_a_reinstall_without_a_tag_is_rejected() {
-    let output = run_deploy(&install_root("force-no-tag"), &["--force"]);
-
-    assert!(
-        !output.status.success(),
-        "--force without a tag must not run"
-    );
-    let stderr = stderr_of(&output);
-    assert!(
-        stderr.contains("--force needs --tag"),
-        "the error must say a tag is required: {stderr}"
-    );
-}
-
-/// An unsigned release is installed by name. Without a tag the run would
-/// resolve the latest release, which is the one path that must never accept a
-/// release without a signature, because it is the path the timer takes.
-#[test]
-fn allowing_an_unsigned_release_without_a_tag_is_rejected() {
-    let output = run_deploy(&install_root("unsigned-no-tag"), &["--allow-unsigned"]);
-
-    assert!(
-        !output.status.success(),
-        "--allow-unsigned without a tag must not run"
-    );
-    let stderr = stderr_of(&output);
-    assert!(
-        stderr.contains("--allow-unsigned needs --tag"),
-        "the error must say a tag is required: {stderr}"
-    );
+        assert!(!output.status.success(), "{args:?} must be refused");
+        assert!(
+            stderr_of(&output).contains(refusal),
+            "{args:?} must be refused with `{refusal}`: {}",
+            stderr_of(&output)
+        );
+    }
 }
 
 /// The gap `--force` closes: the version string is the whole convergence test,
