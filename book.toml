@@ -1,10 +1,8 @@
 # The published manual at https://vcarus.github.io/volto/.
 #
-# The book's source directory *is* `docs/`, the same three pages that ship in
-# every release tarball and that `tests/it_docs.rs` reads. Nothing is copied or
-# generated into a second place: mdBook renders what is already tracked, and
-# `docs/SUMMARY.md` plus `docs/index.md` are the only files this adds -- table
-# of contents and landing page, structure rather than prose.
+# The book's source directory is `docs/`, the pages that ship in every release
+# tarball and that `tests/it_docs.rs` reads. mdBook renders what is tracked;
+# `SUMMARY.md`, `index.md`, `theme/` and `assets/` are its scaffolding.
 #
 # The crate's rustdoc is not built by mdBook. It is published beside the book,
 # under `/api/`, by `.github/workflows/docs.yml`.
