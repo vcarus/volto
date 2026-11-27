@@ -1210,8 +1210,9 @@ fn a_ticket_would_not_offer_early_data_either() {
     );
 }
 
-/// Key update through the trait: three generations sealed by the provider and
-/// opened by rustls.
+/// Key update through the trait: in each of three generations, a packet
+/// sealed by the provider is opened by rustls, and one sealed by rustls is
+/// opened by the provider.
 #[test]
 fn next_1rtt_keys_follow_quic_ku() {
     let id = identity();
@@ -1254,6 +1255,23 @@ fn next_1rtt_keys_follow_quic_ku() {
         .unwrap_or_else(|_| panic!("the client opens generation {generation}"))
         .to_vec();
         assert_eq!(plain, [0xaa, 0xbb]);
+
+        // The other direction: sealed by rustls, opened by the provider.
+        let header = [0x40, 4, 5, 6];
+        let mut body = BytesMut::from(&[0xcc, 0xdd][..]);
+        let tag = rustls::quic::PacketKey::encrypt_in_place(
+            client_keys.local.as_ref(),
+            generation,
+            &header,
+            &mut body,
+        )
+        .expect("the client seals");
+        body.extend_from_slice(tag.as_ref());
+        server_keys
+            .remote
+            .decrypt(generation, &header, &mut body)
+            .unwrap_or_else(|_| panic!("the server opens generation {generation}"));
+        assert_eq!(&body[..], [0xcc, 0xdd]);
     }
 }
 
