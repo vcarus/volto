@@ -55,11 +55,12 @@ mod common;
 #[path = "common/fds.rs"]
 mod fds;
 
+use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use common::{
-    ALLOW_PRIVATE, H3Client, Response, SharedBuffer, TestServer, connect_request,
+    ALLOW_PRIVATE, ClientStream, H3Client, Response, SharedBuffer, TestServer, connect_request,
     connect_udp_request, echoes, numeric_field, open_tcp_tunnel, open_udp_session, proxy_status,
     respond_to, send_and_respond, send_udp_payload, spawn_echo_target, spawn_udp_echo_target,
     udp_round_trip,
@@ -217,41 +218,102 @@ fn assert_local_failure(response: &Response, what: &str) {
     );
 }
 
+/// The one test of this binary, in phases.
+///
+/// Each phase is a function of its own so that a failure names the phase, and
+/// the order and the clamp's scope stay visible here.
 #[tokio::test]
 async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
-    let log = SharedBuffer::shared("volto=debug");
-
-    let server = TestServer::start_with(&format!(
-        "[limits]\nmax_targets_per_conn = {SLOTS}\n{ALLOW_PRIVATE}"
-    ))
-    .await;
-
-    let echo = spawn_echo_target().await;
-    let echo_authority = echo.to_string();
-    let udp_echo = spawn_udp_echo_target().await;
-
-    let mut client = H3Client::connect(&server).await;
-
-    // --- Two tunnels established before the fault, and working. ---
-    let mut live_tcp = open_tcp_tunnel(&mut client, &echo_authority).await;
-    let (live_qsid, _live_udp) = open_udp_session(&mut client, &server, udp_echo).await;
-
-    echoes(&mut live_tcp, b"before").await;
-    assert_eq!(
-        udp_round_trip(&client, live_qsid, b"before").await.as_ref(),
-        b"before"
-    );
+    let mut run = Run::start().await;
 
     let fds_before = settled_fds(FD_SAMPLE_INTERVAL)
         .await
         .expect("both CI platforms list this process's descriptors");
 
-    // --- The fault. ---
     let clamp = FdClamp::tighten();
+    let refused = refusals_under_the_clamp(&mut run).await;
+    nothing_spins_under_the_clamp(&run).await;
+    a_reload_under_the_clamp_changes_nothing(&mut run).await;
+    drop(clamp);
 
+    recovery(&mut run, fds_before).await;
+    a_dns_storm_beside_the_live_tunnels(&mut run).await;
+    the_refused_session_routes_nowhere(run, refused).await;
+}
+
+/// What every phase works on: the server, its log, the client, and the two
+/// tunnels established before the fault, which live for the whole run.
+struct Run {
+    log: SharedBuffer,
+    server: TestServer,
+    echo_authority: String,
+    udp_echo: SocketAddr,
+    client: H3Client,
+    live_tcp: ClientStream,
+    live_qsid: u64,
+    /// Held so the session stays open; only its Quarter Stream ID is used.
+    _live_udp: ClientStream,
+    /// The tunnel and the session opened after the fault, held to the end of
+    /// the run so that their closing cannot reach the closing line early.
+    _recovered: Vec<ClientStream>,
+}
+
+/// The CONNECT-UDP session refused under the clamp.
+///
+/// The stream is kept rather than dropped, because its Quarter Stream ID is
+/// the third thing a refused session has to give back: the claim on the
+/// connection's datagram routing table, taken before the resolver is asked
+/// anything so that optimistically sent packets are not lost. What happens to
+/// a datagram named for it is asserted in the last phase.
+struct Refused {
+    qsid: u64,
+    _stream: ClientStream,
+}
+
+impl Run {
+    /// Two tunnels established before the fault, and working.
+    async fn start() -> Self {
+        let log = SharedBuffer::shared("volto=debug");
+
+        let server = TestServer::start_with(&format!(
+            "[limits]\nmax_targets_per_conn = {SLOTS}\n{ALLOW_PRIVATE}"
+        ))
+        .await;
+
+        let echo_authority = spawn_echo_target().await.to_string();
+        let udp_echo = spawn_udp_echo_target().await;
+
+        let mut client = H3Client::connect(&server).await;
+
+        let mut live_tcp = open_tcp_tunnel(&mut client, &echo_authority).await;
+        let (live_qsid, live_udp) = open_udp_session(&mut client, &server, udp_echo).await;
+
+        echoes(&mut live_tcp, b"before").await;
+        assert_eq!(
+            udp_round_trip(&client, live_qsid, b"before").await.as_ref(),
+            b"before"
+        );
+
+        Self {
+            log,
+            server,
+            echo_authority,
+            udp_echo,
+            client,
+            live_tcp,
+            live_qsid,
+            _live_udp: live_udp,
+            _recovered: Vec::new(),
+        }
+    }
+}
+
+/// Every refusal under the clamp, the tunnels already running untouched, and
+/// slot conservation one refusal at a time.
+async fn refusals_under_the_clamp(run: &mut Run) -> Refused {
     // A CONNECT whose target socket cannot be opened.
     let started = Instant::now();
-    let tcp_refusal = respond_to(&mut client, connect_request(&echo_authority)).await;
+    let tcp_refusal = respond_to(&mut run.client, connect_request(&run.echo_authority)).await;
     let elapsed = started.elapsed();
     assert_local_failure(&tcp_refusal, "CONNECT under EMFILE");
     assert!(elapsed < REFUSAL_BOUND, "the refusal took {elapsed:?}");
@@ -259,39 +321,42 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
     // And a CONNECT-UDP one, which RFC 9298 §3.1 makes the sharper case: the
     // socket is opened before the 2xx precisely so that a session that cannot
     // carry anything is refused instead of accepted and black-holed.
-    //
-    // The stream is kept rather than dropped, because its Quarter Stream ID is
-    // the third thing a refused session has to give back: the claim on the
-    // connection's datagram routing table, taken before the resolver is asked
-    // anything so that optimistically sent packets are not lost. What happens
-    // to a datagram named for it afterwards is asserted at the end of the run.
     let started = Instant::now();
     let (udp_refusal, refused_udp) = send_and_respond(
-        &mut client,
-        connect_udp_request(server.addr, &udp_echo.ip().to_string(), udp_echo.port()),
+        &mut run.client,
+        connect_udp_request(
+            run.server.addr,
+            &run.udp_echo.ip().to_string(),
+            run.udp_echo.port(),
+        ),
     )
     .await;
     let elapsed = started.elapsed();
-    let refused_qsid = datagram::quarter_stream_id(refused_udp.id());
+    let refused = Refused {
+        qsid: datagram::quarter_stream_id(refused_udp.id()),
+        _stream: refused_udp,
+    };
     assert_local_failure(&udp_refusal, "CONNECT-UDP under EMFILE");
     assert!(elapsed < REFUSAL_BOUND, "the refusal took {elapsed:?}");
 
-    // --- The tunnels already running are untouched, in both directions. ---
-    echoes(&mut live_tcp, b"during").await;
+    // The tunnels already running are untouched, in both directions.
+    echoes(&mut run.live_tcp, b"during").await;
     assert_eq!(
-        udp_round_trip(&client, live_qsid, b"during").await.as_ref(),
+        udp_round_trip(&run.client, run.live_qsid, b"during")
+            .await
+            .as_ref(),
         b"during"
     );
     assert_eq!(
-        client.goaway(),
+        run.client.goaway(),
         None,
         "a refused descriptor must not end the connection"
     );
 
-    // --- Slot conservation, one refusal at a time. ---
+    // Slot conservation, one refusal at a time.
     for refusal in 0..REFUSALS {
         let started = Instant::now();
-        let response = respond_to(&mut client, connect_request(&echo_authority)).await;
+        let response = respond_to(&mut run.client, connect_request(&run.echo_authority)).await;
         let elapsed = started.elapsed();
         assert_local_failure(&response, &format!("refusal {refusal} of {REFUSALS}"));
         assert!(
@@ -300,18 +365,25 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
         );
     }
 
-    // --- Nothing spins while the fault lasts. ---
-    let quiet = log.mark();
+    refused
+}
+
+/// Nothing spins while the fault lasts.
+async fn nothing_spins_under_the_clamp(run: &Run) {
+    let quiet = run.log.mark();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let lines = log.since(quiet).lines().count();
+    let lines = run.log.since(quiet).lines().count();
     assert!(
         lines <= QUIET_LINES,
         "the server wrote {lines} lines in half a second of silence under EMFILE:\n{}",
-        log.since(quiet)
+        run.log.since(quiet)
     );
+}
 
-    // --- A reload cannot read the configuration file, and changes nothing. ---
-    let failed = server
+/// A reload cannot read the configuration file, and changes nothing.
+async fn a_reload_under_the_clamp_changes_nothing(run: &mut Run) {
+    let failed = run
+        .server
         .reload()
         .expect_err("a reload with no descriptor to open the file with must fail");
     // It has to say why: the file it could not read, and the operating
@@ -322,33 +394,38 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
         said.contains("failed to read config file") && said.contains(&emfile.to_string()),
         "a failed reload must say that the file could not be read and why: {said}"
     );
-    echoes(&mut live_tcp, b"reload").await;
+    echoes(&mut run.live_tcp, b"reload").await;
+}
 
-    // --- Recovery. ---
-    drop(clamp);
-
-    let mut recovered = open_tcp_tunnel(&mut client, &echo_authority).await;
+/// With the clamp lifted: a working tunnel, a routed session, a reload, and
+/// no more descriptors than before the fault.
+async fn recovery(run: &mut Run, fds_before: usize) {
+    let mut recovered = open_tcp_tunnel(&mut run.client, &run.echo_authority).await;
     echoes(&mut recovered, b"healed").await;
 
     // The datagram router is the part of the recovery a status code cannot
     // show: a session opened after the fault has to claim its Quarter Stream ID
     // and have packets routed to it, which is the state a refused session must
     // not have left behind.
-    let (recovered_qsid, _recovered_udp) = open_udp_session(&mut client, &server, udp_echo).await;
-    assert_ne!(recovered_qsid, live_qsid);
+    let (recovered_qsid, recovered_udp) =
+        open_udp_session(&mut run.client, &run.server, run.udp_echo).await;
+    assert_ne!(recovered_qsid, run.live_qsid);
     assert_eq!(
-        udp_round_trip(&client, recovered_qsid, b"healed")
+        udp_round_trip(&run.client, recovered_qsid, b"healed")
             .await
             .as_ref(),
         b"healed"
     );
     assert_eq!(
-        udp_round_trip(&client, live_qsid, b"healed").await.as_ref(),
+        udp_round_trip(&run.client, run.live_qsid, b"healed")
+            .await
+            .as_ref(),
         b"healed",
         "the session that lived through the fault still routes"
     );
+    run._recovered.extend([recovered, recovered_udp]);
 
-    server
+    run.server
         .reload()
         .expect("with descriptors back, a reload works again");
 
@@ -359,11 +436,14 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
         fds_after <= fds_before + FD_SLACK,
         "descriptors grew across the fault: {fds_before} before, {fds_after} after"
     );
+}
 
-    // --- A storm of unresolvable targets, beside a healthy tunnel. ---
+/// A storm of unresolvable targets is per-request too, beside the tunnels that
+/// lived through the fault.
+async fn a_dns_storm_beside_the_live_tunnels(run: &mut Run) {
     let host = common::unresolvable_host();
     for attempt in 0..DNS_STORM {
-        let response = respond_to(&mut client, connect_request(&format!("{host}:443"))).await;
+        let response = respond_to(&mut run.client, connect_request(&format!("{host}:443"))).await;
         assert_eq!(
             response.status,
             Status::BAD_GATEWAY,
@@ -377,30 +457,40 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
         );
     }
 
-    echoes(&mut live_tcp, b"after!").await;
+    echoes(&mut run.live_tcp, b"after!").await;
     assert_eq!(
-        udp_round_trip(&client, live_qsid, b"after!").await.as_ref(),
+        udp_round_trip(&run.client, run.live_qsid, b"after!")
+            .await
+            .as_ref(),
         b"after!"
     );
-    assert_eq!(client.goaway(), None, "the connection outlived every fault");
+    assert_eq!(
+        run.client.goaway(),
+        None,
+        "the connection outlived every fault"
+    );
+}
 
-    // --- The third thing a refused session held: its Quarter Stream ID. ---
-    //
-    // A session claims one before the resolver is asked anything, so a refusal
-    // has to give it back, and the only production-visible trace of that is the
-    // drop counter on the closing line (RFC 9298 §5 and RFC 9297 §2.1 both ask
-    // the router to drop such a datagram silently). A routing entry that
-    // outlived its refused session would deliver this into a queue nobody reads
-    // and count nothing.
-    //
-    // One datagram, and the run sends no other droppable one, so the closing
-    // line has to say exactly one.
-    let orphan = log.mark();
-    send_udp_payload(&client.quic, refused_qsid, b"orphan");
+/// The third thing a refused session held: its Quarter Stream ID.
+///
+/// A session claims one before the resolver is asked anything, so a refusal has
+/// to give it back, and the only production-visible trace of that is the drop
+/// counter on the closing line (RFC 9298 §5 and RFC 9297 §2.1 both ask the
+/// router to drop such a datagram silently). A routing entry that outlived its
+/// refused session would deliver this into a queue nobody reads and count
+/// nothing.
+///
+/// One datagram, and the run sends no other droppable one, so the closing line
+/// has to say exactly one. Takes the run, because it ends the connection.
+async fn the_refused_session_routes_nowhere(run: Run, refused: Refused) {
+    let orphan = run.log.mark();
+    send_udp_payload(&run.client.quic, refused.qsid, b"orphan");
     // A fence: the round trip crosses the router after the datagram above, so
     // the drop has been counted by the time the connection closes.
     assert_eq!(
-        udp_round_trip(&client, live_qsid, b"fence").await.as_ref(),
+        udp_round_trip(&run.client, run.live_qsid, b"fence")
+            .await
+            .as_ref(),
         b"fence"
     );
     // The count alone cannot say why the datagram was dropped. An entry left
@@ -408,19 +498,21 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
     // is counted as a full queue, so the closing line would say one either way.
     // This DEBUG line is written only for a Quarter Stream ID that has no entry
     // at all.
-    log.wait_for_line(
-        orphan,
-        &[
-            "dropping datagrams for sessions that do not exist",
-            &format!("quarter_stream_id={refused_qsid} "),
-        ],
-    )
-    .await;
+    run.log
+        .wait_for_line(
+            orphan,
+            &[
+                "dropping datagrams for sessions that do not exist",
+                &format!("quarter_stream_id={} ", refused.qsid),
+            ],
+        )
+        .await;
 
-    let mark = log.mark();
-    client.quic.close(quinn::VarInt::from_u32(0), b"");
+    let mark = run.log.mark();
+    run.client.quic.close(quinn::VarInt::from_u32(0), b"");
 
-    let line = log
+    let line = run
+        .log
         .wait_for_line(
             mark,
             &[" INFO ", "connection closed", "reason=\"peer_close\""],
