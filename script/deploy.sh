@@ -916,8 +916,10 @@ else
         systemctl daemon-reload
         systemctl restart "$SERVICE_NAME"
 
-        # An immediately-crashing release is the failure worth catching here;
-        # under Restart=on-failure the service is not "active" again by now.
+        # Under Type=notify a release that exits or never reports ready has
+        # already failed the restart above, which the ERR trap rolls back. This
+        # catches one that came up and then crashed: under Restart=on-failure
+        # the service is not "active" again by now.
         sleep 3
         if systemctl is-active --quiet "$SERVICE_NAME"; then
             trap - ERR

@@ -479,6 +479,31 @@ const ACCOUNTED: &[Accounted] = &[
         reason: "Also per packet once quinn's send queue has fallen behind; the \
                  session's `evictions` sampler bounds it the same way.",
     },
+    Accounted {
+        id: "wkj009dk",
+        file: "systemd.rs",
+        message: "NOTIFY_SOCKET cannot be used, so the service manager is not notified",
+        bound: Bound::Lifecycle,
+        reason: "Once at startup, from the environment the service manager or the \
+                 operator set, before any peer exists.",
+    },
+    Accounted {
+        id: "h6ro04gv",
+        file: "systemd.rs",
+        message: "could not connect to the service manager's notification socket, \
+                  so it is not notified",
+        bound: Bound::Lifecycle,
+        reason: "Once at startup: the notifier is then absent and nothing tries \
+                 the socket again.",
+    },
+    Accounted {
+        id: "kyd7134y",
+        file: "systemd.rs",
+        message: "could not tell the service manager that volto is ready",
+        bound: Bound::Lifecycle,
+        reason: "Once at startup: readiness is sent one time, after the listener \
+                 is bound.",
+    },
 ];
 
 /// The macros a production log line is written with.

@@ -36,6 +36,11 @@ warning rather than silent packet loss. Being a property of the socket rather
 than of a connection, these two are the only `[limits]` keys a reload cannot
 change.
 
+`systemd.rs` holds the service manager's notification protocol, and `quic/`
+knows nothing of it. `main` sends `READY=1` through it once `Server::bind` has
+bound that socket and before the accept loop runs, which is when a
+`Type=notify` start is done ([systemd](deployment.md#systemd)).
+
 ### TLS
 
 The handshake runs on AWS-LC's libssl. `tls/awslc/` is volto's own quinn crypto

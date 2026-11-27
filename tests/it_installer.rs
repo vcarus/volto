@@ -1113,9 +1113,10 @@ fn an_install_whose_service_failed_is_not_reported_as_success() {
 /// A first install whose `systemctl start` fails still prints the report
 /// before it fails (F3-L1).
 ///
-/// Under `Type=exec` the start fails at once when the binary cannot be
-/// executed. Without a guard on that call `set -e` ended the run there, and
-/// the operator got neither the fingerprint nor the policy line.
+/// Under `Type=notify` the start fails at once when the binary cannot be
+/// executed, and after `TimeoutStartSec=` when the server never reports ready.
+/// Without a guard on that call `set -e` ended the run there, and the operator
+/// got neither the fingerprint nor the policy line.
 #[test]
 fn a_first_install_whose_start_fails_still_prints_the_report() {
     let root = scratch_tree(

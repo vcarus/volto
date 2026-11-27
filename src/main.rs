@@ -572,6 +572,17 @@ async fn run(path: PathBuf, config: Config) -> Result<Duration> {
     #[cfg(not(unix))]
     tokio::spawn(watch_for_signals(server.shutdown_trigger()));
 
+    // `Server::bind` has bound the UDP socket, so the start is done: under
+    // `Type=notify` systemd reports it as finished from this message on, and a
+    // start that never reaches it fails at `TimeoutStartSec=` (D124). The
+    // variable is read here and nowhere else; `volto::systemd` takes values.
+    let notifier = volto::systemd::Notifier::connect(&volto::systemd::Environment {
+        notify_socket: std::env::var_os("NOTIFY_SOCKET"),
+    });
+    if let Some(notifier) = &notifier {
+        notifier.ready();
+    }
+
     let stopped = server.run().await;
 
     // After the drain, so a reload that arrived during the process's life is in

@@ -23,6 +23,7 @@
 //!   at most 1.25 times the bandwidth-delay product it measures, plus what the
 //!   path's own loss takes out of it.
 //! * [`shutdown`]: the graceful-shutdown signal shared by endpoint and connections.
+//! * [`systemd`]: the service manager's notification protocol: readiness.
 //! * [`h3`]: HTTP/3 (RFC 9114) for a proxy: framing, QPACK, the control
 //!   stream, request streams, and the routing of inbound HTTP Datagrams to the
 //!   stream each one names.
@@ -90,6 +91,7 @@ pub mod net;
 pub mod policy;
 pub mod quic;
 pub mod shutdown;
+pub mod systemd;
 pub mod tls;
 pub mod tunnel;
 pub mod varint;
