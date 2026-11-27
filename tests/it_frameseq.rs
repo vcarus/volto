@@ -186,8 +186,13 @@ enum ControlEvent {
     SettingsConnectProtocolOutOfRange,
     /// A SETTINGS payload repeating an identifier (RFC 9114 §7.2.4).
     SettingsDuplicatePair,
-    /// A SETTINGS payload using an identifier RFC 9114 §7.2.4.1 reserves.
-    SettingsReservedId,
+    /// A SETTINGS payload using an identifier HTTP/2 defined and RFC 9114
+    /// §7.2.4.1 reserves, by index into [`RESERVED_HTTP2_SETTINGS`].
+    SettingsReservedId(usize),
+    /// A SETTINGS payload using identifier 0x00, which RFC 9114 §11.2.2 lists
+    /// as Reserved but HTTP/2 never defined. Refusing it is this server's own
+    /// rule, not the RFC's.
+    SettingsZeroId,
     /// SETTINGS_H3_DATAGRAM with a value that is neither 0 nor 1
     /// (RFC 9297 §2.1.1).
     SettingsBadDatagramValue,
@@ -219,6 +224,15 @@ enum ControlEvent {
     ReservedH2(usize),
 }
 
+/// Setting identifiers HTTP/2 defined that have no HTTP/3 counterpart.
+///
+/// RFC 9114 Appendix A.3: "Specifying a setting with the identifier 0x02
+/// (corresponding to the SETTINGS_ENABLE_PUSH parameter) in the HTTP/3
+/// SETTINGS frame is an error." It says the same of 0x03, 0x04 and 0x05, and
+/// of no other identifier. Transcribed from the RFC rather than shared with
+/// the server's own list.
+const RESERVED_HTTP2_SETTINGS: [u64; 4] = [0x02, 0x03, 0x04, 0x05];
+
 /// How the control-stream script ends, once its events are on the wire.
 #[derive(Debug, Clone, Copy)]
 enum ControlEnd {
@@ -249,8 +263,10 @@ impl ControlEvent {
                 (SETTINGS_MAX_FIELD_SECTION_SIZE, 65536),
                 (SETTINGS_MAX_FIELD_SECTION_SIZE, 65536),
             ]),
-            // 0x00 is SETTINGS_HEADER_TABLE_SIZE in HTTP/2 and reserved here.
-            Self::SettingsReservedId => settings_frame(&[(0x00, 0)]),
+            Self::SettingsReservedId(index) => {
+                settings_frame(&[(RESERVED_HTTP2_SETTINGS[*index], 0)])
+            }
+            Self::SettingsZeroId => settings_frame(&[(0x00, 0)]),
             Self::SettingsBadDatagramValue => settings_frame(&[(SETTINGS_H3_DATAGRAM, 2)]),
             Self::SettingsTruncatedPair => {
                 // An identifier with no value behind it, inside a length that
@@ -290,7 +306,8 @@ fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
 /// The index of the first offence in `events` and the close code it draws, or
 /// `None` if every event is legal.
 ///
-/// Written against the RFC rather than against the server's tables. Where two
+/// Written against the RFC rather than against the server's tables, except the
+/// arm for setting identifier 0x00, which says why. Where two
 /// MUST-close rules apply to one frame, the model follows the layering the
 /// server evaluates them in, because the RFC ranks neither and the code on the
 /// wire is deterministic: reserved HTTP/2 types first; then §6.2.1's first-frame
@@ -328,7 +345,8 @@ fn first_offence(events: &[ControlEvent]) -> Option<(usize, u64)> {
             | ControlEvent::SettingsUnknownId
             | ControlEvent::SettingsConnectProtocolOutOfRange
             | ControlEvent::SettingsDuplicatePair
-            | ControlEvent::SettingsReservedId
+            | ControlEvent::SettingsReservedId(_)
+            | ControlEvent::SettingsZeroId
             | ControlEvent::SettingsBadDatagramValue
             | ControlEvent::SettingsTruncatedPair
                 if settings_seen =>
@@ -341,9 +359,21 @@ fn first_offence(events: &[ControlEvent]) -> Option<(usize, u64)> {
             // §7.2.4/§7.2.4.1's identifier rules decide before it can be
             // accepted.
             ControlEvent::SettingsTruncatedPair => return Some((index, H3_FRAME_ERROR)),
-            ControlEvent::SettingsDuplicatePair
-            | ControlEvent::SettingsReservedId
-            | ControlEvent::SettingsBadDatagramValue => return Some((index, H3_SETTINGS_ERROR)),
+            ControlEvent::SettingsDuplicatePair | ControlEvent::SettingsBadDatagramValue => {
+                return Some((index, H3_SETTINGS_ERROR));
+            }
+            // RFC 9114 §7.2.4.1: "Setting identifiers that were defined in
+            // [HTTP/2] where there is no corresponding HTTP/3 setting have also
+            // been reserved (Section 11.2.2). These reserved settings MUST NOT
+            // be sent, and their receipt MUST be treated as a connection error
+            // of type H3_SETTINGS_ERROR."
+            ControlEvent::SettingsReservedId(_) => return Some((index, H3_SETTINGS_ERROR)),
+            // Not the RFC's rule: HTTP/2 never defined 0x00, so §7.2.4.1's MUST
+            // does not reach it, and §7.2.4 says "An implementation MUST ignore
+            // any parameter with an identifier it does not understand." This
+            // server refuses 0x00 with H3_SETTINGS_ERROR by its own rule
+            // (`volto::h3::settings`), and this one arm follows the server.
+            ControlEvent::SettingsZeroId => return Some((index, H3_SETTINGS_ERROR)),
 
             // The two odd-but-legal payloads are SETTINGS frames like any
             // other: RFC 9114 §7.2.4 ignores an unknown identifier and
@@ -458,11 +488,16 @@ fn script_verdict(events: &[ControlEvent], end: ControlEnd) -> u64 {
         // RFC 9114 §6.2.1: closing the control stream, however politely, is
         // H3_CLOSED_CRITICAL_STREAM.
         ControlEnd::FinishCleanly => H3_CLOSED_CRITICAL_STREAM,
-        // RFC 9114 §7.1: a stream that ends with its last frame truncated is
-        // H3_FRAME_ERROR. The truncated frame is a grease frame, judged in
-        // the state the events left behind: before SETTINGS its header is
-        // already H3_MISSING_SETTINGS (§6.2.1), and the truncation is never
-        // reached.
+        // RFC 9114 §7.1: "When a stream terminates cleanly, if the last frame
+        // on the stream was truncated, this MUST be treated as a connection
+        // error of type H3_FRAME_ERROR." §6.2.1 applies to the same event with
+        // equal force: "If either control stream is closed at any point, this
+        // MUST be treated as a connection error of type
+        // H3_CLOSED_CRITICAL_STREAM." The RFC ranks neither; this pins the
+        // frame layer's answer, which comes first. The truncated frame is a
+        // grease frame, judged in the state the events left behind: before
+        // SETTINGS its header is already H3_MISSING_SETTINGS (§6.2.1), and
+        // the truncation is never reached.
         ControlEnd::FinishMidFrame => {
             let mut with_grease = events.to_vec();
             with_grease.push(ControlEvent::Grease { n: 3, len: 5 });
@@ -543,7 +578,8 @@ fn any_control_event() -> impl Strategy<Value = ControlEvent> {
         1 => Just(ControlEvent::SettingsUnknownId),
         1 => Just(ControlEvent::SettingsConnectProtocolOutOfRange),
         1 => Just(ControlEvent::SettingsDuplicatePair),
-        1 => Just(ControlEvent::SettingsReservedId),
+        1 => (0usize..RESERVED_HTTP2_SETTINGS.len()).prop_map(ControlEvent::SettingsReservedId),
+        1 => Just(ControlEvent::SettingsZeroId),
         1 => Just(ControlEvent::SettingsBadDatagramValue),
         1 => Just(ControlEvent::SettingsTruncatedPair),
         1 => Just(ControlEvent::GoawayMalformed),
@@ -634,7 +670,8 @@ fn every_control_offence_draws_its_modelled_code() {
         ),
         (ControlEvent::MaxPushIdTrailingBytes, H3_FRAME_ERROR),
         (ControlEvent::SettingsDuplicatePair, H3_FRAME_UNEXPECTED),
-        (ControlEvent::SettingsReservedId, H3_FRAME_UNEXPECTED),
+        (ControlEvent::SettingsReservedId(0), H3_FRAME_UNEXPECTED),
+        (ControlEvent::SettingsZeroId, H3_FRAME_UNEXPECTED),
         (ControlEvent::SettingsBadDatagramValue, H3_FRAME_UNEXPECTED),
         (ControlEvent::SettingsTruncatedPair, H3_FRAME_UNEXPECTED),
         (ControlEvent::Goaway(9), H3_ID_ERROR),
@@ -700,7 +737,11 @@ fn every_control_offence_draws_its_modelled_code() {
     for (first, expected) in [
         (ControlEvent::SettingsTruncatedPair, H3_FRAME_ERROR),
         (ControlEvent::SettingsDuplicatePair, H3_SETTINGS_ERROR),
-        (ControlEvent::SettingsReservedId, H3_SETTINGS_ERROR),
+        (ControlEvent::SettingsReservedId(0), H3_SETTINGS_ERROR),
+        (ControlEvent::SettingsReservedId(1), H3_SETTINGS_ERROR),
+        (ControlEvent::SettingsReservedId(2), H3_SETTINGS_ERROR),
+        (ControlEvent::SettingsReservedId(3), H3_SETTINGS_ERROR),
+        (ControlEvent::SettingsZeroId, H3_SETTINGS_ERROR),
         (ControlEvent::SettingsBadDatagramValue, H3_SETTINGS_ERROR),
     ] {
         let events = vec![first.clone()];
