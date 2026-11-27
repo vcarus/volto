@@ -591,9 +591,9 @@ pub fn status_of(block: &[u8]) -> String {
 /// [`status_of`] needs none, its own failures being `expect`s on the decoder.
 #[track_caller]
 pub fn status_of_response(response: &[u8]) -> String {
-    let (frame_type, used) = varint::peek_varint(response).expect("a frame type");
+    let (frame_type, used) = decode_varint(response).expect("a frame type");
     assert_eq!(frame_type, FRAME_HEADERS, "a response begins with HEADERS");
-    let (length, more) = varint::peek_varint(&response[used..]).expect("a frame length");
+    let (length, more) = decode_varint(&response[used..]).expect("a frame length");
 
     let payload = &response[used + more..];
     assert_eq!(
