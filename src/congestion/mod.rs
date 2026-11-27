@@ -8,7 +8,7 @@
 //! from them alone (D108).
 //!
 //! The window is a gain times the delivery rate measured once per round trip
-//! (see [`rate`]) times the minimum RTT (see [`min_rtt`]). The gain is 1.25
+//! (see `rate.rs`) times the minimum RTT (see `min_rtt.rs`). The gain is 1.25
 //! unless the path's loss has lowered it.
 //!
 //! quinn paces from the window (quinn-proto `src/connection/pacing.rs`,
@@ -23,23 +23,23 @@
 //!
 //! # States
 //!
-//! - The startup ([`startup`]): the startup gain of about 2.89 until the
+//! - The startup (`startup.rs`): the startup gain of about 2.89 until the
 //!   estimate stops growing or an interval loses more than the base loss
 //!   explains. It returns when the estimate climbs back after a fall. Until
 //!   the first startup has ended, the window is at most the initial window
 //!   plus the bytes acknowledged so far.
-//! - The steady state: the steady gain between 1.05 and 1.25 ([`gain`]),
-//!   times the factor that covers the path's base loss ([`base_loss`]).
-//! - A probe ([`min_rtt`]): half the estimated bandwidth-delay product, and at
+//! - The steady state: the steady gain between 1.05 and 1.25 (`gain.rs`),
+//!   times the factor that covers the path's base loss (`base_loss.rs`).
+//! - A probe (`min_rtt.rs`): half the estimated bandwidth-delay product, and at
 //!   least four packets, while the minimum RTT is measured again and the base
 //!   loss is read.
-//! - A recovery ([`recovery`]), beside the other states: after a loss,
+//! - A recovery (`recovery.rs`), beside the other states: after a loss,
 //!   in-flight data is held for a round trip.
 //!
 //! # Invariants
 //!
 //! - Outside a recovery and a probe the window is never below
-//!   [`INITIAL_WINDOW`] (D121). Until there is a delivery-rate sample and a
+//!   `INITIAL_WINDOW` (D121). Until there is a delivery-rate sample and a
 //!   minimum RTT, the window is the initial window.
 //! - The steady gain is at most 1.25, so what is in flight and will arrive is
 //!   at most 1.25 bandwidth-delay products. The base-loss factor adds only
@@ -50,7 +50,7 @@
 //!   because quinn reads it before every packet it sends. The inputs are the
 //!   estimate, the minimum RTT, the probe, the startup with its slow-start
 //!   limit, the steady gain, the base loss, the recovery window and the MTU.
-//! - What the connection's close line reports is counted in [`record`].
+//! - What the connection's close line reports is counted in `record.rs`.
 //!
 //! Lab measurements are in `docs/configuration.md`.
 
