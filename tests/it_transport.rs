@@ -32,11 +32,19 @@ use common::{
     read_to_end, spawn_drain_then_reply_target, spawn_echo_target,
 };
 
+/// The longest a connection idle under the configured one second may take to
+/// close: the timeout and two seconds of slack for a loaded machine. quinn
+/// waits at least three probe timeouts, which on loopback are milliseconds.
+const IDLE_CLOSE_WITHIN: Duration = Duration::from_secs(3);
+
 /// The configured idle timeout is the one that applies.
 ///
-/// Asserting both bounds matters: that the connection closes at all proves the
-/// value is not quinn's 30s default or our 60s one, and that it takes about a
-/// second proves it closed on the timeout rather than failing outright.
+/// Asserting both bounds matters: closing within [`IDLE_CLOSE_WITHIN`] proves
+/// the value is not quinn's 30s default or our 60s one, and taking about a
+/// second proves it closed on the timeout rather than failing outright. The
+/// kind of the close tells the transport's timer from the server's own
+/// deadline on a connection that sends no request, which is two idle
+/// timeouts and so falls inside the bound.
 #[tokio::test]
 async fn an_idle_connection_is_closed_after_the_configured_timeout() {
     let server = TestServer::start_with(&format!("{IMPATIENT}{ALLOW_PRIVATE}")).await;
@@ -51,6 +59,10 @@ async fn an_idle_connection_is_closed_after_the_configured_timeout() {
     assert!(
         elapsed >= Duration::from_millis(750),
         "closed after {elapsed:?}, which is too fast to be the 1s idle timeout: {error}"
+    );
+    assert!(
+        elapsed < IDLE_CLOSE_WITHIN,
+        "closed after {elapsed:?}, which is too slow to be the 1s idle timeout: {error}"
     );
     assert_matches!(
         error,
@@ -73,12 +85,21 @@ async fn reloading_changes_the_transport_parameters_for_new_connections() {
     // A connection accepted after the reload gets the new timeout.
     let impatient = H3Client::connect(&server).await;
     let start = Instant::now();
-    tokio::time::timeout(TIMEOUT, impatient.quic.closed())
+    let error = tokio::time::timeout(TIMEOUT, impatient.quic.closed())
         .await
         .expect("the reloaded idle timeout must apply to new connections");
+    let elapsed = start.elapsed();
     assert!(
-        start.elapsed() >= Duration::from_millis(750),
-        "closed too fast to be the 1s idle timeout"
+        (Duration::from_millis(750)..IDLE_CLOSE_WITHIN).contains(&elapsed),
+        "closed after {elapsed:?}, which is not the 1s idle timeout: {error}"
+    );
+    // The server also closes a connection that sends no request within two
+    // idle timeouts, from the same configured value, so only the kind of the
+    // close says the transport's own timer ended it.
+    assert_matches!(
+        error,
+        quinn::ConnectionError::TimedOut,
+        "expected an idle timeout, got {error}"
     );
 
     // The connection that predates the reload kept the 60s timeout it negotiated,
