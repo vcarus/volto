@@ -68,24 +68,17 @@
 //!   relationship -- because arrivals, lifetimes and spacings are all divided
 //!   by the same number.
 //!
-//!   What it cannot preserve is a connection's quiet time, and the reason is
-//!   worth stating exactly because it puts a floor under the whole exercise.
-//!   Production carries a connection through a long silence on the server's
-//!   keep-alive PINGs: its measured gaps between tunnels reach a minute and a
-//!   half at the 99th percentile, well past its 30-second idle timeout, which
-//!   nothing but the keep-alive explains. The replay cannot use that mechanism.
-//!   A keep-alive must be under half the idle timeout; the idle timeout is
-//!   already at its one-second floor; and with PINGs on, a client that is
-//!   merely holding a connection open would answer them and never time out --
-//!   which is the ending four in five production connections have.
+//!   A connection's quiet time cannot be replayed: the keep-alive that carries
+//!   production connections through long gaps would also stop an idle-ended
+//!   connection from ever timing out.
 //!
 //!   So the planner shortens what it cannot hold: a gap longer than the lab's
 //!   idle timeout, and the quiet tail after a connection's last tunnel. Both
 //!   are counted and printed. The consequence is that a replayed connection
 //!   lives for its working time plus one idle timeout and no more, and
 //!   **lifetime and concurrency are the two rows a comparison should not
-//!   believe**. They read high at strong compression, where the one-second
-//!   floor dwarfs a working phase compressed to milliseconds, and low at weak
+//!   believe**. They read high at strong compression, where one idle timeout
+//!   dwarfs a working phase compressed to milliseconds, and low at weak
 //!   compression, where the clamped tail is shorter than production's. Every
 //!   other row is unaffected.
 //!

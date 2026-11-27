@@ -340,10 +340,9 @@ before believing a number out of a run:
 * **A connection's quiet time cannot be replayed.** Production carries a
   connection through a long silence on the server's keep-alive PINGs — its
   measured gaps between tunnels reach a minute and a half at the 99th
-  percentile, well past its 30-second idle timeout. The lab cannot: a keep-alive
-  must be under half the idle timeout, the idle timeout is already at its
-  one-second floor, and PINGs would stop an idle-ended connection ever timing
-  out, which is the ending four in five production connections have. The planner
+  percentile, well past its 30-second idle timeout. The lab cannot: PINGs would
+  stop an idle-ended connection ever timing out, which is the ending four in
+  five production connections have. The planner
   therefore shortens gaps and quiet tails it cannot hold, and prints how many.
   A replayed connection lives for its working time plus one idle timeout, so
   **lifetime and concurrency read high at strong compression and low at weak

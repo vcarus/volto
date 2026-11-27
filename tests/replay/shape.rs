@@ -666,18 +666,8 @@ pub struct Scaling {
     /// Longest silence a replayed connection may be planned to have, in wall
     /// milliseconds.
     ///
-    /// Production keeps a connection alive through a long gap between tunnels
-    /// with the server's keep-alive PINGs -- its measured gaps reach a minute
-    /// and a half at the 99th percentile, well past its idle timeout, which
-    /// only the keep-alive explains. The replay cannot use that mechanism: a
-    /// keep-alive has to be under half the idle timeout, the idle timeout is
-    /// already at its one-second floor, and with the PINGs on, a client that is
-    /// merely holding its connection open would answer them and never time out
-    /// -- which is precisely the ending four in five production connections
-    /// have.
-    ///
-    /// So the gap is shortened instead of the connection being allowed to die
-    /// in a way production's would not. Below the idle timeout, and counted.
+    /// The gap is shortened instead of the connection being allowed to die in
+    /// a way production's would not. Below the idle timeout, and counted.
     pub max_gap_ms: u64,
 }
 
