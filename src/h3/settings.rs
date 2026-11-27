@@ -21,7 +21,12 @@ pub const SETTING_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
 /// `SETTINGS_H3_DATAGRAM` (RFC 9297 §2.1.1).
 pub const SETTING_H3_DATAGRAM: u64 = 0x33;
 
-/// Setting identifiers RFC 9114 §11.2.2 reserves because HTTP/2 used them.
+/// Setting identifiers refused as reserved, all listed as Reserved in RFC 9114
+/// §11.2.2.
+///
+/// The MUST quoted where they are refused covers 0x02 to 0x05, the identifiers
+/// HTTP/2 defined that have no HTTP/3 counterpart. HTTP/2 never defined 0x00,
+/// so refusing it is our own rule.
 const RESERVED_HTTP2_SETTINGS: [u64; 5] = [0x00, 0x02, 0x03, 0x04, 0x05];
 
 /// The peer's SETTINGS, reduced to what this server acts on.
