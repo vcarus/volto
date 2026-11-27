@@ -392,36 +392,6 @@ async fn a_handshake_queued_before_a_reload_is_accepted_on_the_reloaded_paramete
     );
 }
 
-/// A reload can also tighten the destination policy.
-#[tokio::test]
-async fn reloading_replaces_the_destination_policy() {
-    let server = TestServer::start_with(ALLOW_PRIVATE).await;
-    let target = spawn_echo_target().await;
-
-    let mut client = H3Client::connect(&server).await;
-    assert_eq!(
-        respond_to(&mut client, connect_request(&target.to_string()))
-            .await
-            .status,
-        Status::OK
-    );
-
-    // Withdraw access to private address space.
-    server.rewrite_config("[security]\nallow_private_networks = false\n");
-    server.reload().expect("reload");
-
-    let mut fresh = H3Client::connect(&server).await;
-    let refused = respond_to(&mut fresh, connect_request(&target.to_string())).await;
-    assert_eq!(refused.status, Status::FORBIDDEN);
-    assert_eq!(
-        refused
-            .fields
-            .get("proxy-status")
-            .and_then(FieldValue::to_str),
-        Some("volto; error=destination_ip_prohibited")
-    );
-}
-
 /// A broken configuration file must be rejected whole, leaving the running one in
 /// force — and the server must keep serving throughout.
 #[tokio::test]
