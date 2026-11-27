@@ -1,16 +1,18 @@
-//! M5: load and churn regressions — concurrency, and the absence of leaks.
+//! Load and churn regressions: concurrency, and tunnel slots that come back.
 //!
-//! # How a leak is detected on the wire
+//! # How a leaked slot is detected on the wire
 //!
 //! A leaked tunnel slot is normally invisible until the process runs out of file
-//! descriptors hours later. These tests make it visible immediately by running
-//! with a deliberately small `max_targets_per_conn`: if a finished tunnel does not
-//! return its slot, the run fails at iteration `limit + 1` with a 503 instead of
-//! degrading silently. That keeps the assertion on the wire rather than reaching
-//! into the server's counters.
+//! descriptors hours later. The churn tests make it visible immediately by
+//! running with a deliberately small `max_targets_per_conn`: if a finished
+//! tunnel does not return its slot, the run fails at iteration `limit + 1` with
+//! a 503 instead of degrading silently. That keeps the assertion on the wire
+//! rather than reaching into the server's counters.
 //!
-//! The heaviest scenarios from the spec's §8.3 acceptance list are `#[ignore]`d so
-//! `cargo test` stays quick; run them with
+//! The churn tests run the spec's §8.3 figures and are `#[ignore]`d with the
+//! other heavy scenarios, so `cargo test` stays quick. At the default suite's
+//! scale the same check, with descriptor samples and closing-line counters
+//! added, is `it_soak`'s first phase. Run them with
 //! `cargo test --test it_stress -- --ignored --nocapture`.
 
 mod common;
@@ -120,16 +122,6 @@ async fn a_hundred_concurrent_tunnels_stay_independent() {
     concurrent_tunnels(100).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn five_hundred_tcp_tunnel_cycles_leak_nothing() {
-    tcp_churn(500).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn five_hundred_udp_session_cycles_leak_nothing() {
-    udp_churn(500).await;
-}
-
 /// The spec's §8.3 figure: 500 tunnels open at once on one connection.
 ///
 /// Ignored by default because it needs a fd limit well above the macOS default of
@@ -140,13 +132,19 @@ async fn five_hundred_concurrent_tunnels() {
     concurrent_tunnels(500).await;
 }
 
-/// The spec's §8.3 figure: 10 000 open/close cycles without leaking descriptors.
+/// The spec's §8.3 figure: 10 000 open/close cycles, each returning its tunnel
+/// slot.
+///
+/// No descriptor count is taken here; `it_soak` samples descriptors. Past the
+/// default 1024 streams, the run also needs the QUIC stream credit of each
+/// finished tunnel back.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "heavy: 10 000 tunnel cycles"]
 async fn ten_thousand_tcp_tunnel_cycles() {
     tcp_churn(10_000).await;
 }
 
+/// [`ten_thousand_tcp_tunnel_cycles`] for CONNECT-UDP sessions.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "heavy: 10 000 UDP session cycles"]
 async fn ten_thousand_udp_session_cycles() {

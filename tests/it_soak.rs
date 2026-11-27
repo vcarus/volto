@@ -31,9 +31,8 @@
 //!   tunnels and streams the run uses. A slot that is not released fails the run
 //!   at cycle ~16 with a 503; QUIC stream credit that is never returned parks
 //!   `open_bi` for ever a cycle later. Neither is reachable at the scale the
-//!   rest of the suite runs at: `it_stress` churns 500 tunnels, which is inside
-//!   the default 1024-stream credit and so never asks whether any of it comes
-//!   back.
+//!   rest of the default suite runs at; `it_stress`'s churn tests, which run
+//!   past the default 1024-stream credit, are ignored by default.
 //! * **Descriptors are flat.** Sampled mid-run and again at the end, once for
 //!   the tunnel churn and once for the connection churn, so process warm-up is
 //!   outside each comparison and only the steady state is measured. A socket

@@ -724,8 +724,9 @@ Two tests are load-bearing beyond their names:
   endpoint tuning must not shorten them to zero.
 
 `it_stress` keeps a heavy tier behind `#[ignore]` (500 concurrent tunnels, 10000
-setup/teardown rounds) and a light tier in the default run that catches slot
-leaks by shrinking the quota until a leak turns into an observable 503.
+setup/teardown rounds) that catches slot leaks by shrinking the quota until a
+leak turns into an observable 503. In the default run, `it_soak` makes the same
+check at a smaller scale, with descriptor samples beside it.
 
 These pages are checked too. `it_docs` reads `docs/` as text and asserts what a
 machine can settle: that the configuration keys documented here and the ones
