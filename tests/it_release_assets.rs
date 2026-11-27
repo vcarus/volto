@@ -1449,8 +1449,7 @@ Reproduce with:
     );
 }
 
-/// Both workflows that need nightly name a dated one, and each says the two
-/// move together.
+/// Both workflows that need nightly name the same dated one.
 #[test]
 fn the_nightly_workflows_name_the_same_toolchain() {
     let asan = workflow_nightly("asan.yml");
