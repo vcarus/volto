@@ -82,6 +82,34 @@ async fn attempt_with(client: &mut H3Client, request: Request) -> Option<Status>
     Some(response.status)
 }
 
+/// Sends the request that spends the failure budget, and asserts what the
+/// server does with it.
+///
+/// `src/conn.rs` closes the connection with `AUTH_FAILURE_LIMIT_CODE` before
+/// the 407 would be written, so that request is never answered and the
+/// connection ends with that code. `what` names the case in a failure.
+async fn spends_the_budget(client: &mut H3Client, request: Request, what: &str) {
+    let mut stream = client
+        .send
+        .send_request(request)
+        .await
+        .unwrap_or_else(|error| panic!("{what}: the request was not sent: {error:?}"));
+    let answer = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .unwrap_or_else(|_| panic!("{what}: neither an answer nor a close arrived"));
+    assert!(
+        answer.is_err(),
+        "{what}: the request that spends the budget must not be answered, got {:?}",
+        answer.map(|response| response.status)
+    );
+    close_reason(
+        &client.quic,
+        volto::h3api::AUTH_FAILURE_LIMIT_CODE.value(),
+        TIMEOUT,
+    )
+    .await;
+}
+
 /// Past the cap, new connections are refused at the QUIC layer rather than
 /// accepted and served.
 #[tokio::test]
@@ -199,13 +227,13 @@ async fn repeated_authentication_failures_close_the_connection() {
         );
     }
 
-    // The third exhausts the budget. Whether it is answered before the close
-    // lands is a race, so what is asserted is the outcome: the connection goes.
-    let _ = attempt(&mut client, &target.to_string(), "wrong").await;
-
-    tokio::time::timeout(TIMEOUT, client.quic.closed())
-        .await
-        .expect("the connection must be closed after the failure budget is spent");
+    // The third exhausts the budget.
+    spends_the_budget(
+        &mut client,
+        authorized_connect(&target.to_string(), "user1", "wrong"),
+        "the third failure",
+    )
+    .await;
 }
 
 /// Failures that name nobody spend the budget too, on their own.
@@ -233,13 +261,13 @@ async fn credential_less_failures_alone_close_the_connection() {
         );
     }
 
-    // The third exhausts the budget. Whether it is answered before the close
-    // lands is a race, so what is asserted is the outcome: the connection goes.
-    let _ = attempt_anonymously(&mut client, &target.to_string()).await;
-
-    tokio::time::timeout(TIMEOUT, client.quic.closed())
-        .await
-        .expect("credential-less failures must count against the failure budget");
+    // The third exhausts the budget.
+    spends_the_budget(
+        &mut client,
+        connect_request(&target.to_string()),
+        "the third credential-less failure",
+    )
+    .await;
 }
 
 /// A CONNECT carrying one wrong credential per password named.
@@ -280,17 +308,12 @@ async fn a_request_of_two_guesses_spends_two_failures() {
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    // Whether the 407 arrives before the close lands is a race, so what is
-    // asserted is the outcome: the connection goes.
-    let _ = attempt_with(
+    spends_the_budget(
         &mut client,
         guesses(&target.to_string(), &["wrong", "wronger"]),
+        "two guesses in one request",
     )
     .await;
-
-    tokio::time::timeout(TIMEOUT, client.quic.closed())
-        .await
-        .expect("two guesses in one request must spend two failures");
 }
 
 /// A third credential value is a 400, and no guess in it is charged.
@@ -651,14 +674,13 @@ async fn a_success_does_not_clear_another_users_failures() {
     );
 
     // The second guess at user2 is the second failure charged to user2, so it
-    // spends the budget. Whether the 407 lands before the close is a race, as it
-    // is in `repeated_authentication_failures_close_the_connection`, so the
-    // outcome is what is asserted.
-    let _ = attempt_as(&mut client, &target.to_string(), "user2", "wrong-again").await;
-
-    tokio::time::timeout(TIMEOUT, client.quic.closed())
-        .await
-        .expect("a success as one user must not buy another user's guesses a reprieve");
+    // spends the budget.
+    spends_the_budget(
+        &mut client,
+        authorized_connect(&target.to_string(), "user2", "wrong-again"),
+        "a success as one user must not buy another user's guesses a reprieve",
+    )
+    .await;
 }
 
 /// The interleave that a single run of failures could not stop.
@@ -708,14 +730,13 @@ async fn an_interleaved_cycle_of_guesses_still_reaches_the_cap() {
         "the fourth failure of the connection is one short of the cap"
     );
 
-    // The request that brings the total to five. Whether its 407 lands before
-    // the close is a race, as it is in the tests above, so the outcome is what
-    // is asserted.
-    let _ = attempt_as(&mut client, &authority, "user2", "guess-3").await;
-
-    tokio::time::timeout(TIMEOUT, client.quic.closed())
-        .await
-        .expect("a success as one user must not buy a second user's guesses another round");
+    // The request that brings the total to five.
+    spends_the_budget(
+        &mut client,
+        authorized_connect(&authority, "user2", "guess-3"),
+        "a success as one user must not buy a second user's guesses another round",
+    )
+    .await;
 }
 
 /// A guess at a user-id nobody has is never cleared by anything.
@@ -763,11 +784,12 @@ async fn a_success_never_clears_a_guess_at_a_user_that_does_not_exist() {
         );
     }
 
-    let _ = attempt_as(&mut client, &authority, "eve", "guess-2").await;
-
-    tokio::time::timeout(TIMEOUT, client.quic.closed())
-        .await
-        .expect("guesses at a user that does not exist must survive a success as one that does");
+    spends_the_budget(
+        &mut client,
+        authorized_connect(&authority, "eve", "guess-2"),
+        "guesses at a user that does not exist must survive a success as one that does",
+    )
+    .await;
 }
 
 /// A success clears the failures that named nobody, and only those.
@@ -811,12 +833,12 @@ async fn a_success_clears_credential_less_failures_and_nothing_else() {
     );
 
     // The third failure still standing against user2, so it spends the budget.
-    // As in the tests above, whether the 407 lands before the close is a race.
-    let _ = attempt_as(&mut client, &authority, "user2", "wrong-once-more").await;
-
-    tokio::time::timeout(TIMEOUT, client.quic.closed())
-        .await
-        .expect("a success must not clear a guess along with the request that named nobody");
+    spends_the_budget(
+        &mut client,
+        authorized_connect(&authority, "user2", "wrong-once-more"),
+        "a success must not clear a guess along with the request that named nobody",
+    )
+    .await;
 }
 
 /// Zero disables the cap, for the operator who would rather fail2ban handle it.
