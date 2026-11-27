@@ -20,8 +20,6 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
-	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"testing"
@@ -30,7 +28,6 @@ import (
 	masque "github.com/quic-go/masque-go"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/yosida95/uritemplate/v3"
 )
 
 const (
@@ -90,13 +87,9 @@ func echRoots(t *testing.T) *x509.CertPool {
 func dialECH(t *testing.T, ctx context.Context, addr string, list []byte, idle time.Duration) (*quic.Conn, error) {
 	t.Helper()
 
-	sni := os.Getenv(envSNI)
-	if sni == "" {
-		sni = "localhost"
-	}
 	return quic.DialAddr(ctx, addr, &tls.Config{
 		RootCAs:                        echRoots(t),
-		ServerName:                     sni,
+		ServerName:                     sni(),
 		NextProtos:                     []string{http3.NextProtoH3},
 		MinVersion:                     tls.VersionTLS13,
 		EncryptedClientHelloConfigList: list,
@@ -128,21 +121,8 @@ func TestECHWithTheServersListIsAcceptedUnderRequireECH(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HTTP/3 client connection: %v", err)
 	}
-	_, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		t.Fatalf("%s = %q is not host:port: %v", envECHAddr, addr, err)
-	}
-	sni := os.Getenv(envSNI)
-	if sni == "" {
-		sni = "localhost"
-	}
-	raw := fmt.Sprintf("https://%s/.well-known/masque/udp/{target_host}/{target_port}/", net.JoinHostPort(sni, port))
-	tmpl, err := uritemplate.New(raw)
-	if err != nil {
-		t.Fatalf("parsing URI template %q: %v", raw, err)
-	}
 	target := startEchoTarget(t, 0xE0)
-	session, rsp, err := client.Dial(newRequest(t, ctx, tmpl, target))
+	session, rsp, err := client.Dial(newRequest(t, ctx, templateFor(t, addr), target))
 	if err != nil {
 		t.Fatalf("CONNECT-UDP to %s over ECH: %v", target, err)
 	}

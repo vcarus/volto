@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -65,11 +66,6 @@ func dialProxy(t *testing.T, ctx context.Context) *masque.ClientConn {
 		t.Fatalf("%s is not set: this suite tests a server started by CI, it does not start one", envAddr)
 	}
 
-	sni := os.Getenv(envSNI)
-	if sni == "" {
-		sni = "localhost"
-	}
-
 	certPath := os.Getenv(envCert)
 	if certPath == "" {
 		t.Fatalf("%s is not set: the server certificate has to be trusted explicitly", envCert)
@@ -85,7 +81,7 @@ func dialProxy(t *testing.T, ctx context.Context) *masque.ClientConn {
 
 	conn, err := quic.DialAddr(ctx, addr, &tls.Config{
 		RootCAs:    roots,
-		ServerName: sni,
+		ServerName: sni(),
 		NextProtos: []string{http3.NextProtoH3},
 	}, &quic.Config{
 		EnableDatagrams: true,
@@ -105,23 +101,35 @@ func dialProxy(t *testing.T, ctx context.Context) *masque.ClientConn {
 	return client
 }
 
-// proxyTemplate builds the RFC 9298 §2 default URI template for the server.
+// sni is the name to validate the server certificate against.
+func sni() string {
+	if name := os.Getenv(envSNI); name != "" {
+		return name
+	}
+	return "localhost"
+}
+
+// proxyTemplate builds the RFC 9298 §2 default URI template for the server
+// under test.
+func proxyTemplate(t *testing.T) *uritemplate.Template {
+	t.Helper()
+	return templateFor(t, os.Getenv(envAddr))
+}
+
+// templateFor builds the RFC 9298 §2 default URI template for the server
+// listening on addr.
 //
 // Surge has no way to configure a template either, so this is the same URI
 // shape the production client uses.
-func proxyTemplate(t *testing.T) *uritemplate.Template {
+func templateFor(t *testing.T, addr string) *uritemplate.Template {
 	t.Helper()
 
-	sni := os.Getenv(envSNI)
-	if sni == "" {
-		sni = "localhost"
-	}
-	_, port, err := net.SplitHostPort(os.Getenv(envAddr))
+	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		t.Fatalf("%s = %q is not host:port: %v", envAddr, os.Getenv(envAddr), err)
+		t.Fatalf("server address %q is not host:port: %v", addr, err)
 	}
 
-	raw := fmt.Sprintf("https://%s/.well-known/masque/udp/{target_host}/{target_port}/", net.JoinHostPort(sni, port))
+	raw := fmt.Sprintf("https://%s/.well-known/masque/udp/{target_host}/{target_port}/", net.JoinHostPort(sni(), port))
 	tmpl, err := uritemplate.New(raw)
 	if err != nil {
 		t.Fatalf("parsing URI template %q: %v", raw, err)
@@ -149,27 +157,7 @@ func newRequest(t *testing.T, ctx context.Context, tmpl *uritemplate.Template, t
 
 // basicCredentials renders an HTTP Basic field value (RFC 7617).
 func basicCredentials(user, password string) string {
-	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
-	plain := []byte(user + ":" + password)
-	token := make([]byte, 0, 4*((len(plain)+2)/3))
-	for i := 0; i < len(plain); i += 3 {
-		chunk := plain[i:min(i+3, len(plain))]
-		var bits uint32
-		for j := 0; j < 3; j++ {
-			bits <<= 8
-			if j < len(chunk) {
-				bits |= uint32(chunk[j])
-			}
-		}
-		for j := 0; j < len(chunk)+1; j++ {
-			token = append(token, alphabet[(bits>>(18-6*j))&0x3f])
-		}
-		for j := len(chunk) + 1; j < 4; j++ {
-			token = append(token, '=')
-		}
-	}
-	return "Basic " + string(token)
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+password))
 }
 
 // startEchoTarget runs a UDP server that echoes each packet back with tag
