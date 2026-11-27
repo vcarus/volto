@@ -10,21 +10,21 @@ use rustls_pki_types::DnsName;
 
 /// The hosts a handshake may name, compared the way a name is compared.
 ///
-/// Held as normalised strings (lowercased, with a trailing root dot removed),
-/// so that the normalisation happens once at load rather than once per
-/// Initial packet, and so that both gates can only ever agree: the socket
-/// gate, and the ClientHello callback of the server's TLS (`tls::awslc`),
-/// which calls [`Names::accepts`] too.
+/// Held without the root dot and compared ignoring ASCII case, so that the
+/// dot is removed once at load rather than once per Initial packet.
 #[derive(Debug)]
 pub struct Names {
     names: Vec<String>,
 }
 
 impl Names {
-    /// Normalises what the configuration file said.
+    /// The names the configuration file gave, each without its root dot.
     pub fn new(configured: &[String]) -> Self {
         Self {
-            names: configured.iter().map(|name| normalise(name)).collect(),
+            names: configured
+                .iter()
+                .map(|name| root_relative(name).to_owned())
+                .collect(),
         }
     }
 
@@ -36,10 +36,9 @@ impl Names {
     /// Whether `name` is one of them.
     ///
     /// DNS names are case-insensitive and a trailing dot is the same name
-    /// spelled absolutely, so both are normalised away on each side: the held
-    /// side at load, this side without an allocation, since the held names are
-    /// already lowercase. Nothing else is: no wildcards, no suffix matching. A
-    /// name that is not on the list is not this server's.
+    /// spelled absolutely, so the case is ignored and the dot is removed on
+    /// each side, the held side at load. Nothing else is: no wildcards, no
+    /// suffix matching. A name that is not on the list is not this server's.
     pub fn accepts(&self, name: &str) -> bool {
         let name = root_relative(name);
         self.names
@@ -59,25 +58,14 @@ impl Names {
 /// `name` without its trailing root dot, which is the same name spelled
 /// relative to the root.
 ///
-/// The whole of the rule "a configured host name may end in a root dot", in one
-/// place, because its four callers have to agree. If one of them removed
-/// *every* trailing dot where the others remove one, `expected_sni =
-/// ["host.tw.."]` would be held by the gate as `host.tw.`, a form no
-/// ClientHello can carry, because RFC 6066 §3 has the name represented "without
-/// a trailing dot". It would then be judged covered by the certificate as
-/// `host.tw`, so the D106 warning that exists for exactly this silent typo
-/// would not fire.
-///
 /// One dot and no more, because a second dot is an empty label rather than a
-/// spelling of the root. `Config::validate` refuses those outright, so the four
-/// callers agree on every name that can reach them.
+/// spelling of the root, and `Config::validate` refuses those. Its four
+/// callers must agree: if one removed every trailing dot, `host.tw..` would be
+/// held by the gate as a name no ClientHello can carry (RFC 6066 §3: "without
+/// a trailing dot") and judged covered by the certificate, so the D106
+/// warning would not fire.
 pub(crate) fn root_relative(name: &str) -> &str {
     name.trim_suffix('.')
-}
-
-/// Lowercased, with one trailing root dot removed.
-fn normalise(name: &str) -> String {
-    root_relative(name).to_ascii_lowercase()
 }
 
 /// `name` as a DNS host name by the rustls-pki-types rules, or `None`.
