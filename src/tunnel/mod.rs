@@ -816,7 +816,7 @@ where
 /// handshake that follows it. A share below that ends an attempt before a lost
 /// first SYN has been sent again, so a reachable target behind a slow path or a
 /// long address list could time out on every address.
-pub(crate) const MIN_CONNECT_SHARE: Duration = Duration::from_secs(3);
+pub const MIN_CONNECT_SHARE: Duration = Duration::from_secs(3);
 
 /// [`first_reachable_then`] with no other family behind `addresses`.
 #[cfg(test)]

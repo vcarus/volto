@@ -617,10 +617,40 @@ fn crate_constants() -> BTreeMap<&'static str, (u64, Dimension)> {
             (volto::tunnel::udp::RECV_BLOCK_SIZE as u64, Dimension::Bytes),
         ),
         (
+            "INBOUND_QUEUE_DEPTH",
+            (
+                volto::h3::connection::INBOUND_QUEUE_DEPTH as u64,
+                Dimension::Count,
+            ),
+        ),
+        (
+            "EARLY_DATAGRAM_HOLD",
+            millis(volto::h3::connection::EARLY_DATAGRAM_HOLD),
+        ),
+        (
+            "PEER_SETTINGS_WAIT",
+            millis(volto::h3::connection::PEER_SETTINGS_WAIT),
+        ),
+        ("HOLD_LIFETIME", millis(volto::gate::HOLD_LIFETIME)),
+        (
+            "HOLD_FLIGHTS",
+            (volto::gate::HOLD_FLIGHTS as u64, Dimension::Count),
+        ),
+        (
+            "HOLD_TOTAL_BYTES",
+            (volto::gate::HOLD_TOTAL_BYTES as u64, Dimension::Bytes),
+        ),
+        ("MIN_CONNECT_SHARE", millis(volto::tunnel::MIN_CONNECT_SHARE)),
+        (
+            "CLOSE_FLUSH_TIMEOUT",
+            millis(volto::shutdown::CLOSE_FLUSH_TIMEOUT),
+        ),
+        ("EXIT_SLACK", millis(volto::shutdown::EXIT_SLACK)),
+        (
             "DEFAULT_UDP_SESSION_TIMEOUT",
             (
-                volto::config::DEFAULT_UDP_SESSION_TIMEOUT,
-                Dimension::Seconds,
+                volto::config::DEFAULT_UDP_SESSION_TIMEOUT * 1000,
+                Dimension::Time,
             ),
         ),
         (
@@ -640,34 +670,50 @@ fn crate_constants() -> BTreeMap<&'static str, (u64, Dimension)> {
     ])
 }
 
+/// A time constant as the table holds it: whole milliseconds.
+fn millis(duration: std::time::Duration) -> (u64, Dimension) {
+    let millis = u64::try_from(duration.as_millis()).expect("a constant fits in u64 ms");
+    (millis, Dimension::Time)
+}
+
 /// What a constant counts, which decides the unit words a quote of it may use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dimension {
     Bytes,
-    Seconds,
+    /// Held in milliseconds, whatever unit the constant is declared in.
+    Time,
     /// Streams, chunks, descriptors or a multiplier: no unit at all.
     Count,
 }
 
 /// The units a quoted value may carry, the dimension each belongs to, and what
-/// each one multiplies by to reach the constant's own unit.
+/// each one multiplies by to reach the unit the table holds it in.
 ///
-/// The one time unit is `s`, because the one time constant is stored in
-/// seconds. A quote of it in `ms` or in minutes names another number, so those
-/// words are not units here and fail the gate.
-const UNITS: [(&str, Dimension, u64); 7] = [
+/// A time is quoted in `s` or `ms`. A quote in minutes, or a bare number, names
+/// another number, so those words are not units here and fail the gate.
+const UNITS: [(&str, Dimension, u64); 8] = [
     ("B", Dimension::Bytes, 1),
     ("KiB", Dimension::Bytes, 1024),
     ("MiB", Dimension::Bytes, 1024 * 1024),
     ("GiB", Dimension::Bytes, 1024 * 1024 * 1024),
     ("kB", Dimension::Bytes, 1_000),
     ("MB", Dimension::Bytes, 1_000_000),
-    ("s", Dimension::Seconds, 1),
+    ("ms", Dimension::Time, 1),
+    ("s", Dimension::Time, 1_000),
 ];
 
 /// The words the pages write after a unitless number, which are prose rather
 /// than a unit. Any other word after a number fails the gate.
-const NOUNS: [&str; 6] = ["of", "chunks", "descriptors", "times", "concurrent", "in"];
+const NOUNS: [&str; 8] = [
+    "of",
+    "chunks",
+    "descriptors",
+    "times",
+    "concurrent",
+    "in",
+    "entries",
+    "handshakes",
+];
 
 /// The number a quote carries and the word after it, which may be empty.
 ///
@@ -699,8 +745,8 @@ fn value_in_own_unit(number: u64, word: &str, dimension: Dimension) -> Result<u6
         Some((unit, unit_dimension, _)) => Err(format!(
             "`{unit}` is a unit of {unit_dimension:?}, and the constant is in {dimension:?}"
         )),
-        None if dimension == Dimension::Seconds => Err(format!(
-            "a time is quoted in `s`, and this quote is followed by {word:?}"
+        None if dimension == Dimension::Time => Err(format!(
+            "a time is quoted in `s` or `ms`, and this quote is followed by {word:?}"
         )),
         None if word.is_empty() || NOUNS.contains(&word) => Ok(number),
         None => Err(format!(

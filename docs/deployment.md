@@ -802,8 +802,8 @@ transfers already in flight. Raise it if long transfers matter more to you than
 a few seconds of failed requests at each restart.
 
 The tunnels get one grace period. After it, the endpoint gets
-`CLOSE_FLUSH_TIMEOUT` (1 s) to flush its CLOSE, and then a name lookup still
-running on the blocking pool gets `EXIT_SLACK` (1 s) more, because
+`CLOSE_FLUSH_TIMEOUT` = 1 s to flush its CLOSE, and then a name lookup still
+running on the blocking pool gets `EXIT_SLACK` = 1 s more, because
 `getaddrinfo` cannot be cancelled. Past that the process exits with the lookup
 still running; nothing is left to read its answer. So the exit takes at most
 `shutdown_grace + CLOSE_FLUSH_TIMEOUT + EXIT_SLACK`, which is

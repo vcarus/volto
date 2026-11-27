@@ -38,7 +38,7 @@ const _: () = assert!(!EXIT_SLACK.is_zero());
 /// How long the endpoint waits for its `CONNECTION_CLOSE` frames to be flushed
 /// at step 4. With the grace period before it and [`EXIT_SLACK`] after it, this
 /// makes the exit bound: `shutdown_grace + CLOSE_FLUSH_TIMEOUT + EXIT_SLACK`.
-pub(crate) const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+pub const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 // Added to a grace period an operator may set to zero, and the drain that
 // precedes it may equally have nothing to wait for. At zero a shutdown would
