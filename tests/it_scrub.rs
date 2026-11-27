@@ -3,50 +3,51 @@
 //! This repository is public, and the development notes it grew out of are not:
 //! they carry a private identity, a production topology, real addresses and
 //! ports, and prose in another script. `dev_docs/` is gitignored, but that only
-//! stops the obvious mistake — a quoted line pasted into a comment, a doc
-//! copied to `docs/`, a commit made from the wrong file is exactly as
-//! irreversible once it is pushed (GitHub keeps caches and forks). Until now the
-//! only defence was remembering to grep.
+//! stops the obvious mistake. A quoted line pasted into a comment, a doc copied
+//! to `docs/`, or a commit made from the wrong file is irreversible once it is
+//! pushed (GitHub keeps caches and forks).
 //!
-//! Two checks over `git ls-files`, each over the path of every tracked file as
+//! The gate scans what the next commit can carry: the working copy of every
+//! file git tracks or would add (`git ls-files --cached --others
+//! --exclude-standard`), and the staged copy of every file whose index entry
+//! differs from its working copy. Ignored files, `dev_docs/` and `CLAUDE.md`
+//! among them, are outside it. Two checks run over the path of each file as
 //! well as its contents:
 //!
 //! * CJK characters and the scripts written alongside them, which are
 //!   self-describing and can be spelled out here as escapes, so this file stays
-//!   clean of them itself. A tracked file must be UTF-8, because text in a
-//!   legacy CJK encoding never is; the one exception is a file whose extension
-//!   is on [`BINARY_EXTENSIONS`].
+//!   clean of them itself. A file must be UTF-8, because text in a legacy CJK
+//!   encoding never is; the one exception is a file whose extension is on
+//!   [`BINARY_EXTENSIONS`].
 //! * A list of private literals, which cannot be written down in a public
 //!   repository at all. They come from outside the tree: `VOLTO_SCRUB_PATTERNS`
 //!   (`|`-separated, from a repository secret in CI) and, on the dev host, the
 //!   gitignored `dev_docs/scrub-patterns.txt`. They are searched for in the raw
-//!   bytes of every file, binary ones included, without regard to ASCII letter
-//!   case. Matches are reported by file and line with the pattern *redacted*:
-//!   CI logs are public too.
+//!   bytes of every file, binary ones included, without regard to ASCII
+//!   letter case. Matches are reported by file and line with the pattern *redacted*: CI logs
+//!   are public too.
 //!
-//! With neither source present the literal check simply does not run, which is
-//! the right outcome for a fork or a checkout without the notes — with one
-//! exception. On a push to the canonical repository the secret is supposed to be
-//! there, and a run that finds it missing must say so loudly rather than pass
-//! with the gate half open: a renamed or expired secret would otherwise turn the
-//! whole check into a no-op without anyone noticing. The same push fails when
-//! `git ls-files` fails or lists fewer than [`TRACKED_FLOOR`] files, which
-//! would otherwise turn both checks into a pass.
-
-// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
-// allow: the counting is over the tree this file scans.
-#![allow(clippy::as_conversions)]
+//! The presence of `dev_docs/` marks the dev host, the one place where the gate
+//! runs before a push. There every way the gate could stop short fails the
+//! test: a missing or empty word list, a `git` that fails, a listing shorter
+//! than [`TRACKED_FLOOR`], or a listed file that cannot be read. A push to the
+//! canonical repository fails the same way, since the secret must be there.
+//! Anywhere else (a fork, a pull request, a fresh clone) the word list does not
+//! exist, so the literal check is skipped and the CJK check still runs.
 
 #[path = "common/scripts.rs"]
 mod scripts;
 
+use std::collections::BTreeSet;
 use std::fs;
+use std::io::ErrorKind;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-use scripts::repo_root;
+use scripts::{Scratch, repo_root, scratch_tree};
 
-/// Ranges that no tracked file may contain.
+/// Ranges that no scanned file may contain.
 ///
 /// Hangul Jamo and its two extensions, the enclosed alphanumerics (the circled
 /// digits used as markers in notes), the whole CJK run from the radicals
@@ -94,29 +95,74 @@ fn the_cjk_ranges_cover_the_blocks_around_the_ideographs() {
     }
 }
 
-/// The extensions of the tracked files that are not text. Their contents are
-/// still searched for the private literals, as raw bytes; only the UTF-8
-/// requirement and the CJK check of the contents skip them, because compressed
-/// data decodes into CJK characters by chance.
+/// The extensions of the files that are not text. Their contents are still
+/// searched for the private literals, as raw bytes; only the UTF-8 requirement
+/// and the CJK check of the contents skip them, because compressed data
+/// decodes into CJK characters by chance.
 const BINARY_EXTENSIONS: [&str; 1] = ["png"];
 
-/// Fewer tracked files than this is a listing that went wrong, not a tree.
-/// The tree tracks about 150.
+/// Fewer listed files than this is a listing that went wrong, not a tree.
 const TRACKED_FLOOR: usize = 100;
 
-/// One tracked file: its path as git lists it, and its contents.
-struct Tracked {
+/// The word list on the dev host, a path `CLAUDE.md` fixes.
+const WORD_LIST: &str = "dev_docs/scrub-patterns.txt";
+
+/// Where the gate runs and what it is told.
+struct Gate<'a> {
+    root: &'a Path,
+    /// The `|`-separated literals of `VOLTO_SCRUB_PATTERNS`, when it is set.
+    env_patterns: Option<String>,
+    /// Whether this is a push to the canonical repository in CI.
+    canonical_push: bool,
+    floor: usize,
+}
+
+impl Gate<'_> {
+    /// The gate over this checkout, as CI or the dev host runs it.
+    fn here(root: &Path) -> Gate<'_> {
+        Gate {
+            root,
+            env_patterns: std::env::var("VOLTO_SCRUB_PATTERNS").ok(),
+            canonical_push: is_push_to_canonical_repository(),
+            floor: TRACKED_FLOOR,
+        }
+    }
+
+    fn dev_host(&self) -> bool {
+        self.root.join("dev_docs").is_dir()
+    }
+
+    /// Whether a gate that cannot run fails the test rather than skipping.
+    fn must_run(&self) -> bool {
+        self.dev_host() || self.canonical_push
+    }
+}
+
+/// Whether this is GitHub Actions running a `push` in the repository that owns
+/// the secret.
+///
+/// Only there is an empty pattern list a failure away from the dev host: a fork
+/// has no secret, and a pull request, Dependabot's included, runs without
+/// repository secrets by design, so both fall back to the CJK check alone.
+fn is_push_to_canonical_repository() -> bool {
+    std::env::var("GITHUB_EVENT_NAME").as_deref() == Ok("push")
+        && std::env::var("GITHUB_REPOSITORY").as_deref() == Ok("vcarus/volto")
+}
+
+/// One file the next commit can carry: its path as git lists it, and each copy
+/// of its contents the commit could take.
+struct Listed {
     /// The path as UTF-8, with anything invalid replaced, for messages and the
     /// CJK check.
     path: String,
     /// The path's raw bytes, for the literal check.
     path_bytes: Vec<u8>,
-    /// The contents, or `None` when the file cannot be read, as when it is
-    /// deleted in the working tree and not yet in the index.
-    bytes: Option<Vec<u8>>,
+    /// The working copy and the staged copy, each with its label. Empty for a
+    /// directory, which is another repository's.
+    copies: Vec<(&'static str, Vec<u8>)>,
 }
 
-impl Tracked {
+impl Listed {
     fn is_binary(&self) -> bool {
         Path::new(&self.path)
             .extension()
@@ -127,75 +173,244 @@ impl Tracked {
                     .any(|known| extension.eq_ignore_ascii_case(known))
             })
     }
+
+    /// `path` for a working copy, `path (staged)` for the index's.
+    fn name(&self, label: &str) -> String {
+        if label.is_empty() {
+            self.path.clone()
+        } else {
+            format!("{} ({label})", self.path)
+        }
+    }
 }
 
-/// The tracked files, or `None` when there is no usable git checkout here.
-///
-/// On a push to the canonical repository a failed or implausibly short listing
-/// fails the test instead, because there the checkout is supposed to be whole.
-fn tracked_files(root: &Path) -> Option<Vec<Tracked>> {
-    let output = Command::new("git")
-        .args(["ls-files", "-z"])
-        .current_dir(root)
-        .output();
-
-    let listed = match output {
+/// Runs `git` in `root` and returns its standard output.
+fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    match Command::new("git").args(args).current_dir(root).output() {
         Ok(output) if output.status.success() => Ok(output.stdout),
         Ok(output) => Err(format!(
-            "`git ls-files` failed ({})",
+            "`git {}` failed ({})",
+            args.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         )),
         Err(error) => Err(format!("git is not available ({error})")),
-    };
-    let paths: Vec<Vec<u8>> = match listed {
-        Ok(stdout) => stdout
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect(),
-        Err(reason) => {
-            assert!(
-                !is_push_to_canonical_repository(),
-                "the scrub gate cannot list the tree on a push to the canonical \
-                 repository: {reason}"
-            );
-            eprintln!("skipping the scrub gate: {reason}");
-            return None;
-        }
-    };
-
-    if paths.len() < TRACKED_FLOOR {
-        assert!(
-            !is_push_to_canonical_repository(),
-            "`git ls-files` listed {} files on a push to the canonical repository, \
-             fewer than the {TRACKED_FLOOR} a whole checkout has",
-            paths.len()
-        );
-        eprintln!(
-            "skipping the scrub gate: `git ls-files` listed {} files, fewer than {TRACKED_FLOOR}",
-            paths.len()
-        );
-        return None;
     }
-
-    Some(
-        paths
-            .into_iter()
-            .map(|path_bytes| {
-                let path = String::from_utf8_lossy(&path_bytes).into_owned();
-                let bytes = fs::read(root.join(&path)).ok();
-                Tracked {
-                    path,
-                    path_bytes,
-                    bytes,
-                }
-            })
-            .collect(),
-    )
 }
 
-/// Whether the line `haystack` contains `needle`. Both are already in ASCII
-/// lower case, which is how the literal check ignores letter case.
+/// The NUL-separated paths of a `-z` listing.
+fn paths_of(stdout: &[u8]) -> BTreeSet<Vec<u8>> {
+    stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// What the next commit can carry, `Ok(None)` when the gate is skipped here,
+/// and `Err` when it cannot run where it must.
+fn listing(gate: &Gate) -> Result<Option<Vec<Listed>>, String> {
+    let skip_or_fail = |reason: String| {
+        if gate.must_run() {
+            Err(reason)
+        } else {
+            eprintln!("skipping the scrub gate: {reason}");
+            Ok(None)
+        }
+    };
+    let listed = git(
+        gate.root,
+        &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    );
+    let changed = git(gate.root, &["diff", "--name-only", "-z"]);
+    let (paths, changed) = match (listed, changed) {
+        (Ok(listed), Ok(changed)) => (paths_of(&listed), paths_of(&changed)),
+        (Err(reason), _) | (_, Err(reason)) => return skip_or_fail(reason),
+    };
+    if paths.len() < gate.floor {
+        return skip_or_fail(format!(
+            "`git ls-files` listed {} files, fewer than the {} a whole checkout has",
+            paths.len(),
+            gate.floor
+        ));
+    }
+
+    let mut files = Vec::new();
+    for path_bytes in paths {
+        let path = String::from_utf8_lossy(&path_bytes).into_owned();
+        let on_disk = gate.root.join(&path);
+        let mut copies = Vec::new();
+        let working = match fs::symlink_metadata(&on_disk) {
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Ok(meta) if meta.is_dir() => Ok(None),
+            _ => fs::read(&on_disk).map(Some),
+        };
+        match working {
+            Ok(Some(bytes)) => copies.push(("", bytes)),
+            Ok(None) => {}
+            Err(error) => {
+                if gate.must_run() {
+                    return Err(format!("{path} cannot be read: {error}"));
+                }
+                eprintln!("the scrub gate skips {path}: {error}");
+            }
+        }
+        if changed.contains(&path_bytes) {
+            match git(gate.root, &["show", &format!(":{path}")]) {
+                Ok(bytes) => copies.push(("staged", bytes)),
+                Err(reason) if gate.must_run() => return Err(reason),
+                Err(reason) => eprintln!("the scrub gate skips the staged {path}: {reason}"),
+            }
+        }
+        files.push(Listed {
+            path,
+            path_bytes,
+            copies,
+        });
+    }
+    Ok(Some(files))
+}
+
+/// Adds a literal unless it is empty or already known.
+fn push_pattern(patterns: &mut Vec<String>, candidate: &str) {
+    let candidate = candidate.trim();
+    if !candidate.is_empty() && !patterns.iter().any(|known| known == candidate) {
+        patterns.push(candidate.to_string());
+    }
+}
+
+/// The literals to look for, from outside the tree, in lower case. Never
+/// printed anywhere.
+///
+/// On the dev host the word list must exist and name at least one literal, and
+/// on a push to the canonical repository the secret must; anywhere else an
+/// empty list skips the literal check.
+fn scrub_patterns(gate: &Gate) -> Result<Vec<String>, String> {
+    let mut patterns: Vec<String> = Vec::new();
+    if let Some(from_env) = &gate.env_patterns {
+        for candidate in from_env.split('|') {
+            push_pattern(&mut patterns, candidate);
+        }
+    }
+
+    if gate.dev_host() {
+        let from_file = fs::read_to_string(gate.root.join(WORD_LIST))
+            .map_err(|error| format!("{WORD_LIST} cannot be read on the dev host: {error}"))?;
+        let entries: Vec<&str> = from_file
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .collect();
+        if entries.is_empty() {
+            return Err(format!("{WORD_LIST} names no literal"));
+        }
+        for entry in entries {
+            push_pattern(&mut patterns, entry);
+        }
+    }
+
+    if patterns.is_empty() && gate.canonical_push {
+        return Err("no scrub patterns on a push to the canonical repository: the \
+                    VOLTO_SCRUB_PATTERNS secret is missing or empty"
+            .to_owned());
+    }
+    Ok(patterns.iter().map(|pattern| pattern.to_ascii_lowercase()).collect())
+}
+
+/// Every CJK character in a path or in the text of a file, and every file that
+/// is neither UTF-8 nor binary by its extension.
+fn cjk_violations(files: &[Listed]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for file in files {
+        for (column, ch) in file.path.chars().enumerate() {
+            if is_cjk(ch) {
+                violations.push(format!(
+                    "{} (in the path, column {}) U+{:04X}",
+                    file.path,
+                    column + 1,
+                    u32::from(ch)
+                ));
+            }
+        }
+
+        for (label, bytes) in &file.copies {
+            let name = file.name(label);
+            let text = match std::str::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) if file.is_binary() => continue,
+                Err(error) => {
+                    violations.push(format!(
+                        "{name}: not UTF-8 ({error}), and its extension is not one of \
+                         {BINARY_EXTENSIONS:?}"
+                    ));
+                    continue;
+                }
+            };
+            for (number, line) in text.lines().enumerate() {
+                for (column, ch) in line.chars().enumerate() {
+                    if is_cjk(ch) {
+                        violations.push(format!(
+                            "{name}:{}:{} U+{:04X}",
+                            number + 1,
+                            column + 1,
+                            u32::from(ch)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    violations
+}
+
+/// Every occurrence of one of `patterns` (already in lower case) in a path or
+/// in the bytes of a file, with the pattern redacted.
+fn literal_violations(files: &[Listed], patterns: &[String]) -> Vec<String> {
+    // Redacted on purpose: this output can end up in a public CI log. The file
+    // and line are enough to find a match.
+    let redacted = |index: usize, pattern: &str| {
+        format!("pattern #{}, len {}", index + 1, pattern.chars().count())
+    };
+
+    let mut violations = Vec::new();
+    for file in files {
+        let path = lowered(&file.path_bytes);
+        for (index, pattern) in patterns.iter().enumerate() {
+            if contains(&path, pattern) {
+                violations.push(format!(
+                    "{} (in the path, {})",
+                    file.path,
+                    redacted(index, pattern)
+                ));
+            }
+        }
+
+        // A binary file has no lines, and the number is then only a way to
+        // find the match.
+        for (label, bytes) in &file.copies {
+            let name = file.name(label);
+            let bytes = lowered(bytes);
+            for (number, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+                for (index, pattern) in patterns.iter().enumerate() {
+                    if contains(line, pattern) {
+                        violations.push(format!(
+                            "{name}:{} ({})",
+                            number + 1,
+                            redacted(index, pattern)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    violations
+}
+
+/// `bytes` with its ASCII letters in lower case. A name written with a
+/// capital in a heading is the same private literal as the entry in the list.
+fn lowered(bytes: &[u8]) -> Vec<u8> {
+    bytes.to_ascii_lowercase()
+}
+
+/// Whether the line `haystack` contains `needle`.
 ///
 /// A line that is UTF-8 is searched as text, which is much faster than a
 /// byte-by-byte scan over a tree this size; any other line is scanned.
@@ -208,98 +423,17 @@ fn contains(haystack: &[u8], needle: &str) -> bool {
     }
 }
 
-/// Adds a literal unless it is empty or already known.
-fn push_pattern(patterns: &mut Vec<String>, candidate: &str) {
-    let candidate = candidate.trim();
-    if !candidate.is_empty() && !patterns.iter().any(|known| known == candidate) {
-        patterns.push(candidate.to_string());
-    }
-}
-
-/// The literals to look for, from outside the tree. Never printed anywhere.
-fn scrub_patterns(root: &Path) -> Vec<String> {
-    let mut patterns: Vec<String> = Vec::new();
-
-    if let Ok(from_env) = std::env::var("VOLTO_SCRUB_PATTERNS") {
-        for candidate in from_env.split('|') {
-            push_pattern(&mut patterns, candidate);
-        }
-    }
-
-    // Gitignored, and present only on the dev host.
-    if let Ok(from_file) = fs::read_to_string(root.join("dev_docs/scrub-patterns.txt")) {
-        for line in from_file.lines() {
-            if line.trim_start().starts_with('#') {
-                continue;
-            }
-            push_pattern(&mut patterns, line);
-        }
-    }
-
-    patterns
-}
-
-/// Whether this is GitHub Actions running a `push` in the repository that owns
-/// the secret.
-///
-/// Only there is an empty pattern list a failure: a fork has no secret, and a
-/// pull request — including Dependabot's — runs without repository secrets by
-/// design, so both legitimately fall back to the CJK check alone.
-fn is_push_to_canonical_repository() -> bool {
-    std::env::var("GITHUB_EVENT_NAME").as_deref() == Ok("push")
-        && std::env::var("GITHUB_REPOSITORY").as_deref() == Ok("vcarus/volto")
-}
-
-/// Public repository, English only: no CJK anywhere in the tracked tree, in a
-/// path or in a file, and no file in an encoding the check cannot read.
+/// Public repository, English only: no CJK anywhere the next commit can carry,
+/// in a path or in a file, and no file in an encoding the check cannot read.
 #[test]
 fn no_tracked_file_contains_cjk_characters() {
     let root = repo_root();
-    let Some(files) = tracked_files(&root) else {
+    let Some(files) = listing(&Gate::here(&root)).unwrap_or_else(|reason| panic!("{reason}"))
+    else {
         return;
     };
 
-    let mut violations = Vec::new();
-    for file in &files {
-        let path = &file.path;
-        for (column, ch) in path.chars().enumerate() {
-            if is_cjk(ch) {
-                violations.push(format!(
-                    "{path} (in the path, column {}) U+{:04X}",
-                    column + 1,
-                    ch as u32
-                ));
-            }
-        }
-
-        let Some(bytes) = &file.bytes else {
-            continue;
-        };
-        let text = match std::str::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_) if file.is_binary() => continue,
-            Err(error) => {
-                violations.push(format!(
-                    "{path}: not UTF-8 ({error}), and its extension is not one of \
-                     {BINARY_EXTENSIONS:?}"
-                ));
-                continue;
-            }
-        };
-        for (number, line) in text.lines().enumerate() {
-            for (column, ch) in line.chars().enumerate() {
-                if is_cjk(ch) {
-                    violations.push(format!(
-                        "{path}:{}:{} U+{:04X}",
-                        number + 1,
-                        column + 1,
-                        ch as u32
-                    ));
-                }
-            }
-        }
-    }
-
+    let violations = cjk_violations(&files);
     assert!(
         violations.is_empty(),
         "tracked files must be English only ({} occurrence(s)):\n{}",
@@ -312,73 +446,155 @@ fn no_tracked_file_contains_cjk_characters() {
 #[test]
 fn no_tracked_file_contains_a_private_literal() {
     let root = repo_root();
-    let Some(files) = tracked_files(&root) else {
+    let gate = Gate::here(&root);
+    let patterns = scrub_patterns(&gate).unwrap_or_else(|reason| panic!("{reason}"));
+    let Some(files) = listing(&gate).unwrap_or_else(|reason| panic!("{reason}")) else {
         return;
     };
-
-    let patterns = scrub_patterns(&root);
     if patterns.is_empty() {
-        assert!(
-            !is_push_to_canonical_repository(),
-            "no scrub patterns available on a push to the canonical repository: the \
-             VOLTO_SCRUB_PATTERNS secret is missing or empty, so the private-literal \
-             gate did not run"
-        );
-        eprintln!(
-            "no scrub patterns available (set VOLTO_SCRUB_PATTERNS or provide \
-             dev_docs/scrub-patterns.txt); only the CJK check ran"
-        );
+        eprintln!("no scrub patterns here, so only the CJK check ran");
         return;
     }
 
-    // Redacted on purpose: this output can end up in a public CI log. The file
-    // and line are enough to find a match.
-    let redacted = |index: usize, pattern: &str| {
-        format!("pattern #{}, len {}", index + 1, pattern.chars().count())
-    };
-
-    // ASCII letters compare without regard to case: a name written with a
-    // capital in a heading is the same private literal as the entry in the list.
-    let lowered: Vec<String> = patterns.iter().map(|p| p.to_ascii_lowercase()).collect();
-
-    let mut violations = Vec::new();
-    for file in &files {
-        let path = &file.path;
-        let path_bytes = file.path_bytes.to_ascii_lowercase();
-        for (index, pattern) in lowered.iter().enumerate() {
-            if contains(&path_bytes, pattern) {
-                violations.push(format!(
-                    "{path} (in the path, {})",
-                    redacted(index, pattern)
-                ));
-            }
-        }
-
-        // Raw bytes, so a file that is not UTF-8 is searched like any other. A
-        // binary file has no lines, and the number is then only a way to find
-        // the match.
-        let Some(bytes) = &file.bytes else {
-            continue;
-        };
-        let bytes = bytes.to_ascii_lowercase();
-        for (number, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
-            for (index, pattern) in lowered.iter().enumerate() {
-                if contains(line, pattern) {
-                    violations.push(format!(
-                        "{path}:{} ({})",
-                        number + 1,
-                        redacted(index, pattern)
-                    ));
-                }
-            }
-        }
-    }
-
+    let violations = literal_violations(&files, &patterns);
     assert!(
         violations.is_empty(),
         "tracked files must not carry private literals ({} occurrence(s), \
          patterns redacted):\n{}",
         violations.len(),
         violations.join("\n")
+    );
+}
+
+/// A literal made up for the tests of the gate itself. It is in no word list.
+const MADE_UP_LITERAL: &str = "Quorbleflax";
+
+/// A scratch git repository in which `.gitignore` names `dev_docs/` and
+/// `ignored.txt`, as the real one names its private files, and `tracked.txt`
+/// is staged.
+fn scratch_repository(name: &str) -> Scratch {
+    let root = scratch_tree("scrub", name, &[]);
+    git(&root, &["init", "-q"]).expect("git init must work in a scratch directory");
+    fs::write(root.join(".gitignore"), "dev_docs/\nignored.txt\n").expect("write .gitignore");
+    fs::write(root.join("tracked.txt"), "nothing to see\n").expect("write a tracked file");
+    git(&root, &["add", ".gitignore", "tracked.txt"]).expect("git add");
+    root
+}
+
+/// The gate over a scratch repository, with no secret and a floor of one.
+fn scratch_gate(root: &Path) -> Gate<'_> {
+    Gate {
+        root,
+        env_patterns: None,
+        canonical_push: false,
+        floor: 1,
+    }
+}
+
+/// The gate finds a literal in a file not yet added and in a file staged with
+/// it and then edited, and does not read an ignored file.
+#[test]
+fn the_gate_scans_what_the_next_commit_can_carry() {
+    let root = scratch_repository("next-commit");
+    fs::create_dir(root.join("dev_docs")).expect("create dev_docs");
+    fs::write(
+        root.join(WORD_LIST),
+        format!("# a comment\n{}\n", MADE_UP_LITERAL.to_uppercase()),
+    )
+    .expect("write the word list");
+    fs::write(root.join("untracked.txt"), format!("a {MADE_UP_LITERAL}\n")).expect("untracked");
+    fs::write(root.join("staged.txt"), format!("x\nthe {MADE_UP_LITERAL}\n")).expect("staged");
+    git(&root, &["add", "staged.txt"]).expect("git add");
+    fs::write(root.join("staged.txt"), "x\nedited away\n").expect("edit the staged file");
+    fs::write(root.join("ignored.txt"), MADE_UP_LITERAL).expect("ignored");
+
+    let gate = scratch_gate(&root);
+    let patterns = scrub_patterns(&gate).expect("the word list names a literal");
+    let files = listing(&gate)
+        .expect("the scratch repository can be listed")
+        .expect("the dev host never skips");
+    let violations = literal_violations(&files, &patterns);
+
+    assert_eq!(
+        violations,
+        [
+            "staged.txt (staged):2 (pattern #1, len 11)",
+            "untracked.txt:1 (pattern #1, len 11)",
+        ],
+        "the untracked and the staged copy must be caught, the ignored file not read"
+    );
+}
+
+/// On the dev host each way the gate could stop short is a failure.
+#[test]
+fn on_the_dev_host_the_gate_fails_rather_than_skips() {
+    let root = scratch_repository("dev-host");
+    fs::create_dir(root.join("dev_docs")).expect("create dev_docs");
+    let gate = scratch_gate(&root);
+
+    let missing = scrub_patterns(&gate).expect_err("a missing word list must fail");
+    assert!(missing.contains(WORD_LIST), "{missing}");
+    fs::write(root.join(WORD_LIST), "# only a comment\n\n").expect("write the word list");
+    let empty = scrub_patterns(&gate).expect_err("a word list with no literal must fail");
+    assert!(empty.contains("names no literal"), "{empty}");
+
+    // A file deleted from the working copy is not an error; its staged copy is
+    // what the next commit carries, and it is read.
+    fs::write(root.join("deleted.txt"), "staged text\n").expect("write");
+    git(&root, &["add", "deleted.txt"]).expect("git add");
+    fs::remove_file(root.join("deleted.txt")).expect("delete the working copy");
+    let files = listing(&gate)
+        .expect("a deleted working copy is not an error")
+        .expect("the dev host never skips");
+    let deleted = files
+        .iter()
+        .find(|file| file.path == "deleted.txt")
+        .expect("the deleted file is still listed");
+    assert_eq!(deleted.copies, [("staged", b"staged text\n".to_vec())]);
+
+    let locked = root.join("locked.txt");
+    fs::write(&locked, "text\n").expect("write");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))
+        .expect("chmod 000");
+    // Root reads a file of mode 000, so this case has nothing to show there.
+    if fs::read(&locked).is_err() {
+        let unreadable = listing(&gate).err().expect("an unreadable file must fail");
+        assert!(unreadable.contains("locked.txt cannot be read"), "{unreadable}");
+    }
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o644))
+        .expect("chmod 644");
+
+    let not_a_repository = scratch_tree("scrub", "dev-host-no-git", &["dev_docs"]);
+    let failed = listing(&scratch_gate(&not_a_repository))
+        .err()
+        .expect("a git that fails must fail the gate");
+    assert!(failed.contains("git"), "{failed}");
+
+    let short = Gate {
+        floor: 100,
+        ..scratch_gate(&root)
+    };
+    let few = listing(&short).err().expect("a short listing must fail");
+    assert!(few.contains("fewer than the 100"), "{few}");
+}
+
+/// Away from the dev host the word-list part is skipped and nothing fails for
+/// its absence, while the CJK check still runs and still finds a hit.
+#[test]
+fn away_from_the_dev_host_only_the_word_list_part_is_skipped() {
+    let root = scratch_repository("no-dev-host");
+    fs::write(root.join("notes.md"), "a note \u{3002}\n").expect("write");
+    let gate = scratch_gate(&root);
+
+    assert_eq!(scrub_patterns(&gate), Ok(Vec::new()));
+    let files = listing(&gate)
+        .expect("the scratch repository can be listed")
+        .expect("a listing that works is scanned");
+    assert_eq!(cjk_violations(&files), ["notes.md:1:8 U+3002"]);
+
+    let not_a_repository = scratch_tree("scrub", "no-dev-host-no-git", &[]);
+    assert!(
+        matches!(listing(&scratch_gate(&not_a_repository)), Ok(None)),
+        "without dev_docs a git that fails skips the gate"
     );
 }
