@@ -1,4 +1,4 @@
-//! M1: TCP CONNECT tunnels (RFC 9114 §4.4) and request dispatch.
+//! TCP CONNECT tunnels (RFC 9114 §4.4) and request dispatch.
 
 mod common;
 
@@ -379,13 +379,12 @@ async fn target_reset_becomes_h3_connect_error() {
 /// The client keeps uploading and does not read the tunnel while it does, which
 /// parks the write pump in `write_all` and the read pump in
 /// `send_data_in_place` — so when the RST lands only the write pump is in a
-/// position to see it. It used to stop the client's sending side and then
-/// simply return, dropping the writer, and a dropped `quinn::SendStream`
-/// finishes rather than resets: the response direction ended in a clean FIN.
-/// That is the truncation shape, and what an upload-shaped protocol through the
-/// tunnel would read as a complete response. RFC 9114 §4.4 rules it out — any
-/// error on the TCP connection, a received RST included, is a stream error of
-/// type H3_CONNECT_ERROR.
+/// position to see it. A dropped `quinn::SendStream` finishes rather than
+/// resets, so a pump that returned here would end the response direction with
+/// a clean FIN. That is the truncation shape, and what an upload-shaped
+/// protocol through the tunnel would read as a complete response. RFC 9114
+/// §4.4 rules it out: any error on the TCP connection, a received RST included,
+/// is a stream error of type H3_CONNECT_ERROR.
 #[tokio::test]
 async fn target_reset_during_a_client_upload_becomes_h3_connect_error() {
     let server = TestServer::start().await;
@@ -582,13 +581,10 @@ fn a_tunnel_ended_with_its_connection_resets_its_target() {
 /// a proxy SHOULD perform the same operation on the other direction in order to
 /// ensure that both directions of the stream are cancelled."
 ///
-/// A client that resets only its *sending* side used to have the response
-/// direction finished with a clean FIN, because a dropped `quinn::SendStream`
-/// finishes rather than resets — so whatever the target had still to say read to
-/// the client as a complete response rather than as a cancelled one. It is now
-/// reset with H3_REQUEST_CANCELLED, RFC 9114 §8.1's "The request or its response
-/// (including pushed response) is cancelled", and the target still sees the RST
-/// the same paragraph of §4.4 asks for.
+/// The response direction is reset with H3_REQUEST_CANCELLED, RFC 9114 §8.1's
+/// "The request or its response (including pushed response) is cancelled",
+/// because a dropped `quinn::SendStream` would finish it; and the target still
+/// sees the RST the same paragraph of §4.4 asks for.
 #[tokio::test]
 async fn a_client_reset_cancels_the_response_direction_too() {
     let server = TestServer::start().await;
@@ -623,10 +619,9 @@ async fn a_client_reset_cancels_the_response_direction_too() {
 /// The other half of the same sentence: a client that aborts *reading* must have
 /// its own sending direction cancelled with an HTTP/3 code.
 ///
-/// Left to the `Reader` being dropped, quinn stops the peer with code 0 — so the
-/// two halves of one cancelled request ended under two different verdicts. The
-/// server notices the client's STOP_SENDING when it next writes to the response
-/// direction, which is what the echoed byte below arranges.
+/// Left to the `Reader` being dropped, quinn would stop the peer with code 0.
+/// The server notices the client's STOP_SENDING when it next writes to the
+/// response direction, which is what the echoed byte below arranges.
 ///
 /// Driven on a raw QUIC stream because the shared client has no way to abort
 /// reading while keeping its sending side open, which is precisely the shape
@@ -791,11 +786,7 @@ fn park_both_pumps(
 /// A teardown must not wait behind a write to a target that stopped reading.
 ///
 /// RFC 9114 §4.4: "if a proxy detects an error with the stream or the QUIC
-/// connection, it MUST close the TCP connection." With the write outside the
-/// pump's `select!`, that close waited for `write_all` to finish — which, on a
-/// target that never reads, is never: the client's STOP_SENDING was noticed by
-/// the other pump, the teardown was raised, and nothing acted on it, so the
-/// target socket stayed open for the life of the process.
+/// connection, it MUST close the TCP connection."
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_abort_closes_a_target_that_stopped_reading() {
     let server = TestServer::start().await;
@@ -826,13 +817,11 @@ async fn a_client_abort_closes_a_target_that_stopped_reading() {
 ///
 /// RFC 9114 §4.4 names both in one sentence — "If the proxy detects that the
 /// client has reset the stream or aborted reading from the stream, it MUST
-/// close the TCP connection" — and only the second half was detected. A reset
-/// reaches the proxy as an error on a *read* of the request stream, and with
-/// both pumps parked in writes nobody was reading: the client → target pump sat
-/// in `write_all` on a target that never reads, the target → client pump sat in
-/// `send_data_in_place` on a client that never reads, and neither ever looked
-/// again. The target socket, its file descriptor and the tunnel slot were held
-/// for the life of the QUIC connection.
+/// close the TCP connection". A reset reaches the proxy as an error on a *read*
+/// of the request stream, and with both pumps parked in writes nobody is
+/// reading: the client → target pump sits in `write_all` on a target that never
+/// reads, and the target → client pump sits in `send_data_in_place` on a client
+/// that never reads.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_reset_closes_a_target_that_stopped_reading() {
     let server = TestServer::start().await;
@@ -891,13 +880,9 @@ async fn spawn_mute_target() -> SocketAddr {
 /// signal a client has for "I am done with this request". The FIN ends the
 /// client → target pump — by design, it raises no teardown — so the only pump
 /// left is target → client, parked in a read of a target that will never speak.
-/// Nothing in that `select!` watched the request stream, so the `STOP_SENDING`
-/// was never seen:
 ///
 /// RFC 9114 §4.4: "If the proxy detects that the client has reset the stream or
-/// aborted reading from the stream, it MUST close the TCP connection." The
-/// target socket, its file descriptor and the tunnel slot were held for the life
-/// of the QUIC connection instead.
+/// aborted reading from the stream, it MUST close the TCP connection."
 ///
 /// The slot is what the leak is measured by, because it is what a leak costs a
 /// real client: with room for one tunnel, the next CONNECT is refused until the
@@ -950,13 +935,12 @@ async fn a_clean_client_close_still_reaches_the_target_as_eof() {
     );
 }
 
-/// A one-second bound on a stalled write in a half-closed tunnel.
+/// The one-second bound on a stalled write in a half-closed tunnel, as a
+/// duration for the tests that have to out-wait it.
 ///
 /// It is `[limits] udp_session_timeout`, which a CONNECT-UDP session's idle
-/// bound also comes from; one second is the smallest the config layer accepts.
-const HALF_CLOSED_TIMEOUT: &str = "[limits]\nudp_session_timeout = 1\n";
-
-/// The same number as a duration, for the tests that have to out-wait it.
+/// bound also comes from, and `TestServer::start_with_udp_timeout(1)` sets it;
+/// one second is the smallest the config layer accepts.
 const HALF_CLOSED_BUDGET: Duration = Duration::from_secs(1);
 
 /// How long the tests below give a bound of one second to fire.
@@ -990,11 +974,8 @@ const CHUNKLESS_WINDOW: u32 = 4 * 1024;
 /// has already put a FIN on this socket: the first read returns a clean EOF that
 /// says nothing about the ending, and what the test is waiting for is the error
 /// a later one fails with. A tunnel closed politely never produces that error,
-/// and a test hunting an abortive close ends in the timeout it was given. That
-/// FIN also decides where the error can arrive at all: it leaves the proxy's
-/// socket in FIN_WAIT_2, and only a stack that resets from there (macOS) sends
-/// the RST this reports — on Linux the report never comes, and the caller must
-/// not wait for it.
+/// and a test hunting an abortive close ends in the timeout it was given. On
+/// Linux the report never comes; see the caller.
 async fn spawn_quiet_burst_target(
     burst: usize,
 ) -> (SocketAddr, tokio::sync::mpsc::Receiver<std::io::ErrorKind>) {
@@ -1040,26 +1021,19 @@ async fn spawn_quiet_burst_target(
 /// The clean FIN ends the client → target pump through the one arm that raises
 /// no teardown, which is what leaves the surviving direction unwatched: it
 /// parks in `send_data_in_place` as soon as the client's flow-control window is
-/// spent, and nothing is left to raise a teardown that would end that wait. The
-/// target socket, its file descriptor and the tunnel slot were held until the
-/// QUIC connection ended — which this server's own keep-alives can postpone
-/// indefinitely.
+/// spent, and nothing is left to raise a teardown that would end that wait.
 ///
-/// Both halves of the cut are asserted where they are observable: the client
-/// sees its response direction cancelled rather than finished everywhere, so
-/// the download it abandoned cannot read back as a complete one, and on a stack
-/// that sends a reset from FIN_WAIT_2 (macOS) the target sees the connection go
-/// away *abortively*, the way the mirror test below asserts it. The reset is
-/// the half that needs arranging — see [`spawn_quiet_burst_target`] for why a
-/// flooding target produces one by accident and so pins nothing, and the
-/// comment at the assertion for why Linux never delivers it on this path.
+/// The client-side reset is asserted everywhere and the target-side reset only
+/// where the stack sends one; the comment at the assertion says why. See
+/// [`spawn_quiet_burst_target`] for why a flooding target produces a reset by
+/// accident and so pins nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_half_closed_tunnel_whose_client_stops_reading_is_cut() {
     /// Over [`CHUNKLESS_WINDOW`] so the write parks, inside one loopback
     /// segment and one relay read so nothing of it is left unread.
     const BURST: usize = 8 * 1024;
 
-    let server = TestServer::start_with(&format!("{HALF_CLOSED_TIMEOUT}{ALLOW_PRIVATE}")).await;
+    let server = TestServer::start_with_udp_timeout(1).await;
     let (target, mut ended) = spawn_quiet_burst_target(BURST).await;
     let mut transport = quinn::TransportConfig::default();
     transport.stream_receive_window(CHUNKLESS_WINDOW.into());
@@ -1166,7 +1140,7 @@ async fn a_tunnel_whose_client_has_not_finished_survives_a_long_stall() {
     /// proxy really is parked in `send_data_in_place` during the stall below.
     const TOTAL: usize = 4 * 1024 * 1024;
 
-    let server = TestServer::start_with(&format!("{HALF_CLOSED_TIMEOUT}{ALLOW_PRIVATE}")).await;
+    let server = TestServer::start_with_udp_timeout(1).await;
     let target = spawn_bounded_flood_target(TOTAL).await;
     let mut client = H3Client::connect(&server).await;
 
@@ -1206,13 +1180,13 @@ async fn a_half_closed_tunnel_survives_a_download_taken_in_sips() {
     const TOTAL: usize = 4 * 1024 * 1024;
     /// How much is taken before each pause. Comfortably over one relay chunk,
     /// so the write the pause interrupted always completes when reading
-    /// resumes -- the floor the module doc describes.
+    /// resumes -- the floor `src/tunnel/tcp.rs`'s module doc describes.
     const SIP: usize = 256 * 1024;
     /// The pause between sips: under the budget, and sixteen of them are over
     /// five of it.
     const PAUSE: Duration = Duration::from_millis(400);
 
-    let server = TestServer::start_with(&format!("{HALF_CLOSED_TIMEOUT}{ALLOW_PRIVATE}")).await;
+    let server = TestServer::start_with_udp_timeout(1).await;
     let target = spawn_bounded_flood_target(TOTAL).await;
     let mut client = H3Client::connect(&server).await;
 
@@ -1305,7 +1279,7 @@ async fn spawn_eof_then_deaf_target() -> (
 /// than cancelled, and the target socket is closed with a reset.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_target_that_stops_reading_after_its_own_eof_is_cut() {
-    let server = TestServer::start_with(&format!("{HALF_CLOSED_TIMEOUT}{ALLOW_PRIVATE}")).await;
+    let server = TestServer::start_with_udp_timeout(1).await;
     let (target, look, mut ended) = spawn_eof_then_deaf_target().await;
     let client = H3Client::connect(&server).await;
 
@@ -1392,10 +1366,8 @@ async fn the_target_of_a_200_the_peer_will_not_take_is_reset_too() {
 /// client has reset the stream or aborted reading from the stream, it MUST
 /// close the TCP connection. [...] In all these cases, if the underlying TCP
 /// implementation permits it, the proxy SHOULD send a TCP segment with the RST
-/// bit set." A 200 that failed outright used to make `tcp::run` return without the
-/// reset, so a target that had already accepted the connection was told it was
-/// finished politely (review L8). `the_target_of_a_200_the_peer_will_not_take_is_reset_too`
-/// above is the other half, where the write lapses rather than fails.
+/// bit set." `the_target_of_a_200_the_peer_will_not_take_is_reset_too` above is
+/// the other half, where the write lapses rather than fails.
 ///
 /// Driven on a raw QUIC stream: the shared client has no way to abort reading a
 /// response it has not read, and that is what makes the server's write of the
@@ -1429,27 +1401,6 @@ async fn a_200_that_fails_aborts_the_target_connection() {
     );
 }
 
-#[tokio::test]
-async fn refuses_a_target_that_is_not_listening() {
-    let server = TestServer::start().await;
-    let target = closed_address().await;
-    let mut client = H3Client::connect(&server).await;
-
-    let response = respond_to(&mut client, connect_request(&target.to_string())).await;
-
-    // RFC 9114 §4.4: failure to establish the connection is reported with a
-    // non-2xx status, not a stream reset.
-    assert_eq!(response.status, Status::BAD_GATEWAY);
-
-    // RFC 9209 §2.1.2: the refusal names the hop that refused it, as a
-    // structured field String. Only failures to reach a target carry it.
-    assert_eq!(
-        proxy_status(&response),
-        Some(format!("volto; error=connection_refused; next-hop=\"{target}\"").as_str()),
-        "the refusal must name the address that refused the connection"
-    );
-}
-
 /// A refusal ends the request stream, so a client reading the answer to its end
 /// reaches one.
 ///
@@ -1467,14 +1418,20 @@ async fn a_refusal_ends_the_request_stream() {
 
     let (response, mut stream) =
         send_and_respond(&mut client, connect_request(&target.to_string())).await;
+
+    // RFC 9114 §4.4: failure to establish the connection is reported with a
+    // non-2xx status, not a stream reset.
     assert_eq!(response.status, Status::BAD_GATEWAY);
 
-    match tokio::time::timeout(TIMEOUT, stream.recv_data()).await {
-        Ok(Ok(None)) => {}
-        Ok(Ok(Some(_))) => panic!("a refusal has no body to deliver"),
-        Ok(Err(error)) => panic!("a refused request stream must end cleanly, not as {error:?}"),
-        Err(_) => panic!("the refused request stream was left open with nothing left to come"),
-    }
+    // RFC 9209 §2.1.2: the refusal names the hop that refused it, as a
+    // structured field String. Only failures to reach a target carry it.
+    assert_eq!(
+        proxy_status(&response),
+        Some(format!("volto; error=connection_refused; next-hop=\"{target}\"").as_str()),
+        "the refusal must name the address that refused the connection"
+    );
+
+    ends_with_no_body(&mut stream, "the 502 for a port nobody listens on").await;
 }
 
 /// Arms an address that black-holes SYNs, in the only portable way there is.
@@ -1489,7 +1446,8 @@ async fn a_refusal_ends_the_request_stream() {
 /// Returns the address, the connections holding the queue full, and the listener
 /// — all three must stay alive for the address to keep black-holing. `None`
 /// means this kernel does not behave that way, and the caller should skip rather
-/// than fail: a differently tuned host must not make the suite red.
+/// than fail: a differently tuned host must not make the suite red. The skip's
+/// reason is printed here.
 async fn arm_a_blackholed_address() -> Option<(SocketAddr, Vec<TcpStream>, TcpListener)> {
     let socket = TcpSocket::new_v4().ok()?;
     socket
@@ -1504,12 +1462,16 @@ async fn arm_a_blackholed_address() -> Option<(SocketAddr, Vec<TcpStream>, TcpLi
             // The queue has room still; keep the connection so it stays taken.
             Ok(Ok(held)) => holding.push(held),
             // Refused rather than dropped: this kernel does not black-hole.
-            Ok(Err(_)) => return None,
+            Ok(Err(_)) => break,
             // A SYN that draws no answer at all: the queue is full.
             Err(_) => return Some((addr, holding, listener)),
         }
     }
 
+    eprintln!(
+        "skipping: this kernel does not drop SYNs for a full accept queue, so no black-holed \
+         address can be arranged"
+    );
     None
 }
 
@@ -1519,10 +1481,6 @@ async fn arm_a_blackholed_address() -> Option<(SocketAddr, Vec<TcpStream>, TcpLi
 #[tokio::test]
 async fn a_black_holed_target_is_refused_when_the_connect_budget_expires() {
     let Some((blackhole, _holding, _listener)) = arm_a_blackholed_address().await else {
-        eprintln!(
-            "skipping: this kernel does not drop SYNs for a full accept queue, so no \
-             black-holed address can be arranged"
-        );
         return;
     };
 
@@ -1565,21 +1523,14 @@ async fn a_black_holed_target_is_refused_when_the_connect_budget_expires() {
 /// RFC 9114 §4.4 has the proxy close the TCP connection when it "detects an
 /// error with the stream or the QUIC connection". A request that is still
 /// connecting has no tunnel yet, so nothing in it watches the connection, and
-/// only the connection's own task can end it. A detached request task outlived
-/// its connection by the whole connect budget. It held the half-open socket, the
-/// tunnel slot and the connection's state, and no per-connection bound counted
-/// any of them. The budget here is far longer than the test, so only the end of
-/// the connection can end the request.
+/// only the connection's own task can end it. The budget here is far longer
+/// than the test, so only the end of the connection can end the request.
 ///
 /// The proxy runs on a runtime of its own, so that its live tasks are counted
 /// apart from the client's and the target's.
 #[tokio::test]
 async fn a_request_still_connecting_ends_with_its_connection() {
     let Some((blackhole, _holding, _listener)) = arm_a_blackholed_address().await else {
-        eprintln!(
-            "skipping: this kernel does not drop SYNs for a full accept queue, so no \
-             black-holed address can be arranged"
-        );
         return;
     };
 
@@ -1652,13 +1603,12 @@ async fn refuses_an_authority_without_a_port() {
     ends_with_no_body(&mut stream, "the 400 for an authority without a port").await;
 }
 
-/// A bracket that did not open the authority is not part of a host (review M3).
+/// A bracket that did not open the authority is not part of a host.
 ///
 /// RFC 3986 gives "[" and "]" to the IP-literal form alone, but they are legal
 /// *characters* in an authority, so the codec passes them through and the split
-/// is where the shape is judged. Until it did, `127.0.0.1]:P` opened a tunnel to
-/// `127.0.0.1:P` -- the resolver took the bracket off on its way past -- so the
-/// connection went somewhere the request log did not name.
+/// is where the shape is judged. Passed through, `127.0.0.1]:P` would reach
+/// `127.0.0.1:P`, a target the request log does not name.
 #[tokio::test]
 async fn refuses_an_authority_with_a_stray_bracket() {
     let server = TestServer::start().await;
@@ -1686,8 +1636,8 @@ async fn refuses_an_authority_with_a_stray_bracket() {
 /// Table-driven over every route a request can be dispatched to and over every
 /// field RFC 9110 §7.6.1 names, because the rule is about the *message*: it
 /// cannot depend on which tunnel the request asked for, on whether this server
-/// implements that tunnel at all, or on whether the sender has authenticated
-/// (review M4). Each route is exercised with a clean request first, so a 400
+/// implements that tunnel at all, or on whether the sender has authenticated.
+/// Each route is exercised with a clean request first, so a 400
 /// cannot be some other refusal wearing the same status.
 #[tokio::test]
 async fn refuses_connection_specific_fields() {
@@ -1754,7 +1704,7 @@ async fn refuses_connection_specific_fields() {
 
     // And before the credentials check, not after it: the rule is about the
     // message, so an unauthenticated peer must be told what is wrong with its
-    // request rather than that it should have signed it (review M4).
+    // request rather than that it should have signed it.
     let guarded = TestServer::start_with(&format!(
         "{ALLOW_PRIVATE}{}",
         common::auth_section(&[("user1", "s3cret")])
@@ -1916,12 +1866,10 @@ async fn a_trailer_section_on_a_live_tunnel_ends_the_connection() {
 /// the stream or the QUIC connection, it MUST close the TCP connection", on the
 /// one path where the tunnel is torn down before it ever carried a byte.
 ///
-/// Two guards can answer this and the test holds both, which a mutation check
-/// (2026-08-29) is what established: with `frame::misplaced` made to allow
-/// HEADERS on a tunnel, the frame is buffered and handed on, and the arm in
-/// `Reader::recv_data` its own comment calls unreachable repeats the verdict.
-/// That arm is load-bearing after all, so nothing here should be narrowed to the
-/// first guard alone.
+/// Two guards answer this, `frame::misplaced` and the `Item::Frame` arm of
+/// `body_piece` in `src/h3/stream.rs`. With the first made to allow HEADERS on
+/// a tunnel, the second still gives the same verdict, so the test must not be
+/// narrowed to the first.
 ///
 /// Driven on a raw stream because the shared client cannot write a second HEADERS
 /// frame before it has read the response.
