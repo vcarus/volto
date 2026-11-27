@@ -1348,10 +1348,9 @@ pub async fn read_datagram(
 /// one.
 ///
 /// The capsule fallback's counterpart to [`recv_datagram`], and it checks the
-/// same thing for the same reason: RFC 9297 §2.1 carries an HTTP Datagram under
-/// a Context ID, and RFC 9298 §5 gives a UDP payload exactly one, so a capsule
-/// under any other context is not a packet from the target whatever else it may
-/// be. That assertion is a protocol requirement rather than scaffolding, which
+/// same thing for the same reason: RFC 9298 §4 reserves Context ID 0 for UDP
+/// payloads and §5 encodes them under it, so a capsule under any other context
+/// is not a packet from the target. That assertion is a protocol requirement rather than scaffolding, which
 /// is the class D66 says travels up with the helper.
 ///
 /// `None` means the decoder needs more bytes, not that the stream ended, so a
