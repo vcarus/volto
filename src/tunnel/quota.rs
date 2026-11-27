@@ -499,24 +499,20 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_for_idle_resolves_when_the_last_slot_goes() {
-        let quota = Arc::new(Quota::new(4));
+        let quota = Quota::new(4);
         let slot = quota.acquire().expect("slot");
 
-        // Still busy: the wait must not resolve yet. The sleep is what lets
-        // the spawned waiter run before it is looked at.
-        let idle = quota.clone();
-        let waiter = tokio::spawn(async move { idle.wait_until_idle().await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Still busy: one poll of the wait must find it pending.
+        let mut waiter = std::pin::pin!(quota.wait_until_idle());
         assert!(
-            !waiter.is_finished(),
+            crate::tunnel::poll_once(waiter.as_mut()).is_none(),
             "the wait resolved while a slot was held"
         );
 
         drop(slot);
         tokio::time::timeout(Duration::from_secs(5), waiter)
             .await
-            .expect("idle within the timeout")
-            .expect("waiter task");
+            .expect("idle within the timeout");
     }
 
     /// Watching for idle must not *take* the budget it is watching.
