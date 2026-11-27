@@ -9,7 +9,7 @@
 # existing /target ignore rule and removed by `cargo clean` -- and the two
 # slow pieces are cached there between runs: the self-signed certificate is
 # reused until within an hour of expiry, and the aioquic virtualenv is rebuilt
-# only when requirements.txt changes.
+# only when requirements.txt changes or the virtualenv no longer imports.
 #
 # A second volto process runs beside the first, with an ECH key and
 # `require_ech = true`, for the masque-go ECH case (ech_test.go); its
@@ -75,15 +75,26 @@ export VOLTO_ECH_CONFIG VOLTO_ECH_OTHER_CONFIG
 # without a single packet being sent.
 (cd "$ROOT/tests/interop" && go test -v -count=1 -timeout 120s ./...)
 
-# aioquic, in a virtualenv rebuilt only when its requirements change.
+# aioquic, in a virtualenv rebuilt when its requirements change or when it no
+# longer imports. Where no wheel fits the local Python, pip builds cryptography
+# from source and links it to the system OpenSSL; removing that OpenSSL breaks
+# the import, and a rebuild is the repair.
 VENV="$WORK/venv"
 REQS="$ROOT/tests/interop/aioquic/requirements.txt"
 STAMP="$VENV/.requirements.sha256"
 if [ ! -x "$VENV/bin/python" ] \
-    || ! shasum -a 256 -c "$STAMP" --status 2>/dev/null; then
+    || ! shasum -a 256 -c "$STAMP" --status 2>/dev/null \
+    || ! "$VENV/bin/python" -c 'import aioquic.h3.connection' 2>/dev/null; then
     rm -rf "$VENV"
     python3 -m venv "$VENV"
-    "$VENV/bin/pip" install --quiet -r "$REQS"
+    # A source build finds OpenSSL through OPENSSL_DIR or pkg-config. MacPorts
+    # installs OpenSSL 4 outside the pkg-config path, so it is named here
+    # unless the caller set OPENSSL_DIR.
+    if [ -z "${OPENSSL_DIR:-}" ] && [ -d /opt/local/libexec/openssl4 ]; then
+        export OPENSSL_DIR=/opt/local/libexec/openssl4
+    fi
+    # No cache: a cached wheel can be linked to the OpenSSL that was removed.
+    "$VENV/bin/pip" install --quiet --no-cache-dir -r "$REQS"
     shasum -a 256 "$REQS" > "$STAMP"
 fi
 "$VENV/bin/python" "$ROOT/tests/interop/aioquic/interop_test.py"
