@@ -48,30 +48,50 @@ use scripts::repo_root;
 
 /// Ranges that no tracked file may contain.
 ///
-/// The enclosed alphanumerics (the circled digits used as markers in notes),
-/// Hangul Jamo, the whole CJK run from the symbols and punctuation block
-/// through the compatibility block (so kana, Bopomofo, enclosed CJK forms and
-/// the like are all inside it), the three common ideograph blocks including the
-/// compatibility ideographs, Hangul syllables, fullwidth/halfwidth forms, and
-/// the supplementary ideograph planes — so the check covers the scripts the
-/// notes are written in, their neighbours and their markers, not only Han
-/// characters.
-const CJK_RANGES: [(char, char); 9] = [
+/// Hangul Jamo and its two extensions, the enclosed alphanumerics (the circled
+/// digits used as markers in notes), the whole CJK run from the radicals
+/// through the compatibility block (Kangxi radicals, ideographic description
+/// characters, symbols and punctuation, kana, Bopomofo and enclosed CJK forms
+/// are all inside it), the ideograph blocks and the compatibility ideographs,
+/// Hangul syllables, the vertical and compatibility forms, fullwidth and
+/// halfwidth forms, the enclosed ideographic supplement, and the ideographs of
+/// planes 2 and 3. So the check covers the scripts the notes are written in,
+/// their neighbours and their markers, not only Han characters.
+const CJK_RANGES: [(char, char); 13] = [
     ('\u{1100}', '\u{11ff}'),
     ('\u{2460}', '\u{24ff}'),
-    ('\u{3000}', '\u{33ff}'),
+    ('\u{2e80}', '\u{33ff}'),
     ('\u{3400}', '\u{4dbf}'),
     ('\u{4e00}', '\u{9fff}'),
-    ('\u{ac00}', '\u{d7af}'),
+    ('\u{a960}', '\u{a97f}'),
+    ('\u{ac00}', '\u{d7ff}'),
     ('\u{f900}', '\u{faff}'),
+    ('\u{fe10}', '\u{fe1f}'),
+    ('\u{fe30}', '\u{fe4f}'),
     ('\u{ff00}', '\u{ffef}'),
-    ('\u{20000}', '\u{2fa1f}'),
+    ('\u{1f200}', '\u{1f2ff}'),
+    ('\u{20000}', '\u{323af}'),
 ];
 
 fn is_cjk(ch: char) -> bool {
     CJK_RANGES
         .iter()
         .any(|(first, last)| ch >= *first && ch <= *last)
+}
+
+/// One character of each block around the ideographs that the check covers,
+/// and two that it must not flag: a letter and the emoji variation selector.
+#[test]
+fn the_cjk_ranges_cover_the_blocks_around_the_ideographs() {
+    for ch in [
+        '\u{2e80}', '\u{2f00}', '\u{2ff0}', '\u{a960}', '\u{d7b0}', '\u{fe10}', '\u{fe30}',
+        '\u{1f200}', '\u{30000}',
+    ] {
+        assert!(is_cjk(ch), "U+{:04X} must count as CJK", u32::from(ch));
+    }
+    for ch in ['a', '\u{fe0f}'] {
+        assert!(!is_cjk(ch), "U+{:04X} is not CJK", u32::from(ch));
+    }
 }
 
 /// The extensions of the tracked files that are not text. Their contents are
