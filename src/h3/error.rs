@@ -439,8 +439,8 @@ mod tests {
         assert_eq!(Code::QPACK_DECOMPRESSION_FAILED.value(), 0x200);
     }
 
-    /// The grading in `quic/mod.rs` reads the connection close log off this
-    /// text, and `it_close_log` asserts the peer-close line names the variant.
+    /// `it_close_log` asserts that the WARN line for a peer close names the
+    /// variant, which an operator greps for.
     #[test]
     fn a_peer_application_close_names_itself() {
         let error = ConnectionError::from(quinn::ConnectionError::ApplicationClosed(
