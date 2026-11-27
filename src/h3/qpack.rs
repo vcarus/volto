@@ -715,18 +715,23 @@ mod tests {
         }
     }
 
-    /// The example RFC 7541 §5.1 works through: 1337 in a five-bit prefix is
-    /// `31, 154, 10`. This codec has no five-bit prefix, but the algorithm is
-    /// the same one, so the check is worth having on a width it does use.
+    /// The three examples of RFC 7541 Appendix C.1, encoded and decoded. This
+    /// codec uses no five-bit prefix, but the algorithm is the same at every
+    /// width.
     #[test]
-    fn prefixed_integers_match_the_rfc_encoding() {
-        let mut buf = BytesMut::new();
-        put_int(&mut buf, 7, 0, 1337);
-        assert_eq!(&buf[..], &[127, 186, 9]);
+    fn prefixed_integers_match_the_rfc_examples() {
+        for (prefix_bits, value, wire) in [
+            (5, 10, &[10][..]),
+            (5, 1337, &[31, 154, 10][..]),
+            (8, 42, &[42][..]),
+        ] {
+            let mut buf = BytesMut::new();
+            put_int(&mut buf, prefix_bits, 0, value);
+            assert_eq!(&buf[..], wire, "{value} in a {prefix_bits}-bit prefix");
 
-        let mut buf = BytesMut::new();
-        put_int(&mut buf, 8, 0, 42);
-        assert_eq!(&buf[..], &[42]);
+            let decoded = Reader::new(wire).take_int(prefix_bits).expect("decodes");
+            assert_eq!(decoded, (0, value), "{value} in a {prefix_bits}-bit prefix");
+        }
     }
 
     /// The whole of a 200 response to a CONNECT: prefix, then one byte.
