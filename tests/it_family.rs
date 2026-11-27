@@ -8,21 +8,16 @@
 //!
 //! The environment decides whether this is testable at all: `localhost` must
 //! resolve to both families and `::1` must be bindable. Both hold on the macOS
-//! development host; some Linux CI images ship neither, so the tests skip with a
-//! reason instead of failing there.
+//! development host, which must stay green, so a missing premise fails there.
+//! Some Linux CI images ship neither, so the tests skip with a reason there.
 //!
-//! Only the default half of each test is discriminating everywhere. A resolver
-//! that follows RFC 6724 lists `::1` before `127.0.0.1`, as the macOS host's
-//! does, and on such a host the `ipv6` half reaches the IPv6 target whether the
-//! server moves IPv6 first or leaves the list as it arrived. There it shows
-//! that the IPv6 path works end to end, and the reordering itself is pinned by
-//! the `the_ipv6_preference_puts_ipv6_first` unit test in `src/net.rs`. On a
-//! resolver that lists IPv4 first, the `ipv6` half is discriminating too.
+//! Both halves of each test are discriminating on any resolver: the server asks
+//! for the preferred family first, one family at a time (`net::Family`), so the
+//! order `getaddrinfo` would have given decides nothing.
 
 mod common;
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::panic::Location;
 
 use common::{
@@ -150,17 +145,24 @@ fn tag_through_udp_tunnel(server: &TestServer, port: u16) -> impl Future<Output 
     }
 }
 
-/// Why the environment cannot run these tests.
+/// Reports that this host cannot run `test`, and fails on macOS.
 ///
-/// One message per reason, so a skip in CI says which half was missing.
-fn skip_reason(dual_stack: bool) -> &'static str {
-    if dual_stack {
+/// One message per reason, so a skip in CI says which premise was missing.
+/// These two tests are the only wire-level coverage `ip_family_preference` has,
+/// and a skip prints only under `--nocapture`, so on the platform that must stay
+/// green a missing premise is a failure rather than a skip.
+fn skip_or_fail(test: &str, dual_stack: bool) {
+    let reason = if dual_stack {
         "could not bind the same port on both 127.0.0.1 and ::1 (no IPv6 loopback, or every \
          port tried was already taken)"
     } else {
         "`localhost` does not resolve to both address families here, so there is no family \
          choice for the proxy to make"
+    };
+    if cfg!(target_os = "macos") {
+        panic!("{test}: {reason}; this is the platform that must stay green");
     }
+    eprintln!("skipping {test}: {reason}");
 }
 
 /// The TCP tunnel walks the resolved list in order, so the preference decides
@@ -175,10 +177,7 @@ async fn connect_dials_the_preferred_family_first() {
     };
 
     let Some((v4, v6, port)) = listeners else {
-        eprintln!(
-            "skipping connect_dials_the_preferred_family_first: {}",
-            skip_reason(dual_stack)
-        );
+        skip_or_fail("connect_dials_the_preferred_family_first", dual_stack);
         return;
     };
 
@@ -195,8 +194,6 @@ async fn connect_dials_the_preferred_family_first() {
     );
     drop(server);
 
-    // Discriminating only on a resolver that lists IPv4 first; see the module
-    // doc.
     let server = TestServer::start_with(&format!("{IPV6_FIRST}{ALLOW_PRIVATE}")).await;
     assert_eq!(
         tag_through_tcp_tunnel(&server, port).await,
@@ -218,9 +215,9 @@ async fn connect_udp_binds_a_socket_to_the_preferred_family() {
     };
 
     let Some((v4, v6, port)) = sockets else {
-        eprintln!(
-            "skipping connect_udp_binds_a_socket_to_the_preferred_family: {}",
-            skip_reason(dual_stack)
+        skip_or_fail(
+            "connect_udp_binds_a_socket_to_the_preferred_family",
+            dual_stack,
         );
         return;
     };
@@ -236,59 +233,10 @@ async fn connect_udp_binds_a_socket_to_the_preferred_family() {
     );
     drop(server);
 
-    // Discriminating only on a resolver that lists IPv4 first; see the module
-    // doc.
     let server = TestServer::start_with(&format!("{IPV6_FIRST}{ALLOW_PRIVATE}")).await;
     assert_eq!(
         tag_through_udp_tunnel(&server, port).await,
         V6_TAG,
         "ip_family_preference = \"ipv6\" must bind a socket to the IPv6 target"
-    );
-}
-
-/// The premise of the two tests above, latched on the platform that has to
-/// hold it.
-///
-/// The two wire tests return early with an `eprintln!` when the host cannot
-/// host the experiment, and an `eprintln!` from a passing test is invisible
-/// under `cargo test` without `--nocapture`. They are the only wire-level
-/// coverage `ip_family_preference` has, so a premise that quietly stops holding
-/// everywhere would leave the knob shipping untested with every run still
-/// green. `it_scrub` answers the same shape with the canonical-repository latch
-/// in `no_tracked_file_contains_a_private_literal`; this is that latch.
-///
-/// It is a latch and not a proof of the preference: it fails when macOS, the
-/// platform CLAUDE.md requires to stay green, stops resolving `localhost` to
-/// both families, and says nothing about any other host. Linux CI images that
-/// ship one family are the reason it is not asserted everywhere.
-///
-/// The equality below is the weaker half and is kept for what it does check.
-/// `localhost_is_dual_stack` and the expression it is compared against are the
-/// same predicate, since a `SocketAddr` is either V4 or V6 and so "two distinct
-/// `is_ipv6` answers" and "one of each" cannot disagree over one list. What is
-/// left for it to catch is that the two run over separate `lookup_host` calls,
-/// so a resolver that answers differently twice in a row fails it.
-#[tokio::test]
-async fn the_environment_probe_agrees_with_the_resolver() {
-    let addresses: Vec<SocketAddr> = match tokio::net::lookup_host(("localhost", 443)).await {
-        Ok(addresses) => addresses.collect(),
-        Err(_) => Vec::new(),
-    };
-    let dual_stack = localhost_is_dual_stack().await;
-    assert_eq!(
-        dual_stack,
-        addresses.iter().any(SocketAddr::is_ipv4) && addresses.iter().any(SocketAddr::is_ipv6),
-        "two consecutive lookups of `localhost` disagreed about its address \
-         families: {addresses:?}"
-    );
-
-    #[cfg(target_os = "macos")]
-    assert!(
-        dual_stack,
-        "`localhost` no longer resolves to both address families on macOS, so \
-         `connect_dials_the_preferred_family_first` and \
-         `connect_udp_binds_a_socket_to_the_preferred_family` are now skipping \
-         silently on the platform that must stay green, and \
-         `ip_family_preference` has no wire coverage left anywhere: {addresses:?}"
     );
 }
