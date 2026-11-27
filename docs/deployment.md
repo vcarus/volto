@@ -269,7 +269,9 @@ three things the host needs:
   systemd unit and restarts. If the restart fails, which under `Type=notify`
   includes a server that never reports ready, or if the service is not running
   a few seconds later, both are restored, systemd is reloaded, the service is
-  restarted, and the script fails loudly. The unit is covered because it is
+  restarted, and the script fails loudly. A signal in that window (a Ctrl-C, an
+  SSH session that drops, a stop of the timer's service) restores both as well,
+  and the run fails. The unit is covered because it is
   refreshed on every update and carries the hardening directives an older host
   is most likely to reject.
 - **Already on that version**, with the config and the unit in place: it exits

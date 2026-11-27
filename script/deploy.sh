@@ -173,7 +173,7 @@ note() {
 }
 
 # Puts the previous binary and unit back, reloads systemd, runs `systemctl $1`
-# on the service, and ends the run. Both rollback paths of the update call it.
+# on the service, and ends the run. Every rollback path of the update calls it.
 #
 # The ERR trap over the swap window calls it with `start`. Before the health
 # check the service is normally still running the release it was running, or
@@ -186,10 +186,23 @@ note() {
 # which is the one being rolled back. `|| true` on both, so a failed reload or
 # start does not hide the failure `die` reports.
 #
+# A second argument `interrupted` means a signal ended the run inside the swap
+# window. The signal traps there call it with `start` until the restart is
+# issued and with `restart` from then on: systemd finishes a restart job whose
+# systemctl is gone, so the process it brings up may be the new release.
+#
+# The first line ignores INT, TERM, HUP and PIPE until the run ends, and the
+# commands it runs inherit that. A second Ctrl-C, or the HUP and TERM that
+# follow a dropped session or a stop of the timer's service, then cannot cut
+# the rollback short. A write to a terminal or a pipe that is gone fails
+# instead of killing the shell, and every write here comes after the files are
+# back.
+#
 # The binary and the unit go back together. A unit's .prev without a binary's,
 # from a host that had no executable binary, is not restored: it would put the
 # new binary under the old unit and report a rollback that did not happen.
 put_back() {
+    trap '' INT TERM HUP PIPE
     trap - ERR
     local restored=""
 
@@ -205,6 +218,11 @@ put_back() {
         systemctl "$1" "$SERVICE_NAME" || true
     fi
 
+    if [ "${2:-}" = interrupted ]; then
+        [ -n "$restored" ] ||
+            die "the run was interrupted while installing volto $VERSION and there was nothing to restore -- see: journalctl -u $SERVICE_NAME -e"
+        die "the run was interrupted while installing volto $VERSION; restored the previous $restored -- see: journalctl -u $SERVICE_NAME -e"
+    fi
     if [ "$1" = start ]; then
         [ -n "$restored" ] ||
             die "installing volto $VERSION failed and there was nothing to restore -- see: journalctl -u $SERVICE_NAME -e"
@@ -898,22 +916,29 @@ else
             install -m 0644 "$UNIT" "$UNIT.prev"
             note "previous unit kept at $UNIT.prev"
         fi
-        # Both `.prev` copies exist from here on, so every failure until the
-        # service answers is a failure put_back can undo. Without the trap,
-        # `set -e` would end the run with the new binary under the old unit, or
-        # with both new files and the service down. A command inside the `if`
-        # below is a tested command and does not fire the trap, which is what
-        # leaves the health check's rollback reachable for a service that comes
-        # up and then dies.
+        # Both `.prev` copies exist from here on. Until the health check passes,
+        # a failed command and a signal (INT, TERM, HUP) both run put_back,
+        # which puts both copies back. Without the ERR trap, `set -e` would end
+        # the run with the new binary under the old unit, or with both new
+        # files and the service down; without the signal traps, a Ctrl-C, a
+        # dropped SSH session or a stop of the timer's service would end it the
+        # same way. A signal that comes while put_back runs is ignored, so the
+        # rollback finishes. What nothing here can answer is a SIGKILL or a
+        # power loss. A command inside the
+        # `if` below is a tested command and does not fire the ERR trap, which
+        # is what leaves the health check's rollback reachable for a service
+        # that comes up and then dies.
         #
         # The binary is written beside its target and renamed over it, so the
         # name /usr/local/bin/volto holds the old file or the new one and never
         # a partial copy.
         trap 'put_back start' ERR
+        trap 'put_back start interrupted' INT TERM HUP
         install -m 0755 "$SRC/volto" "$BIN.new"
         mv -f "$BIN.new" "$BIN"
         install -m 0644 "$SRC/script/masque.service" "$UNIT"
         systemctl daemon-reload
+        trap 'put_back restart interrupted' INT TERM HUP
         systemctl restart "$SERVICE_NAME"
 
         # Under Type=notify a release that exits or never reports ready has
@@ -922,7 +947,7 @@ else
         # the service is not "active" again by now.
         sleep 3
         if systemctl is-active --quiet "$SERVICE_NAME"; then
-            trap - ERR
+            trap - ERR INT TERM HUP
             note "volto $VERSION is running"
         else
             put_back restart

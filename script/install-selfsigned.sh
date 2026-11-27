@@ -611,7 +611,10 @@ done
 # mode that follow them, and disarmed after the chmod block. Without it `set -e`
 # ends the run with the configured pair split, or with the new pair in place and
 # the key still root:root and mode 0600 from openssl's umask, which the next
-# restart cannot read.
+# restart cannot read. Armed on INT, TERM and HUP over the same steps, with the
+# argument `interrupted`, because a signal there splits the pair the same way.
+# Its first line ignores those signals and PIPE, for the reasons deploy.sh's
+# put_back gives.
 # A failure at the key backup leaves the old key with no certificate. A failure
 # at either move into place leaves the new certificate, or no certificate,
 # beside the old key's backup. The running service keeps the pair it loaded, so
@@ -621,26 +624,32 @@ done
 # one in a single rename, so the certificate path is not left empty while there
 # is an old certificate to restore.
 restore_previous_pair() {
+    trap '' INT TERM HUP PIPE
     trap - ERR
-    local restored="" removed=""
+    local restored="" removed="" outcome=failed
+    [ "${1:-}" != interrupted ] || outcome="was interrupted"
 
     # A new file with no previous one to give way to is removed. Leaving a new
     # key behind would put it beside a restored certificate it does not match,
     # or leave half a pair after a first install.
-    if [ -n "$key_backup" ]; then
+    #
+    # The swap names each backup and marks each placement before its rename,
+    # so a signal right after a rename finds it recorded. The files are looked
+    # for here, so a rename that failed or never ran is not taken as done.
+    if [ -n "$key_backup" ] && [ -e "$key_backup" ]; then
         if mv -f "$key_backup" "$KEY"; then
             restored="$KEY"
         fi
-    elif [ "$key_placed" -eq 1 ]; then
+    elif [ -z "$key_backup" ] && [ "$key_placed" -eq 1 ] && [ -e "$KEY" ]; then
         if rm -f "$KEY"; then
             removed="$KEY"
         fi
     fi
-    if [ -n "$cert_backup" ]; then
+    if [ -n "$cert_backup" ] && [ -e "$cert_backup" ]; then
         if mv -f "$cert_backup" "$CERT"; then
             restored="$CERT${restored:+ and $restored}"
         fi
-    elif [ "$cert_placed" -eq 1 ]; then
+    elif [ -z "$cert_backup" ] && [ "$cert_placed" -eq 1 ] && [ -e "$CERT" ]; then
         if rm -f "$CERT"; then
             removed="$CERT${removed:+ and $removed}"
         fi
@@ -648,13 +657,13 @@ restore_previous_pair() {
     rm -f "$CERT.new" "$KEY.new"
 
     if [ -n "$restored" ] && [ -n "$removed" ]; then
-        die "installing the new certificate failed; restored the previous $restored and removed the new $removed"
+        die "installing the new certificate $outcome; restored the previous $restored and removed the new $removed"
     elif [ -n "$restored" ]; then
-        die "installing the new certificate failed; restored the previous $restored"
+        die "installing the new certificate $outcome; restored the previous $restored"
     elif [ -n "$removed" ]; then
-        die "installing the new certificate failed; there was no previous pair to restore, and removed the new $removed"
+        die "installing the new certificate $outcome; there was no previous pair to restore, and removed the new $removed"
     fi
-    die "installing the new certificate failed before anything was moved into place"
+    die "installing the new certificate $outcome before anything was moved into place"
 }
 
 CERT_CHANGED=0
@@ -714,21 +723,22 @@ else
     cert_placed=0
     key_placed=0
     trap restore_previous_pair ERR
+    trap 'restore_previous_pair interrupted' INT TERM HUP
 
     if [ -f "$CERT" ]; then
-        mv "$CERT" "$CERT.$stamp.bak"
         cert_backup="$CERT.$stamp.bak"
+        mv "$CERT" "$cert_backup"
         if [ -f "$KEY" ]; then
-            mv "$KEY" "$KEY.$stamp.bak"
             key_backup="$KEY.$stamp.bak"
+            mv "$KEY" "$key_backup"
         fi
         note "backed up the previous certificate to $cert_backup"
     fi
 
-    mv "$CERT.new" "$CERT"
     cert_placed=1
-    mv "$KEY.new" "$KEY"
+    mv "$CERT.new" "$CERT"
     key_placed=1
+    mv "$KEY.new" "$KEY"
 
     note "generated a self-signed certificate for $SNI, valid $CERT_DAYS days"
 fi
@@ -739,7 +749,7 @@ chmod 0640 "$KEY"
 # The transaction is complete. restore_previous_pair removes the new pair and
 # restores the old one, so a kept-certificate run armed no trap and disarms
 # nothing here.
-trap - ERR
+trap - ERR INT TERM HUP
 
 # --- configuration ----------------------------------------------------------
 
@@ -772,8 +782,10 @@ fi
 
 # Puts back the binary and unit this run kept as .prev, reloads systemd, runs
 # `systemctl $1`, then ends the run. The ERR trap of the swap below calls it
-# with `start` and the health check with `restart`, as deploy.sh's put_back
-# does, for the reasons given there.
+# with `start`, the health check with `restart`, and the signal traps of the
+# swap with `start` or `restart` and `interrupted`, as deploy.sh's put_back
+# does, for the reasons given there. Its first line ignores INT, TERM, HUP and
+# PIPE, as there.
 #
 # As in deploy.sh, a run that replaced the binary puts the unit back only
 # together with the binary: a unit's .prev without a binary's, from a host
@@ -781,8 +793,10 @@ fi
 # A run that placed only the unit (the binary was kept) puts the unit back
 # alone, which is the pair the host had.
 put_back() {
+    trap '' INT TERM HUP PIPE
     trap - ERR
-    local restored=""
+    local restored="" outcome=failed
+    [ "${2:-}" != interrupted ] || outcome="was interrupted"
 
     rm -f "$BIN.new"
     if [ "$PLACE_BINARY" -eq 1 ]; then
@@ -799,8 +813,8 @@ put_back() {
     systemctl "$1" "$SERVICE_NAME" || true
 
     [ -n "$restored" ] ||
-        die "replacing the binary and unit failed and there was nothing to restore -- see: journalctl -u $SERVICE_NAME -e"
-    die "replacing the binary and unit failed; restored the previous $restored -- see: journalctl -u $SERVICE_NAME -e"
+        die "replacing the binary and unit $outcome and there was nothing to restore -- see: journalctl -u $SERVICE_NAME -e"
+    die "replacing the binary and unit $outcome; restored the previous $restored -- see: journalctl -u $SERVICE_NAME -e"
 }
 
 if [ "$HAD_CONFIG" -eq 1 ] && [ "$PLACE_BINARY" -eq 0 ] && [ "$PLACE_UNIT" -eq 0 ]; then
@@ -827,7 +841,10 @@ elif [ "$HAD_CONFIG" -eq 1 ]; then
     fi
     # The commands are written out here rather than in a function, because
     # this script does not set -E and a function would not inherit the trap.
+    # A signal until the health check passes runs put_back too: with `start`
+    # until the restart or start is issued, with `restart` from then on.
     trap 'put_back start' ERR
+    trap 'put_back start interrupted' INT TERM HUP
     if [ "$PLACE_BINARY" -eq 1 ]; then
         install -m 0755 "$BINARY" "$BIN.new"
         mv -f "$BIN.new" "$BIN"
@@ -836,6 +853,7 @@ elif [ "$HAD_CONFIG" -eq 1 ]; then
     [ "$PLACE_UNIT" -eq 0 ] || install -m 0644 "$UNIT_SRC" "$UNIT"
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    trap 'put_back restart interrupted' INT TERM HUP
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         systemctl restart "$SERVICE_NAME"
     else
@@ -845,7 +863,7 @@ elif [ "$HAD_CONFIG" -eq 1 ]; then
     # and then died reaches the else branch.
     sleep 3
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-        trap - ERR
+        trap - ERR INT TERM HUP
     else
         put_back restart
     fi

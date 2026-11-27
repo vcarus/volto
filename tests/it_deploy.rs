@@ -1723,6 +1723,14 @@ enum Service {
     RestartFails,
     /// `restart` succeeds and the health check finds the service inactive.
     DiesAfterRestart,
+    /// The first `daemon-reload` sends the named signal to the script, as a
+    /// Ctrl-C, a dropped SSH session or a stop of the timer's service does,
+    /// before the restart is issued. Everything else succeeds.
+    InterruptedBeforeRestart(&'static str),
+    /// Every `restart volto` sends the named signal to the script and then
+    /// succeeds, as systemd finishes a restart job whose `systemctl` is gone.
+    /// The rollback's own restart is signalled too.
+    InterruptedDuringRestart(&'static str),
 }
 
 /// How the binary inside a published release answers `--check-config`.
@@ -1755,6 +1763,8 @@ struct Host {
     release: PathBuf,
     staging: PathBuf,
     logs: PathBuf,
+    /// `TMPDIR` for the run, so a test can see what the run left behind.
+    tmp: PathBuf,
 }
 
 impl Host {
@@ -1772,6 +1782,7 @@ impl Host {
                 "release",
                 "staging",
                 "logs",
+                "tmp",
             ],
         );
         let host = Host {
@@ -1780,6 +1791,7 @@ impl Host {
             release: base.join("release"),
             staging: base.join("staging"),
             logs: base.join("logs"),
+            tmp: base.join("tmp"),
         };
 
         // `id -u volto` answers the uid in `logs/volto-uid`, or a uid no file
@@ -1812,9 +1824,23 @@ impl Host {
         );
 
         let (restart, active) = match service {
-            Service::ComesUp => (0, 0),
             Service::RestartFails => (1, 0),
             Service::DiesAfterRestart => (0, 1),
+            Service::ComesUp
+            | Service::InterruptedBeforeRestart(_)
+            | Service::InterruptedDuringRestart(_) => (0, 0),
+        };
+        // The stand-in is run by the script's own shell, so `$PPID` is the
+        // script.
+        let interrupt = match service {
+            Service::InterruptedBeforeRestart(signal) => format!(
+                "[ \"$*\" = daemon-reload ] && [ ! -e '{marker}' ] && : > '{marker}' && kill -{signal} \"$PPID\"\n",
+                marker = host.logs.join("interrupted").display(),
+            ),
+            Service::InterruptedDuringRestart(signal) => {
+                format!("[ \"$*\" = 'restart volto' ] && kill -{signal} \"$PPID\"\n")
+            }
+            _ => String::new(),
         };
         // `show` is a query, recorded apart from the calls that act on the
         // service so that every sequence asserted below stays the sequence of
@@ -1830,6 +1856,7 @@ impl Host {
                  \x20 'show -p EnvironmentFiles --value volto') printf '%s\\n' \"$*\" >> '{shown}'; cat '{files}' 2>/dev/null; exit 0 ;;\n\
                  esac\n\
                  printf '%s\\n' \"$*\" >> '{log}'\n\
+                 {interrupt}\
                  case \"$*\" in\n\
                  \x20 'restart volto') exit {restart} ;;\n\
                  \x20 'is-active --quiet volto') exit {active} ;;\n\
@@ -1998,6 +2025,7 @@ impl Host {
             .env("PATH", path_with_stubs(&self.stubs))
             .env("VOLTO_DEPLOY_ROOT", &self.root)
             .env("REPO", "example/volto")
+            .env("TMPDIR", &self.tmp)
             .env_remove("RUST_LOG")
             .env_remove("TAG")
             .env_remove("VOLTO_DEPLOY_CANDIDATE")
@@ -2016,6 +2044,7 @@ impl Host {
             .env("PATH", path_with_stubs(&self.stubs))
             .env("VOLTO_DEPLOY_ROOT", &self.root)
             .env("REPO", "example/volto")
+            .env("TMPDIR", &self.tmp)
             .env("RUST_LOG", rust_log)
             .env_remove("TAG")
             .env_remove("VOLTO_DEPLOY_CANDIDATE")
@@ -2311,6 +2340,84 @@ fn a_release_that_does_not_stay_up_is_rolled_back() {
         stderr.contains("volto 1.3.7 failed to start; rolled the binary and unit back to 1.3.6"),
         "the run must say what it rolled back and to which version: {stderr}"
     );
+}
+
+/// A signal inside the swap window rolls the update back as a failure there
+/// does, and the run still ends through its cleanup (S9-M1).
+///
+/// A Ctrl-C under `sudo volto-deploy`, the SIGHUP that sudo relays when an SSH
+/// session drops, and the SIGTERM that systemd sends when it stops the timer's
+/// service all reach the script. With the rollback armed on ERR alone, a signal
+/// after the binary was moved ended the run through the EXIT trap, which
+/// restores nothing, and left the new release installed with no health check.
+///
+/// Before the restart is issued the old process still serves, so the rollback
+/// starts the service, which leaves an active unit alone. Once the restart is
+/// issued, systemd finishes it without the script, and the process it brings up
+/// may be the new release, so the rollback restarts the service on the restored
+/// files. The stand-in signals the rollback's own restart as well, and the
+/// rollback must finish all the same. The exit status is the rollback's own,
+/// not a death by the signal, and `TMPDIR` is empty afterwards, so the EXIT
+/// trap ran.
+#[test]
+fn a_signal_inside_the_swap_window_rolls_the_update_back() {
+    const BEFORE: &str = "daemon-reload\ndaemon-reload\nstart volto\n";
+    const DURING: &str = "daemon-reload\nrestart volto\ndaemon-reload\nrestart volto\n";
+    for (n, (service, expected)) in [
+        (Service::InterruptedBeforeRestart("TERM"), BEFORE),
+        (Service::InterruptedBeforeRestart("INT"), BEFORE),
+        (Service::InterruptedDuringRestart("TERM"), DURING),
+        (Service::InterruptedDuringRestart("INT"), DURING),
+        (Service::InterruptedDuringRestart("HUP"), DURING),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let host = Host::new(&format!("interrupted-{n}"), service);
+        host.plant_install();
+        host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+        let previous_binary =
+            fs::read_to_string(host.bin()).expect("the planted binary must be readable");
+        let previous_unit =
+            fs::read_to_string(host.unit()).expect("the planted unit must be readable");
+
+        let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+
+        let stderr = stderr_of(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "case {n}: the run must end through the rollback with status 1: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(host.bin()).ok(),
+            Some(previous_binary),
+            "case {n}: the previous binary must be back in place: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(host.unit()).ok(),
+            Some(previous_unit),
+            "case {n}: the previous unit must be back in place: {stderr}"
+        );
+        assert_eq!(
+            host.calls("systemctl"),
+            expected,
+            "case {n}: the rollback must reload systemd and then start or restart: {stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "the run was interrupted while installing volto 1.3.7; restored the previous binary and unit"
+            ),
+            "case {n}: the run must say it was interrupted and what it restored: {stderr}"
+        );
+        let left: Vec<_> = fs::read_dir(&host.tmp)
+            .expect("the run's TMPDIR must be readable")
+            .collect();
+        assert!(
+            left.is_empty(),
+            "case {n}: the EXIT trap must remove the download directory: {left:?}"
+        );
+    }
 }
 
 /// The real update path asks the downloaded binary whether it can load this

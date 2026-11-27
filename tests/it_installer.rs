@@ -909,6 +909,100 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
     }
 }
 
+/// A signal during the certificate swap puts the previous pair back, as a
+/// failed rename does (S9-M1).
+///
+/// The stand-in `mv` makes its rename and then sends the signal to the script,
+/// on the call each case names. A Ctrl-C, the SIGHUP of a dropped session and a
+/// SIGTERM all ended the run there with the pair split, since only ERR was
+/// trapped. The rollback's own renames come later and are not signalled. The
+/// exit status is the rollback's, not a death by the signal.
+#[test]
+fn a_signal_during_the_certificate_swap_puts_the_previous_pair_back() {
+    let script = repo_root().join("script/install-selfsigned.sh");
+
+    for (signal_at, signal) in [(1, "TERM"), (2, "HUP"), (3, "INT"), (4, "TERM")] {
+        let root = scratch_tree(
+            "install",
+            &format!("swap-signal-at-{signal_at}"),
+            &["etc/volto", "usr/local/bin"],
+        );
+        let conf_dir = root.join("etc/volto");
+        let (cert, key) = plant_placeholder_certificates(&conf_dir);
+        let old_cert = fs::read(&cert).expect("the old certificate must be readable");
+        let old_key = fs::read(&key).expect("the old key must be readable");
+
+        let binary = plant_binary_without_the_flag(&root, "volto-stub");
+        let stubs = plant_root_stubs(&root, 0, "active");
+        write_executable(
+            &stubs.join("mv"),
+            &format!(
+                "#!/bin/sh\n\
+                 count_file='{count}'\n\
+                 n=$(( $(cat \"$count_file\" 2>/dev/null || echo 0) + 1 ))\n\
+                 echo \"$n\" >\"$count_file\"\n\
+                 '{real}' \"$@\"\n\
+                 status=$?\n\
+                 [ \"$n\" -ne {signal_at} ] || kill -{signal} \"$PPID\"\n\
+                 exit \"$status\"\n",
+                count = stubs.join("mv-calls").display(),
+                real = real_tool("mv").display(),
+            ),
+        );
+
+        let output = Command::new("bash")
+            .arg(&script)
+            .args([
+                "--force",
+                "--sni",
+                "volto.test",
+                "--binary",
+                binary.to_str().expect("a UTF-8 path to the binary"),
+                "-u",
+                "alice",
+                "-w",
+                "correct-horse-battery",
+            ])
+            .current_dir(repo_root())
+            .env("VOLTO_INSTALL_ROOT", &root)
+            .env("PATH", path_with_stubs(&stubs))
+            .output()
+            .expect("the installer script must be runnable");
+        let stderr = stderr_of(&output);
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "SIG{signal} after rename {signal_at} must end the run through the rollback: {stderr}"
+        );
+        assert_eq!(
+            fs::read(&cert).ok(),
+            Some(old_cert),
+            "after SIG{signal} at rename {signal_at} the old certificate must be back: {stderr}"
+        );
+        assert_eq!(
+            fs::read(&key).ok(),
+            Some(old_key),
+            "after SIG{signal} at rename {signal_at} the old key must be back: {stderr}"
+        );
+        let leftovers: Vec<String> = fs::read_dir(&conf_dir)
+            .expect("the configuration directory must be readable")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".new") || name.ends_with(".bak"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "after SIG{signal} at rename {signal_at} no new or backup file may stay, found {leftovers:?}: {stderr}"
+        );
+        assert!(
+            stderr
+                .contains("installing the new certificate was interrupted; restored the previous"),
+            "the run must say the swap was interrupted: {stderr}"
+        );
+    }
+}
+
 /// A `chown` that fails when it is given the certificate pair, and succeeds on
 /// the directory before it, so the run reaches the certificate transaction.
 const CHOWN_FAILS_ON_THE_PAIR: &str =
@@ -1450,6 +1544,99 @@ fn a_replaced_binary_that_fails_to_restart_is_rolled_back() {
         "the rollback reloads systemd and starts the service: {}",
         systemctl_calls(&stubs)
     );
+}
+
+/// A signal while `--replace-binary` swaps the binary and unit rolls them back
+/// as a failure there does (S9-M1).
+///
+/// The stand-in `systemctl` sends the signal to the script on the first
+/// `daemon-reload`, before the restart is issued, or on every `restart volto`,
+/// the rollback's own included. Before the restart the rollback starts the
+/// service, which leaves the old process serving; after it the rollback
+/// restarts the service on the restored files, because systemd finishes the
+/// restart job without the script.
+#[test]
+fn a_signal_while_replacing_the_binary_rolls_it_back() {
+    for (n, (trigger, signal, expected)) in [
+        (
+            "daemon-reload",
+            "TERM",
+            "daemon-reload\ndaemon-reload\nstart volto\n",
+        ),
+        (
+            "restart volto",
+            "HUP",
+            "daemon-reload\nenable volto\nis-active --quiet volto\nrestart volto\n\
+             daemon-reload\nrestart volto\n",
+        ),
+        (
+            "restart volto",
+            "INT",
+            "daemon-reload\nenable volto\nis-active --quiet volto\nrestart volto\n\
+             daemon-reload\nrestart volto\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = configured_root(&format!("replace-signal-{n}"), "");
+        let stubs = plant_root_stubs(&root, 0, "active");
+        let marker = stubs.join("signalled");
+        // `restart volto` is signalled every time, `daemon-reload` once.
+        let once = if trigger == "daemon-reload" {
+            format!("[ ! -e '{m}' ] && : > '{m}' && ", m = marker.display())
+        } else {
+            String::new()
+        };
+        write_executable(
+            &stubs.join("systemctl"),
+            &format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = show ] && exit 0\n\
+                 printf '%s\\n' \"$*\" >> '{log}'\n\
+                 [ \"$*\" = '{trigger}' ] && {once}kill -{signal} \"$PPID\"\n\
+                 case \"$*\" in\n\
+                 \x20 'is-active volto') echo active ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log = stubs.join("systemctl.log").display()
+            ),
+        );
+
+        let output = run_full_install_with_stubs(&root, &stubs, &["--replace-binary"]);
+
+        let stderr = stderr_of(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "case {n}: the run must end through the rollback: {stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "replacing the binary and unit was interrupted; restored the previous binary and unit"
+            ),
+            "case {n}: the run must say it was interrupted and what it restored: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("usr/local/bin/volto"))
+                .ok()
+                .as_deref(),
+            Some(OLD_BINARY),
+            "case {n}: the previous binary must be back: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("etc/systemd/system/volto.service"))
+                .ok()
+                .as_deref(),
+            Some(OLD_UNIT),
+            "case {n}: the previous unit must be back: {stderr}"
+        );
+        assert_eq!(
+            systemctl_calls(&stubs),
+            expected,
+            "case {n}: the rollback must reload systemd and then start or restart: {stderr}"
+        );
+    }
 }
 
 /// A rollback after `--replace-binary` puts the unit back only together with
