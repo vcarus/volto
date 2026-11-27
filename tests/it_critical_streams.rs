@@ -16,10 +16,9 @@
 mod common;
 
 use common::rawstream::{
-    FRAME_CANCEL_PUSH, FRAME_MAX_PUSH_ID, FRAME_SETTINGS, H3_CLOSED_CRITICAL_STREAM, H3_ID_ERROR,
-    H3_REQUEST_CANCELLED, QPACK_DECODER_STREAM_ERROR, QPACK_ENCODER_STREAM_ERROR, STREAM_CONTROL,
-    STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER, application_close, frame, open_uni_stream,
-    read_varint, still_serving, varint_frame,
+    FRAME_SETTINGS, H3_CLOSED_CRITICAL_STREAM, H3_REQUEST_CANCELLED, QPACK_DECODER_STREAM_ERROR,
+    QPACK_ENCODER_STREAM_ERROR, STREAM_CONTROL, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
+    application_close, frame, open_uni_stream, read_varint, still_serving,
 };
 use common::{TIMEOUT, TestServer, connect_quic};
 
@@ -155,43 +154,6 @@ async fn a_reset_control_stream_ends_the_connection() {
         reason.contains("reset its control stream"),
         "the reason {reason:?} does not say the control stream was reset"
     );
-}
-
-/// RFC 9114 §7.2.3: a CANCEL_PUSH for a push ID never mentioned by a
-/// PUSH_PROMISE is H3_ID_ERROR -- and this server mentions none.
-#[tokio::test]
-async fn a_cancel_push_is_an_id_error() {
-    let mut control = frame(FRAME_SETTINGS, &[]);
-    control.extend(varint_frame(FRAME_CANCEL_PUSH, 7));
-
-    expect_close(
-        "CANCEL_PUSH",
-        STREAM_CONTROL,
-        &control,
-        H3_ID_ERROR,
-        "CANCEL_PUSH",
-    )
-    .await;
-}
-
-/// RFC 9114 §7.2.7: MAX_PUSH_ID may repeat or grow, but a smaller value than
-/// previously received is H3_ID_ERROR. The accepted ones come first so the
-/// reason phrase proves they were accepted.
-#[tokio::test]
-async fn a_shrinking_max_push_id_is_an_id_error() {
-    let mut control = frame(FRAME_SETTINGS, &[]);
-    for push_id in [10, 10, 12, 5] {
-        control.extend(varint_frame(FRAME_MAX_PUSH_ID, push_id));
-    }
-
-    expect_close(
-        "a shrinking MAX_PUSH_ID",
-        STREAM_CONTROL,
-        &control,
-        H3_ID_ERROR,
-        "shrank to 5",
-    )
-    .await;
 }
 
 /// Closing either of the peer's QPACK streams ends the connection.

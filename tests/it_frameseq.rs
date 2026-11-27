@@ -692,9 +692,23 @@ fn every_control_offence_draws_its_modelled_code() {
             Some(expected),
             "the model must agree with this table for {offence:?}"
         );
+        // The three H3_ID_ERROR offences are told apart by the reason phrase,
+        // which names the frame and the identifier that broke the rule.
+        let names = match offence {
+            ControlEvent::Goaway(id) => Some(format!("GOAWAY identifier that grew to {id}")),
+            ControlEvent::MaxPushId(id) => Some(format!("MAX_PUSH_ID that shrank to {id}")),
+            ControlEvent::CancelPush(id) => Some(format!("CANCEL_PUSH for push ID {id}")),
+            _ => None,
+        };
         run_case(async {
             let (code, reason) = drive_control_script(&events, ControlEnd::FinishCleanly).await;
             assert_eq!(code, expected, "{offence:?}: the reason was {reason:?}");
+            if let Some(names) = &names {
+                assert!(
+                    reason.contains(names.as_str()),
+                    "{offence:?}: the reason {reason:?} does not name the offence"
+                );
+            }
         });
     }
 
