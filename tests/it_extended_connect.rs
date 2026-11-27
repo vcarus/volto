@@ -1,11 +1,5 @@
-//! Extended CONNECT this server does not implement, and field sections it
-//! cannot decode.
-//!
-//! Two paths that are one line each in the source and were reachable only from
-//! unit tests: the 501 that RFC 9220 §3 asks for when `:protocol` names
-//! something other than `connect-udp`, and the connection error QPACK requires
-//! when a field section claims a dynamic-table entry this decoder can never
-//! have. Both are about what a *peer* is told, so both belong on the wire.
+//! Extended CONNECT requests this server does not serve or cannot accept, and a
+//! field section it cannot decode, judged on the wire.
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the frame lengths are ones this file writes out itself.
@@ -69,11 +63,9 @@ async fn an_unimplemented_connect_protocol_is_answered_501() {
 /// "Endpoints MUST treat a request or response that contains undefined or
 /// invalid pseudo-header fields as malformed."
 ///
-/// CR LF because it is the pair that matters: this was the one pseudo-header
-/// with no character-set check, so a value carrying them was answered 501 as an
-/// unimplemented protocol and reached two log lines and `Request.protocol` on an
-/// *accepted* request. RFC 9114 §10.3 names carriage return and line feed among
-/// the three octets an intermediary might translate verbatim (audit L6).
+/// CR LF because RFC 9114 §10.3 names carriage return and line feed among the
+/// characters that "might be exploited by an attacker if they are translated
+/// verbatim".
 ///
 /// The credentials are here for the reason the 501 case gives: without them a
 /// 407 would hide which verdict was reached.
@@ -256,13 +248,8 @@ async fn a_dynamic_table_reference_closes_the_connection() {
     );
 }
 
-/// An extended CONNECT for `connect-ip`, authenticated.
-///
-/// RFC 8441 §4 requires `:scheme` and `:path` alongside `:protocol` and says
-/// how `:authority` is interpreted when it is present; it does not make
-/// `:authority` mandatory. That requirement is RFC 9298 §3.4's, and it is
-/// `connect-udp`'s alone. The authority here names the proxy, so the request
-/// reaches the routing arm under test whether or not it is set.
+/// An extended CONNECT for `connect-ip`, authenticated, naming the proxy in
+/// `:authority`.
 fn connect_ip_request(proxy: &str) -> Request {
     let mut request = Request::new(Method::Connect);
     request.scheme = Some("https".into());
