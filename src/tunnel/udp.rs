@@ -33,8 +33,6 @@
 //! * Closing the socket also closes the request stream, and vice versa
 //!   (RFC 9298 §3.1). A half-open UDP session has no meaning.
 
-use std::time::Duration;
-
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use rustix::io::Errno;
@@ -151,21 +149,33 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     // The other family is read only once every address of the first one has
     // failed to connect, and inside what is left of the resolution budget.
     let later = later.as_mut().map(|other| {
-        let addresses = tunnel::later_addresses(other, &ctx.resolver, |addresses| {
-            tunnel::usable_addresses(ctx, stream_id, &host, port, addresses)
-        })
-        .addresses;
-        async move {
-            match deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, addresses)
-                    .await
-                    .unwrap_or_default(),
-                None => addresses.await,
-            }
+        let tunnel::Later { started, addresses } =
+            tunnel::later_addresses(other, &ctx.resolver, |addresses| {
+                tunnel::usable_addresses(ctx, stream_id, &host, port, addresses)
+            });
+        tunnel::Later {
+            started,
+            addresses: async move {
+                match deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, addresses)
+                        .await
+                        .unwrap_or_default(),
+                    None => addresses.await,
+                }
+            },
         }
     });
 
-    let walk = bind_any(&first, later).await;
+    // Connecting a UDP socket only asks the kernel for a route, so the first
+    // address with one wins and nothing later can correct the choice: the
+    // family order of resolution (D58) is the whole decision. The walk has no
+    // budget, and `connected_udp_socket` never waits, so the other family's
+    // lookup is never polled beside an attempt and is read only once every
+    // first address has failed (D123). The address of the last attempt
+    // travels with the error, for the RFC 9209 `next-hop` parameter.
+    let walk =
+        tunnel::first_reachable_then(first, later, None, net::connected_udp_socket, OPEN_FAILED)
+            .await;
     // The wait for the other family is lookup time, as on the TCP path.
     let resolve = resolve + walk.waited;
     let allowed = walk.addresses;
@@ -863,9 +873,7 @@ impl Session<'_> {
                                 // fields MUST be treated as it if were a
                                 // malformed or incomplete message", and RFC
                                 // 9114 §4.1.2 answers one with H3_MESSAGE_ERROR.
-                                capsule::Error::MalformedDatagram => {
-                                    h3api::Code::H3_MESSAGE_ERROR
-                                }
+                                capsule::Error::MalformedDatagram => h3api::Code::H3_MESSAGE_ERROR,
                                 // Our own bound, for which RFC 9298 §5 names no
                                 // code. RFC 9297 §5.2 registers 0x33 for a
                                 // "Datagram or Capsule Protocol parse error".
@@ -988,73 +996,8 @@ fn capsule_fields() -> Fields {
     fields
 }
 
-/// Opens a connected UDP socket to the first address that works.
-///
-/// As on the TCP path, the address of the last attempt travels with the error:
-/// it is the hop an RFC 9209 `next-hop` parameter names.
-///
-/// Unlike the TCP path, this is not a failover: connecting a UDP socket only
-/// asks the kernel for a route, so the first address with one wins and nothing
-/// later can correct the choice. The family ordering applied at resolution
-/// (decision D58) is therefore the whole of the decision here.
-///
-/// `first` is tried before the other family is read at all. `later` is
-/// awaited only when every address of `first` failed, as it would have been
-/// reached in one list, and its addresses are tried after them.
-async fn bind_any<L>(first: &[std::net::SocketAddr], later: Option<L>) -> tunnel::Walk<UdpSocket>
-where
-    L: std::future::Future<Output = Vec<std::net::SocketAddr>>,
-{
-    bind_any_with(first, later, net::connected_udp_socket).await
-}
-
-/// [`bind_any`] with the socket step supplied by the caller, so a test can
-/// stand in for a family that has no route.
-async fn bind_any_with<T, D, F, L>(
-    first: &[std::net::SocketAddr],
-    later: Option<L>,
-    dial: D,
-) -> tunnel::Walk<T>
-where
-    D: Fn(std::net::SocketAddr) -> F,
-    F: std::future::Future<Output = std::io::Result<T>>,
-    L: std::future::Future<Output = Vec<std::net::SocketAddr>>,
-{
-    const FAILED: &str = "could not open a socket to the target";
-
-    let failure = match tunnel::first_reachable(first, None, &dial, FAILED).await {
-        Ok(socket) => {
-            return tunnel::Walk {
-                result: Ok(socket),
-                waited: Duration::ZERO,
-                addresses: first.to_vec(),
-            };
-        }
-        Err(failure) => failure,
-    };
-
-    let mut addresses = first.to_vec();
-    let Some(later) = later else {
-        return tunnel::Walk {
-            result: Err(failure),
-            waited: Duration::ZERO,
-            addresses,
-        };
-    };
-    let (more, waited) = tunnel::timed(later).await;
-    let result = if more.is_empty() {
-        Err(failure)
-    } else {
-        tunnel::first_reachable(&more, None, &dial, FAILED).await
-    };
-    addresses.extend(more);
-
-    tunnel::Walk {
-        result,
-        waited,
-        addresses,
-    }
-}
+/// The debug line for one address a socket could not be opened to.
+const OPEN_FAILED: &str = "could not open a socket to the target";
 
 /// Checks a CONNECT-UDP request against the rules that are about the message
 /// rather than the target.
@@ -1216,17 +1159,18 @@ mod tests {
                 &mut other,
                 &lab.resolver,
                 <[std::net::SocketAddr]>::to_vec,
-            )
-            .addresses;
+            );
 
-            let walk = bind_any_with(&resolved.addresses, Some(later), |address| async move {
+            let dial = |address: std::net::SocketAddr| async move {
                 if address.is_ipv4() && !has_ipv4_route {
                     Err(std::io::Error::from(std::io::ErrorKind::NetworkUnreachable))
                 } else {
                     Ok(address)
                 }
-            })
-            .await;
+            };
+            let walk =
+                tunnel::first_reachable_then(resolved.addresses, Some(later), None, dial, "test")
+                    .await;
 
             let reached = match walk.result {
                 Ok(address) => address,

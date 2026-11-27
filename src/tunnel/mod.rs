@@ -858,26 +858,8 @@ where
 /// long address list could time out on every address.
 pub(crate) const MIN_CONNECT_SHARE: Duration = Duration::from_secs(3);
 
-/// Dials `addresses` in order, returning the first that answers or the last
-/// failure, with the address it happened on.
-///
-/// Both tunnel types walk their resolved list this way, so the address an
-/// RFC 9209 `next-hop` parameter names is chosen by one rule: the last one
-/// attempted. `failed` is the caller's debug line for an address that did not
-/// answer.
-///
-/// `budget` bounds the **whole** walk rather than each address, so a name
-/// with several unreachable addresses cannot multiply the wait by their
-/// number. Within it, each attempt gets an equal share of what is left for the
-/// addresses not yet tried, so an address that never answers cannot spend the
-/// time of the ones after it, and an address that fails early leaves the rest
-/// of its share to them. The share is never less than [`MIN_CONNECT_SHARE`],
-/// or what is left when that is less, so a long list or a small budget does not
-/// cut every attempt shorter than a handshake takes. The shares never add up to
-/// more than the budget, and the walk stops when nothing is left, so the floor
-/// means fewer addresses are tried, not a longer wait. The attempts are still
-/// made one at a time, in the order resolution gave (D58): this is not address
-/// racing. `None` waits on each dial for as long as it takes.
+/// [`first_reachable_then`] with no other family behind `addresses`.
+#[cfg(test)]
 pub(crate) async fn first_reachable<T, D, F>(
     addresses: &[std::net::SocketAddr],
     budget: Option<Duration>,
@@ -922,12 +904,30 @@ pub(crate) struct Walk<T> {
     pub(crate) addresses: Vec<std::net::SocketAddr>,
 }
 
-/// [`first_reachable`] over `first`, then over the other family's addresses
-/// that `later` gives.
+/// Dials `first` in order, then the other family's addresses that `later`
+/// gives, returning the first that answers or the last failure, with the
+/// address it happened on.
 ///
-/// The share of `budget` each attempt gets is the one [`first_reachable`]
-/// gives over both lists together, the other family counted as soon as its
-/// addresses are known. While they are not, an attempt is given the share
+/// Both tunnel types walk their resolved list this way, so the address an
+/// RFC 9209 `next-hop` parameter names is chosen by one rule: the last one
+/// attempted. `failed` is the caller's debug line for an address that did not
+/// answer.
+///
+/// `budget` bounds the **whole** walk rather than each address, so a name
+/// with several unreachable addresses cannot multiply the wait by their
+/// number. Within it, each attempt gets an equal share of what is left for the
+/// addresses not yet tried, so an address that never answers cannot spend the
+/// time of the ones after it, and an address that fails early leaves the rest
+/// of its share to them. The share is never less than [`MIN_CONNECT_SHARE`],
+/// or what is left when that is less, so a long list or a small budget does not
+/// cut every attempt shorter than a handshake takes. The shares never add up to
+/// more than the budget, and the walk stops when nothing is left, so the floor
+/// means fewer addresses are tried, not a longer wait. The attempts are still
+/// made one at a time, in the order resolution gave (D58): this is not address
+/// racing. `None` waits on each dial for as long as it takes.
+///
+/// The other family counts towards the shares as soon as its addresses are
+/// known. While they are not, an attempt is given the share
 /// that counts only the known ones, and the lookup is waited for beside it:
 /// when it gives addresses, the attempt's share becomes what the rule gives
 /// with them, counted from the moment the attempt started, and an attempt
