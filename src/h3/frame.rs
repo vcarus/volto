@@ -917,13 +917,9 @@ fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64) -> Option<Viola
         // refused, a trailer section's HEADERS included: there is no
         // representation on a tunnel for a trailer to describe, and RFC 9220 §3
         // extends CONNECT to other protocols by pointing at this same section.
-        StreamKind::Tunnel => match kind {
-            DATA => None,
-            _ if BufferedKind::from_type(kind).is_some() => {
-                Some(unexpected(NON_DATA_FRAME_ON_A_TUNNEL))
-            }
-            _ => None,
-        },
+        StreamKind::Tunnel => {
+            BufferedKind::from_type(kind).map(|_| unexpected(NON_DATA_FRAME_ON_A_TUNNEL))
+        }
     }
 }
 
