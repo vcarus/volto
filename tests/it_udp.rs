@@ -7,14 +7,14 @@ use std::panic::Location;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::h3client::{ends_cleanly, ends_with_reset};
-use common::rawstream::{H3_DATAGRAM_ERROR, H3_MESSAGE_ERROR, H3_NO_ERROR, H3_REQUEST_CANCELLED};
+use common::h3client::{ends_cleanly, ends_with_reset, stops_with_no_error_at_once};
+use common::rawstream::{H3_DATAGRAM_ERROR, H3_MESSAGE_ERROR, H3_REQUEST_CANCELLED};
 use common::{
-    ALLOW_PRIVATE, DELIBERATE, H3Client, TIMEOUT, TestServer, assert_peer_reset,
-    closed_udp_address, connect_udp_request, open_udp_session, open_udp_session_to, respond_to,
-    send_udp_payload, spawn_bursting_udp_target, spawn_flooding_udp_target,
-    spawn_pushing_udp_target, spawn_silent_udp_target, spawn_tagged_udp_target,
-    spawn_udp_echo_target, spawn_udp_target, udp_round_trip, windowless_transport,
+    ALLOW_PRIVATE, DELIBERATE, H3Client, TIMEOUT, TestServer, closed_udp_address,
+    connect_udp_request, open_udp_session, open_udp_session_to, respond_to, send_udp_payload,
+    spawn_bursting_udp_target, spawn_flooding_udp_target, spawn_pushing_udp_target,
+    spawn_silent_udp_target, spawn_tagged_udp_target, spawn_udp_echo_target, spawn_udp_target,
+    udp_round_trip, windowless_transport,
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
@@ -901,24 +901,14 @@ async fn a_payload_at_the_maximum_size_does_not_abort_the_session() {
 }
 
 /// A session accepted and closed on the spot asks the client to stop sending
-/// with H3_NO_ERROR, at once, on the CONNECT-UDP path as much as on the TCP one.
-///
-/// The blackhole answer (D49) is "a target that hung up immediately", and a
-/// target hanging up is not an error. Any other code here would put a fault in
-/// the client's log for a request this server deliberately treated as fine.
-/// Observable because the STOP_SENDING goes out before the 200 does, so the
-/// first write after the response is refused with the code it carried.
+/// with H3_NO_ERROR, at once, on the CONNECT-UDP path as much as on the TCP one
+/// (`stops_with_no_error_at_once` says why both halves matter).
 ///
 /// Both callers of the close share one helper, so this is the same wire
-/// behaviour `it_policy` pins for a CONNECT — checked here because a CONNECT-UDP
-/// session reaches it through a different route (the RFC 9298 path template, and
-/// a 200 that has to carry the capsule protocol field) and could regress on its
-/// own.
-///
-/// The time bound is the half that matters: a server that instead waits for the
-/// client to close first and only stops it after a grace period — the shape
-/// this path briefly had, and rolled back (D59) — satisfies everything else
-/// here, just seconds later.
+/// behaviour `it_policy` pins for a CONNECT. It is checked here because a
+/// CONNECT-UDP session reaches it through a different route (the RFC 9298 path
+/// template, and a 200 that has to carry the capsule protocol field) and could
+/// regress on its own.
 #[tokio::test]
 async fn a_session_closed_on_the_spot_stops_the_client_with_no_error() {
     let server = TestServer::start().await;
@@ -926,31 +916,7 @@ async fn a_session_closed_on_the_spot_stops_the_client_with_no_error() {
 
     let (_, mut stream) = open_udp_session_to(&mut client, &server, "0.0.0.0", 443).await;
 
-    let started = tokio::time::Instant::now();
-    let error = loop {
-        match stream
-            .send_data(Bytes::from_static(b"anything at all"))
-            .await
-        {
-            // quinn only surfaces the stop once the write reaches the peer's
-            // state, so an early write can still be accepted locally.
-            Ok(()) => {
-                assert!(
-                    started.elapsed() < TIMEOUT,
-                    "the server never stopped the stream"
-                );
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            Err(error) => break error,
-        }
-    };
-
-    assert_peer_reset(&error, H3_NO_ERROR);
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the stop must be asked for up front, not after a wait; it took {:?}",
-        started.elapsed()
-    );
+    stops_with_no_error_at_once(&mut stream).await;
 }
 
 /// An unknown capsule type must be skipped, leaving the session usable.

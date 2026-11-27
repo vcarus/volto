@@ -1581,3 +1581,55 @@ pub fn ends_with_reset<'a>(
         );
     }
 }
+
+/// Writes to `stream` until the server's STOP_SENDING refuses a write, and
+/// asserts that the stop carried H3_NO_ERROR and came at once.
+///
+/// The shape of a request the server accepts and closes on the spot. The
+/// blackhole answer (D49) is "a target that hung up immediately", and a target
+/// hanging up is not an error, so any other code would put a fault in the
+/// client's log for a request the server treated as fine. The STOP_SENDING goes
+/// out before the 200, so the first write that reaches the server's state after
+/// the response is refused with the code it carried. quinn surfaces the stop
+/// only then, so an earlier write can still be accepted locally, and the loop
+/// writes again.
+///
+/// The time bound is the half that matters. A server that drains the client's
+/// stream for a while and stops it only afterwards, the design D59 rejected,
+/// satisfies everything else here, seconds later.
+#[track_caller]
+pub fn stops_with_no_error_at_once(stream: &mut ClientStream) -> impl Future<Output = ()> + '_ {
+    let caller = Location::caller();
+    async move {
+        let started = tokio::time::Instant::now();
+        let error = loop {
+            match stream
+                .send_data(Bytes::from_static(
+                    b"the first flight the client had queued",
+                ))
+                .await
+            {
+                Ok(()) => {
+                    assert!(
+                        started.elapsed() < super::TIMEOUT,
+                        "the server never stopped the stream awaited at {caller}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => break error,
+            }
+        };
+
+        assert_eq!(
+            volto::h3api::peer_reset_code(&error),
+            Some(super::rawstream::H3_NO_ERROR),
+            "the stream awaited at {caller} must be stopped with H3_NO_ERROR, got {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the stop awaited at {caller} must be asked for up front, not after a wait; it \
+             took {:?}",
+            started.elapsed()
+        );
+    }
+}

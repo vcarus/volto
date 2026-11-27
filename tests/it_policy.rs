@@ -9,9 +9,9 @@ mod common;
 use std::assert_matches;
 use std::time::Duration;
 
-use bytes::Bytes;
 use common::Response;
-use common::rawstream::{H3_NO_ERROR, H3_REQUEST_CANCELLED};
+use common::h3client::stops_with_no_error_at_once;
+use common::rawstream::H3_REQUEST_CANCELLED;
 use common::{
     ALLOW_PRIVATE, H3Client, TIMEOUT, TestServer, assert_peer_reset, auth_section, authorize,
     authorized_connect, basic_credentials, close_and_drain, connect_request, connect_udp_request,
@@ -594,19 +594,9 @@ async fn a_blackholed_udp_target_is_accepted_then_closed() {
 }
 
 /// The tunnel accepted and closed on the spot asks the client to stop sending
-/// with H3_NO_ERROR, and asks at once.
-///
-/// The blackhole answer (D49) is "a target that hung up immediately", and a
-/// target hanging up is not an error. Any other code here would put a fault in
-/// the client's log for a request this server deliberately treated as fine.
-/// Observable because the STOP_SENDING goes out before the 200 does, so the
-/// first write after the response is refused with the code it carried.
-///
-/// The time bound is the half that matters: a server that instead waits for the
-/// client to close first and only stops it after a grace period — the shape
-/// this path briefly had, and rolled back (D59) — satisfies everything else
-/// here, just seconds later. `it_udp` pins the same behaviour on the CONNECT-UDP
-/// path, which reaches the shared close through a different route.
+/// with H3_NO_ERROR, and asks at once (`stops_with_no_error_at_once` says why
+/// both halves matter). `it_udp` pins the same on the CONNECT-UDP path, which
+/// reaches the shared close through a different route.
 #[tokio::test]
 async fn a_tunnel_closed_on_the_spot_stops_the_client_with_no_error() {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
@@ -614,33 +604,7 @@ async fn a_tunnel_closed_on_the_spot_stops_the_client_with_no_error() {
 
     let mut stream = open_tcp_tunnel(&mut client, "0.0.0.0:443").await;
 
-    let started = tokio::time::Instant::now();
-    let error = loop {
-        match stream
-            .send_data(Bytes::from_static(
-                b"the first flight the client had queued",
-            ))
-            .await
-        {
-            // quinn only surfaces the stop once the write reaches the peer's
-            // state, so an early write can still be accepted locally.
-            Ok(()) => {
-                assert!(
-                    started.elapsed() < TIMEOUT,
-                    "the server never stopped the stream"
-                );
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            Err(error) => break error,
-        }
-    };
-
-    assert_peer_reset(&error, H3_NO_ERROR);
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the stop must be asked for up front, not after a wait; it took {:?}",
-        started.elapsed()
-    );
+    stops_with_no_error_at_once(&mut stream).await;
 }
 
 /// Private space can be opened up deliberately — the deployments where reaching a
