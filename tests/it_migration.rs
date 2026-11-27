@@ -1,8 +1,7 @@
 //! Client address migration (RFC 9000 §9): the server must carry a connection
 //! and its tunnels across a mid-life change of the peer's address — what a
-//! phone produces when it hops from cellular onto Wi-Fi. Field-verified
-//! against Surge iOS (2026-08-14); these tests pin that behavior against
-//! upstream bumps or a stray `migration(false)` in the transport config.
+//! phone produces when it hops from cellular onto Wi-Fi. This test fails if
+//! the server config disables migration.
 
 mod common;
 
