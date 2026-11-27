@@ -669,3 +669,34 @@ const _: () = assert!(
         == FULL_SIZED_FRAMES_THAT_FIT,
     "the HEADERS budget is no longer sixteen full-sized field sections"
 );
+
+/// Accepts the server's control stream and reads its type, asserting that it
+/// is the control stream.
+///
+/// The first unidirectional stream a client accepts from this server is its
+/// control stream: quinn hands out a peer's streams in stream-id order, and the
+/// server opens its control stream before its two QPACK streams.
+///
+/// Hold what this returns: dropping a [`quinn::RecvStream`] sends
+/// STOP_SENDING, which the server answers by closing the connection with
+/// H3_CLOSED_CRITICAL_STREAM.
+#[track_caller]
+pub fn server_control_stream(
+    connection: &quinn::Connection,
+) -> impl Future<Output = quinn::RecvStream> + '_ {
+    let caller = Location::caller();
+    async move {
+        let mut recv = tokio::time::timeout(TIMEOUT, connection.accept_uni())
+            .await
+            .unwrap_or_else(|_| panic!("at {caller}: the server's control stream never arrived"))
+            .unwrap_or_else(|error| {
+                panic!("at {caller}: accept the server's control stream: {error}")
+            });
+        let kind = read_varint(&mut recv).await;
+        assert_eq!(
+            kind, STREAM_CONTROL,
+            "at {caller}: the first stream the server opened is not its control stream"
+        );
+        recv
+    }
+}

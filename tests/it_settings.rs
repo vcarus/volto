@@ -16,7 +16,7 @@ use common::rawstream::{
     self, FRAME_DATA, FRAME_HEADERS, FRAME_SETTINGS, H3_EXCESSIVE_LOAD, H3_MISSING_SETTINGS,
     SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_H3_DATAGRAM, SETTINGS_MAX_FIELD_SECTION_SIZE,
     STREAM_CONTROL, connect_udp_headers_frame, decode_varint, open_uni_stream, read_frame,
-    read_varint, status_of, still_serving, stopped_code,
+    server_control_stream, status_of, still_serving, stopped_code,
 };
 use common::{
     H3Client, TIMEOUT, TestServer, client_endpoint_with_transport, connect_quic, connect_request,
@@ -30,12 +30,6 @@ use volto::varint;
 
 /// The value the server must advertise, matching `h3api::MAX_FIELD_SECTION_SIZE`.
 const EXPECTED_MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
-
-/// How many unidirectional streams to inspect before giving up.
-///
-/// The server opens its two QPACK streams alongside the control stream, so the
-/// control stream is not guaranteed to be the first one accepted.
-const MAX_UNI_STREAMS: usize = 8;
 
 #[tokio::test]
 async fn server_advertises_extended_connect_and_h3_datagram() {
@@ -232,38 +226,17 @@ async fn a_frame_before_settings_ends_the_connection() {
     }
 }
 
-/// Finds the control stream and returns the settings it carries.
+/// Reads the server's control stream and returns the settings it opens with.
 async fn read_settings(connection: &quinn::Connection) -> HashMap<u64, u64> {
-    for _ in 0..MAX_UNI_STREAMS {
-        let mut recv = tokio::time::timeout(TIMEOUT, connection.accept_uni())
-            .await
-            .expect("a unidirectional stream arrived")
-            .expect("unidirectional stream");
+    let mut control = server_control_stream(connection).await;
 
-        if read_varint(&mut recv).await != STREAM_CONTROL {
-            // A grease stream or a QPACK stream; keep looking.
-            continue;
-        }
-
-        // RFC 9114 §6.2.1: SETTINGS must be the first frame on the control
-        // stream.
-        let frame_type = read_varint(&mut recv).await;
-        assert_eq!(
-            frame_type, FRAME_SETTINGS,
-            "the first control stream frame must be SETTINGS, got type {frame_type:#x}"
-        );
-
-        let length = read_varint(&mut recv).await;
-        let mut payload = vec![0u8; usize::try_from(length).expect("settings frame length")];
-        tokio::time::timeout(TIMEOUT, recv.read_exact(&mut payload))
-            .await
-            .expect("settings payload arrived")
-            .expect("settings payload");
-
-        return parse_settings(&payload);
-    }
-
-    panic!("no HTTP/3 control stream among the first {MAX_UNI_STREAMS} unidirectional streams");
+    // RFC 9114 §6.2.1: SETTINGS must be the first frame on the control stream.
+    let (frame_type, payload) = read_frame(&mut control).await;
+    assert_eq!(
+        frame_type, FRAME_SETTINGS,
+        "the first control stream frame must be SETTINGS, got type {frame_type:#x}"
+    );
+    parse_settings(&payload)
 }
 
 /// Decodes the identifier/value pairs of a SETTINGS payload.

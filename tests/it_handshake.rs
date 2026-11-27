@@ -28,7 +28,8 @@ use std::time::Duration;
 
 use common::rawstream::{
     FRAME_HEADERS, H3_NO_ERROR, H3_REQUEST_INCOMPLETE, H3_STREAM_CREATION_ERROR, authenticate,
-    authenticated_connect_headers_frame, close_reason, read_frame, status_of, still_serving,
+    authenticated_connect_headers_frame, close_reason, read_frame, server_control_stream,
+    status_of, still_serving,
 };
 use common::{
     ALLOW_PRIVATE, H3Client, IMPATIENT, Leg, Relayed, TIMEOUT, TestServer, auth_section,
@@ -828,11 +829,9 @@ async fn a_client_that_has_connected_before_evicts_without_a_retry() {
     // client's Handshake packet, which is before the HTTP/3 layer has opened
     // anything — so the arrival of the server's control stream is proof that the
     // packet carrying them has been processed too.
-    tokio::time::timeout(TIMEOUT, first.accept_uni())
-        .await
-        .expect("the server's control stream must arrive")
-        .expect("the server's control stream must open");
+    let control = server_control_stream(&first).await;
     first.close(0u32.into(), b"");
+    drop(control);
     drop(first);
 
     // Refill the one slot with a peer that has never authenticated, so there is
@@ -945,7 +944,7 @@ async fn the_server_does_not_permit_zero_rtt() {
     let first = finish_connect(&endpoint, server.addr)
         .await
         .expect("the first handshake must succeed");
-    first_control_byte(&first).await;
+    let _first_control = server_control_stream(&first).await;
     assert_eq!(
         tickets.load(Ordering::Relaxed),
         0,
@@ -972,26 +971,12 @@ async fn the_server_does_not_permit_zero_rtt() {
     // The same wait as on the first connection, so that a ticket sent with the
     // end of this handshake would have reached the store before the count is
     // read.
-    first_control_byte(&second).await;
+    let _second_control = server_control_stream(&second).await;
     assert_eq!(
         tickets.load(Ordering::Relaxed),
         0,
         "no ticket on the second connection either"
     );
-}
-
-/// Waits for the first byte of the server's control stream on `connection`,
-/// which the server sends after its handshake and after any ticket.
-async fn first_control_byte(connection: &quinn::Connection) {
-    let mut control = tokio::time::timeout(TIMEOUT, connection.accept_uni())
-        .await
-        .expect("the server's control stream must arrive")
-        .expect("the server opens its control stream");
-    let mut byte = [0u8; 1];
-    tokio::time::timeout(TIMEOUT, control.read_exact(&mut byte))
-        .await
-        .expect("the control stream must carry its first byte")
-        .expect("the control stream is readable");
 }
 
 /// A client endpoint that keeps session tickets and is willing to use them for
