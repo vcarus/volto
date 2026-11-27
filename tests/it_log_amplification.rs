@@ -20,10 +20,8 @@
 //! before it has done anything at all is `volto::quic`'s handshake failure, so
 //! that module alone is watched at DEBUG here.
 //!
-//! Its own binary because a capturing subscriber is process-wide and
-//! `tracing_subscriber::fmt().init()` may run once, which is why every scenario
-//! lives inside the one `#[tokio::test]` and takes a mark into the shared buffer
-//! rather than starting from an empty one.
+//! One `#[tokio::test]`, for the reason `SharedBuffer::shared` gives; each
+//! scenario reads after its own mark.
 
 mod common;
 
@@ -76,7 +74,7 @@ async fn one_peer_cannot_buy_an_unbounded_number_of_production_log_lines() {
 /// a peer is one HEADERS frame, under a hundred bytes for a line that reaches
 /// the journal. A port scan through the proxy is 65535 of them.
 ///
-/// The line is INFO (D111, user ruling 2026-11-12; D44 had left it at WARN).
+/// The line is INFO (D111).
 /// It is still the evidence an operator is left with when somebody probes the
 /// private side of the host, and the shipped `volto=info` filter keeps it. What
 /// is bounded here is the volume: the first refusal is reported at once, and
@@ -260,9 +258,7 @@ async fn an_authentication_storm_is_bounded_by_the_failure_budget(buffer: &Share
 /// handshake.
 ///
 /// What keeps that out is `ConnectionError`'s conversion, which keeps the code
-/// and drops the peer's prose. Nothing else pins it, and the conversion reads as
-/// a tidying-up rather than as a defence, so this is the test that says it is
-/// load-bearing.
+/// and drops the peer's prose.
 ///
 /// This drives the *application* close, which is the one a peer can send through
 /// quinn's public API and so the one a test can reach. The transport close —
