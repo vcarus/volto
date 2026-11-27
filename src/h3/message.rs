@@ -182,9 +182,9 @@ impl FieldValue {
 
     /// [`Self::parse`] for a value that is already an owned buffer.
     ///
-    /// The same octets are accepted and refused. The buffer becomes the value
-    /// itself, so nothing is copied. A buffer with spare capacity, such as a
-    /// Huffman decoder's output, is shrunk to its length on the way in.
+    /// The same octets are accepted and refused. The buffer becomes the value.
+    /// One with spare capacity, such as a Huffman decoder's output, is shrunk to
+    /// its length, which can reallocate.
     pub fn from_vec(value: Vec<u8>) -> Option<Self> {
         is_field_value(&value).then(|| Self(value.into_boxed_slice()))
     }
