@@ -132,8 +132,8 @@ pub const RELAY_BUF_SIZE: usize = 16 * 1024;
 /// has been acknowledged. So the memory a tunnel occupies is *blocks* × block
 /// size, while the only thing bounding it, quinn's `send_window` of 10 MB per
 /// connection, counts bytes. A fresh [`RELAY_BUF_SIZE`] block per read would
-/// make every read, however small, pin 16 KiB: 11.7x amplification for
-/// MTU-sized reads and 238x for 64-byte ones.
+/// make every read, however small, pin 16 KiB: 16384 bytes pinned per read of
+/// n bytes, 11.7x for a 1400-byte read.
 ///
 /// # The arithmetic
 ///
