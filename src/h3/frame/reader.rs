@@ -199,10 +199,9 @@ impl FrameReader {
     ///
     /// `Ok(true)` means a read from quinn would return data now, `Ok(false)`
     /// that the peer finished and quinn has handed over every byte; a reset
-    /// arrives as `quinn::ReadError::Reset`. A zero-length read is what asks the
-    /// question: `quinn::RecvStream::read_chunk(0, ..)` takes the ordinary read
-    /// path, but the assembler underneath copies out `min(0, available)` bytes,
-    /// so the decoder above stays authoritative for every byte of the stream.
+    /// arrives as `quinn::ReadError::Reset`. A zero-length read asks it: quinn
+    /// returns an empty chunk when it has data and consumes nothing, so the
+    /// decoder still sees every byte.
     ///
     /// The question is about quinn alone. Chunks in the read-ahead have already
     /// left quinn, so they are not counted. `Ok(false)` can be the answer while
