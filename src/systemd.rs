@@ -4,8 +4,8 @@
 //! A unit of `Type=notify` sets `NOTIFY_SOCKET` in the service's environment.
 //! The value names an `AF_UNIX` datagram socket, and a message is one datagram
 //! of `KEY=VALUE` assignments (`sd_notify(3)`). This module sends two of them.
-//! [`READY`] goes once the listener is bound, after which systemd counts the
-//! start as done. [`WATCHDOG`] goes every half of `WATCHDOG_USEC` when the unit
+//! `READY=1` goes once the listener is bound, after which systemd counts the
+//! start as done. `WATCHDOG=1` goes every half of `WATCHDOG_USEC` when the unit
 //! sets `WatchdogSec=`, and systemd restarts the service when one does not
 //! arrive in time.
 //!
@@ -34,17 +34,17 @@ use std::time::Duration;
 use tracing::warn;
 
 /// The message that tells the service manager the listener is bound.
-pub const READY: &[u8] = b"READY=1";
+const READY: &[u8] = b"READY=1";
 
 /// The watchdog's keep-alive.
-pub const WATCHDOG: &[u8] = b"WATCHDOG=1";
+const WATCHDOG: &[u8] = b"WATCHDOG=1";
 
 /// The shortest period the keep-alive is sent at.
 ///
 /// `tokio::time::interval` panics on a zero period, and half of a
 /// `WATCHDOG_USEC` of 1 is zero microseconds. A watchdog that short cannot be
 /// met by any period, so the floor only has to keep the interval legal.
-pub const SHORTEST_HEARTBEAT: Duration = Duration::from_millis(1);
+const SHORTEST_HEARTBEAT: Duration = Duration::from_millis(1);
 
 /// What the service manager put in this process's environment, as `main` read
 /// it.
@@ -71,7 +71,7 @@ pub struct Environment {
 /// its floor. A value that is not a number of microseconds above zero, or a
 /// `WATCHDOG_PID` that is not a process id, is an error, which the caller
 /// writes as one WARN line.
-pub fn heartbeat(
+fn heartbeat(
     watchdog_usec: Option<&OsStr>,
     watchdog_pid: Option<&OsStr>,
     own_pid: u32,
@@ -102,7 +102,7 @@ pub fn heartbeat(
 
 /// Where `NOTIFY_SOCKET` points.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Address {
+enum Address {
     /// A socket file, named by an absolute path.
     Path(PathBuf),
     /// A Linux abstract socket name: the value without its leading `@`.
@@ -115,7 +115,7 @@ pub enum Address {
 /// The two forms systemd sets: an absolute path, on every Unix, and an abstract
 /// socket name with a leading `@`, which only Linux has. Any other value is
 /// refused, and notifications are then off.
-pub fn address(value: &OsStr) -> Result<Address, &'static str> {
+fn address(value: &OsStr) -> Result<Address, &'static str> {
     let bytes = value.as_encoded_bytes();
     match bytes.first() {
         Some(b'/') => Ok(Address::Path(PathBuf::from(value))),
