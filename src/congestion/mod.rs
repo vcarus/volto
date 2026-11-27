@@ -367,7 +367,8 @@
 //! without the limit of a second, or the lowest sample when the probe saw
 //! fewer than three values of `now`. While the sender
 //! is app-limited the probe does not start, because the window does not limit
-//! an app-limited sender. ACKs that arrive during a probe count as app-limited
+//! an app-limited sender. Nor does it start while the base-loss reading of the
+//! previous probe is still open. ACKs that arrive during a probe count as app-limited
 //! for the delivery rate, so the probe's own low samples do not lower the
 //! estimate. Linux BBR does the same during ProbeRTT (`bbr_update_min_rtt` in
 //! `net/ipv4/tcp_bbr.c`).
@@ -672,7 +673,7 @@ impl Bbr {
             Some((min, at)) if rtt > min => {
                 let expired =
                     self.probe_due || now.saturating_duration_since(at) > MIN_RTT_LIFETIME;
-                if !app_limited && expired {
+                if !app_limited && expired && !self.base.open() {
                     self.probe_due = false;
                     // The round trip before the probe, by send time.
                     self.base.enter(now, min);
@@ -1478,6 +1479,33 @@ mod tests {
             Some(ms(55)),
             "and is not taken"
         );
+    }
+
+    /// A probe that is due while the previous probe's reading is still open
+    /// waits for it to close, so that the open reading is compared with its
+    /// own round trip before the probe and is not dropped.
+    #[test]
+    fn a_probe_waits_for_the_previous_reading_to_close() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        let t1 = t0 + ms(10_001);
+        ack(&mut c, t1, ms(120), 0, false);
+        c.on_end_acks(t1, 0, false, None);
+        let ended = t1 + ms(200);
+        c.on_end_acks(ended, 0, false, None);
+        assert!(c.probe.is_none(), "the probe ended");
+
+        c.probe_due = true;
+        ack(&mut c, ended + ms(10), ms(130), 0, false);
+        assert!(
+            c.probe.is_none(),
+            "the reading closes two smoothed RTTs after the probe"
+        );
+        let closes = ended + 2 * SRTT;
+        c.on_end_acks(closes, 0, false, None);
+        assert_eq!(c.last_closed.map(|(at, _)| at), Some(closes));
+        ack(&mut c, closes + ms(1), ms(130), 0, false);
+        assert!(c.probe.is_some(), "the probe starts once it has closed");
     }
 
     #[test]

@@ -203,6 +203,13 @@ impl BaseLoss {
         self.len > 0
     }
 
+    /// Whether the reading of the last probe has not closed yet. A new probe
+    /// waits for it, since entering replaces the round trip it is compared
+    /// with and beginning replaces the reading.
+    pub(super) fn open(&self) -> bool {
+        self.reading.is_some()
+    }
+
     /// The base loss in parts per million: the lowest of the kept readings,
     /// at most [`BaseLoss::bound_ppm`], and zero before the first reading.
     pub(super) fn ppm(&self) -> u64 {
