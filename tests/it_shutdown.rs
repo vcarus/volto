@@ -1,4 +1,4 @@
-//! M5: graceful shutdown (RFC 9114 §5.2 GOAWAY plus a bounded grace period).
+//! Graceful shutdown (RFC 9114 §5.2 GOAWAY plus a bounded grace period).
 //!
 //! The property under test is not "the process exits" but "it exits without
 //! cutting anyone off": a tunnel that is mid-transfer when SIGTERM arrives must
@@ -184,11 +184,7 @@ async fn a_request_below_the_goaway_identifier_is_served_during_the_drain() {
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    // Something to drain, so the GOAWAY finds a connection mid-work. The drain
-    // no longer needs a tunnel to stay open -- an accepted request holds it by
-    // itself, and `a_promised_request_outlives_the_last_tunnel_on_the_connection`
-    // is that shape without this safety net -- but a live tunnel is still the
-    // ordinary traffic this test drains around.
+    // Something to drain, so the GOAWAY finds a connection mid-work.
     let held = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     // The request under test, opened now and completed later: the HEADERS frame
@@ -266,8 +262,7 @@ async fn a_request_below_the_goaway_identifier_is_served_during_the_drain() {
 /// The same promise, with no tunnel open to keep the connection alive for it.
 ///
 /// [`a_request_below_the_goaway_identifier_is_served_during_the_drain`] holds a
-/// tunnel open throughout, because without one the connection used to finish the
-/// moment the GOAWAY was out. That is the interleaving this test is about: a
+/// tunnel open throughout. This test is about the interleaving without one: a
 /// request stream is accepted the instant the peer opens it, and does not take a
 /// tunnel slot until its headers have arrived and its credentials have been
 /// checked, so between those two points it is a request the server has committed
@@ -499,19 +494,6 @@ async fn a_server_with_no_connections_stops() {
     server.wait_until_stopped(Duration::from_secs(15)).await;
 }
 
-/// The bytes of an HTTP/3 control stream: its type, then an empty SETTINGS
-/// frame.
-///
-/// Written by hand rather than through [`H3Client`], because the peer below has
-/// to be one that never *reads* the server's control stream — and that client
-/// reads it for the life of the connection, as RFC 9114 §6.2.1 requires of a
-/// well-behaved one.
-fn client_control_preface() -> Vec<u8> {
-    let mut preface = vec![0x00];
-    preface.extend_from_slice(&common::rawstream::frame(0x04, &[]));
-    preface
-}
-
 /// A peer that will not take the GOAWAY must not cost the whole grace period.
 ///
 /// The exact twin of [`an_idle_server_stops_promptly`] above: one connection,
@@ -548,14 +530,19 @@ async fn a_peer_that_will_not_take_a_goaway_does_not_hold_up_shutdown() {
         .await
         .expect("handshake");
 
-    // A control stream of our own, so the server sees an ordinary HTTP/3 peer
-    // rather than one it could refuse for something else.
+    // A control stream of our own (its type, then an empty SETTINGS), so the
+    // server sees an ordinary HTTP/3 peer rather than one it could refuse for
+    // something else. Written by hand because this peer must never read the
+    // server's control stream, and `H3Client` reads it for the life of the
+    // connection.
     let mut control = quic
         .open_uni()
         .await
         .expect("open the client control stream");
+    let mut preface = vec![0x00];
+    preface.extend_from_slice(&common::rawstream::frame(0x04, &[]));
     control
-        .write_all(&client_control_preface())
+        .write_all(&preface)
         .await
         .expect("write the client control preface");
 
@@ -589,9 +576,9 @@ async fn a_peer_that_will_not_take_a_goaway_does_not_hold_up_shutdown() {
 /// the runtime's blocking pool and cannot be cancelled, so a thread stays there
 /// until the stub resolver gives up, tens of seconds where a nameserver answers
 /// nothing (D90). tokio documents dropping a runtime as blocking indefinitely
-/// for blocking tasks that have started, so the implicit drop the binary used to
-/// end on made the exit as long as the slowest lookup a client had asked for,
-/// and `script/masque.service` turns anything past `TimeoutStopSec` into a
+/// for blocking tasks that have started, so a plain drop would make the exit as
+/// long as the slowest lookup a client asked for, and `script/masque.service`
+/// turns anything past `TimeoutStopSec` into a
 /// SIGKILL.
 ///
 /// What is asserted is [`volto::shutdown::stop_runtime`], the call the binary
