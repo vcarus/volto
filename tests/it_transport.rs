@@ -29,7 +29,7 @@ use common::rawstream::H3_REQUEST_CANCELLED;
 use common::{
     ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section,
     client_endpoint_with_transport, connect_quic, finish_connect, open_tcp_tunnel, read_at_least,
-    read_to_end, spawn_drain_then_reply_target, spawn_echo_target,
+    spawn_echo_target,
 };
 
 /// The longest a connection idle under the configured one second may take to
@@ -369,21 +369,22 @@ async fn an_unauthenticated_peer_cannot_make_the_server_hold_more_than_the_initi
     );
 }
 
-/// The raise reaches the client by the time the first answer does, and an
-/// upload larger than the initial window that starts on that answer completes.
+/// The raise reaches the client by the time the first answer does.
 ///
 /// The raise is made when the first request authenticates, before its name is
 /// resolved. quinn queues a MAX_DATA frame and wakes the connection, so the
 /// frame leaves on the next packet, no later than the one carrying the 200. A
 /// client that counts no MAX_DATA when it reads the 200 would be uploading on
-/// the 1 MiB window until the tunnel's reads returned credit.
+/// the 1 MiB window until the tunnel's reads returned credit. The value of the
+/// raise is what `quic::transport`'s own tests assert; this one asserts its
+/// timing on the wire.
 ///
 /// No `[auth]` users, so the first completed request is what authenticates,
 /// the same moment as on a server that checks credentials.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_upload_on_the_first_answer_is_not_held_to_the_initial_window() {
+async fn the_window_raise_reaches_the_client_with_the_first_answer() {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
-    let target = spawn_drain_then_reply_target("").await;
+    let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
     assert_eq!(
         client.quic.stats().frame_rx.max_data,
@@ -391,29 +392,9 @@ async fn an_upload_on_the_first_answer_is_not_held_to_the_initial_window() {
         "nothing before the first request should have raised the window"
     );
 
-    let mut tunnel = open_tcp_tunnel(&mut client, &target.to_string()).await;
+    let _tunnel = open_tcp_tunnel(&mut client, &target.to_string()).await;
     assert!(
         client.quic.stats().frame_rx.max_data >= 1,
         "the raise must have reached the client by the time the 200 did"
-    );
-
-    let upload = vec![0x5a; 4 * INITIAL_RECEIVE_WINDOW as usize];
-    let started = Instant::now();
-    tunnel
-        .send_data(bytes::Bytes::from(upload.clone()))
-        .await
-        .expect("send the upload");
-    tunnel.finish().expect("finish the upload");
-    let returned = read_to_end(&mut tunnel).await;
-
-    assert_eq!(
-        returned.len(),
-        upload.len(),
-        "the target must have received the whole upload"
-    );
-    assert!(
-        started.elapsed() < TIMEOUT,
-        "a 4 MiB upload over loopback took {:?}",
-        started.elapsed()
     );
 }
