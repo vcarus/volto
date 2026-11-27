@@ -411,6 +411,7 @@ is_older_version() {
     return 1
 }
 
+# >>> mirrored RUST_LOG reader (deploy.sh <-> install-selfsigned.sh) >>>
 # Reads the RUST_LOG the $SERVICE_NAME unit starts the service with, so that the
 # config check can be run with it: the service reads RUST_LOG at startup and
 # refuses a value that turns its own log lines off, and this script's own
@@ -517,6 +518,7 @@ check_config_as_the_unit() {
         )
     fi
 }
+# <<< mirrored RUST_LOG reader (deploy.sh <-> install-selfsigned.sh) <<<
 
 # Refuses the install when the binary in $1 cannot load this host's config.
 #

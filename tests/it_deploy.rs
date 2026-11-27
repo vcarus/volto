@@ -771,6 +771,57 @@ fn restoring_the_previous_files_starts_rather_than_restarts_the_service() {
     );
 }
 
+/// Opens the RUST_LOG reader both scripts carry.
+const RUST_LOG_READER_OPEN: &str =
+    "# >>> mirrored RUST_LOG reader (deploy.sh <-> install-selfsigned.sh) >>>\n";
+/// And closes it.
+const RUST_LOG_READER_CLOSE: &str =
+    "# <<< mirrored RUST_LOG reader (deploy.sh <-> install-selfsigned.sh) <<<\n";
+
+/// The text between the RUST_LOG reader's markers in `script`, which must open
+/// and close the block once each.
+fn rust_log_reader(script: &str) -> String {
+    let text = fs::read_to_string(repo_root().join(script)).expect("the script must be readable");
+    for marker in [RUST_LOG_READER_OPEN, RUST_LOG_READER_CLOSE] {
+        assert_eq!(
+            text.matches(marker).count(),
+            1,
+            "{script} must carry the marker {marker:?} once"
+        );
+    }
+    let start =
+        text.find(RUST_LOG_READER_OPEN).expect("counted above") + RUST_LOG_READER_OPEN.len();
+    let end = text.find(RUST_LOG_READER_CLOSE).expect("counted above");
+    assert!(
+        start < end,
+        "{script} closes the RUST_LOG reader before it opens it"
+    );
+    text[start..end].to_owned()
+}
+
+/// `read_unit_rust_log` and `check_config_as_the_unit` are the same in both
+/// scripts, comments included (S9-D2).
+///
+/// `deploy.sh` runs piped from curl with no file of its own, so it cannot
+/// source a shared file, and each script's behaviour tests exercise only its own
+/// copy. A change to systemd's quoting rules made in one copy fails here until
+/// the other matches.
+#[test]
+fn both_scripts_carry_the_same_rust_log_reader() {
+    let deploy = rust_log_reader("script/deploy.sh");
+    let installer = rust_log_reader("script/install-selfsigned.sh");
+    assert!(
+        deploy.contains("\nread_unit_rust_log() {\n")
+            && deploy.contains("\ncheck_config_as_the_unit() {\n"),
+        "the marked block must hold both functions: {deploy}"
+    );
+    assert_eq!(
+        deploy, installer,
+        "the RUST_LOG reader in script/install-selfsigned.sh has drifted from the \
+         one in script/deploy.sh"
+    );
+}
+
 /// Whether the shell line `line` runs `curl` as a command.
 ///
 /// `curl` counts as a command word at the start of the line, after a `$(`, a

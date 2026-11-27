@@ -278,6 +278,7 @@ check_generated_config() {
     esac
 }
 
+# >>> mirrored RUST_LOG reader (deploy.sh <-> install-selfsigned.sh) >>>
 # Reads the RUST_LOG the $SERVICE_NAME unit starts the service with, so that the
 # config check can be run with it: the service reads RUST_LOG at startup and
 # refuses a value that turns its own log lines off, and this script's own
@@ -384,6 +385,7 @@ check_config_as_the_unit() {
         )
     fi
 }
+# <<< mirrored RUST_LOG reader (deploy.sh <-> install-selfsigned.sh) <<<
 
 # Asks $BINARY whether it can load the config file $1. Sets ASK_VERDICT to
 # `loads`, `refuses`, or `unasked` for a binary too old to know the flag, and
