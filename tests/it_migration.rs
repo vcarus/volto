@@ -8,6 +8,8 @@ mod common;
 
 use common::{H3Client, TestServer, echoes, open_tcp_tunnel, spawn_echo_target};
 
+/// A tunnel open before the move keeps carrying bytes after it, and a new
+/// tunnel opens on the moved connection.
 #[tokio::test]
 async fn a_tcp_tunnel_survives_the_client_changing_address() {
     let server = TestServer::start().await;
@@ -23,17 +25,7 @@ async fn a_tcp_tunnel_survives_the_client_changing_address() {
     // The same stream keeps carrying bytes across the address change; a server
     // that resets or drops the connection on migration fails here.
     echoes(&mut stream, b"after the move").await;
-}
 
-#[tokio::test]
-async fn new_tunnels_open_after_the_client_changed_address() {
-    let server = TestServer::start().await;
-    let target = spawn_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
-
-    client.rebind();
-
-    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
-
-    echoes(&mut stream, b"fresh tunnel").await;
+    let mut fresh = open_tcp_tunnel(&mut client, &target.to_string()).await;
+    echoes(&mut fresh, b"fresh tunnel").await;
 }
