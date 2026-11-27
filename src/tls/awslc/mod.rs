@@ -140,8 +140,6 @@ struct CtxData {
     /// `[security] require_ech`: refuse every ClientHello libssl accepted no
     /// ECH on.
     require_ech: bool,
-    /// Where the keylog callback writes, when `[log] keylog` is on.
-    keylog: Option<Arc<KeyLog>>,
 }
 
 /// The server side of the provider: one `SSL_CTX`, shared by every session.
@@ -152,6 +150,9 @@ pub struct ServerConfig {
     /// socket gate opens ECH extensions with them before libssl is given the
     /// ClientHello, so all three use the one set loaded per build.
     ech: Option<Arc<EchKeySet>>,
+    /// Where the keylog callback writes, when `[log] keylog` is on. Each
+    /// session copies it into its `Shared`, where the callback reads it.
+    keylog: Option<Arc<KeyLog>>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -252,7 +253,6 @@ impl<'a> Builder<'a> {
             names: self.names,
             refuse_unaccepted_ech: self.refuse_unaccepted_ech,
             require_ech: self.require_ech,
-            keylog: self.keylog,
         });
 
         // SAFETY (every call on `ctx` in this block): `ctx` is a valid SSL_CTX
@@ -335,7 +335,7 @@ impl<'a> Builder<'a> {
             let arg = Arc::as_ptr(&data).cast_mut().cast::<c_void>();
             sys::SSL_CTX_set_alpn_select_cb(ctx.as_ptr(), Some(select_alpn), arg);
             sys::SSL_CTX_set_client_hello_cb(ctx.as_ptr(), Some(judge_client_hello), arg);
-            if data.keylog.is_some() {
+            if self.keylog.is_some() {
                 sys::SSL_CTX_set_keylog_callback(ctx.as_ptr(), Some(on_keylog));
             }
         }
@@ -356,6 +356,7 @@ impl<'a> Builder<'a> {
             ctx,
             data,
             ech: self.ech,
+            keylog: self.keylog,
         })
     }
 }
@@ -926,7 +927,7 @@ impl Session {
         // reference to it and returns a new SSL or null.
         let ssl = Ssl::from_ptr(unsafe { sys::SSL_new(config.ctx.as_ptr()) }, "SSL_new")?;
         let shared = Arc::new(Mutex::new(Shared {
-            keylog: config.data.keylog.clone(),
+            keylog: config.keylog.clone(),
             ..Shared::default()
         }));
         // SAFETY: `ssl` is fresh and owned here. The QUIC method table is a
