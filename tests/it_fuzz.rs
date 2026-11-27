@@ -43,7 +43,7 @@
 //! is spent in the five properties that put bytes on a QUIC stream, since each
 //! of their cases is a round trip. That is why their defaults are the low ones.
 //! At the defaults those five take under a second, and the whole binary takes
-//! about fifteen seconds in a debug build on the dev host.
+//! between ten and fifteen seconds in a debug build on the dev host.
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the generated inputs have the lengths this file chose for them.
