@@ -9,17 +9,11 @@
 //! no packet across the proxy, and a peer can produce them as fast as its link
 //! allows.
 //!
-//! The regression this shape once exposed is D92: `tokio::time::timeout_at`
-//! returns the wrapped future's value without consulting the clock, so while the
-//! queue never ran dry, the deadline was not measured at all. This binary does
-//! not catch that regression. Under it the session is held only while the flood
-//! keeps its queue supplied. Once the flood stops, the queue drains, the next
-//! wait finds the deadline already past, and the close line appears well inside
-//! `SLACK`. The verdict on D92 belongs to the `before_deadline` unit tests in
-//! `src/tunnel/udp.rs`, which flood a paused clock and are exact. What this
-//! binary checks is the end-to-end shape: the session closes on its own, the
-//! flood really ran while the deadline did, and the budget forwarded one packet
-//! and no more.
+//! The verdict on D92 belongs to the `before_deadline` unit tests in
+//! `src/tunnel/udp.rs`, which flood a paused clock. This binary cannot catch
+//! that regression, because the close comes once the flood stops. What it
+//! checks is the end-to-end shape: the session closes on its own, the flood ran
+//! while the deadline did, and the budget forwarded one packet and no more.
 //!
 //! It is a test of its own, rather than part of `it_udp`, for two reasons:
 //!
@@ -68,19 +62,11 @@ const FLOOD_OVERRUN: Duration = Duration::from_secs(1);
 ///
 /// Not a timing probe: the module doc says why this binary cannot catch the
 /// unfixed loop, and the deterministic verdict on it belongs to the
-/// `before_deadline` unit tests, which flood a paused clock and are exact. What
-/// rules out a tighter bound is a measurement: under a parallel full-suite
-/// load the in-process flood task can starve the session task outright — one
-/// red run sat at 7 717 processed drops for nine seconds, then closed within
-/// 600 ms of `flood.abort()` — so *while the flood runs* there is no bound a
-/// loaded machine cannot cross, and a close-by deadline assertion was red 3/60
-/// at four seconds and would still have been red at ten. The assertable moment is after the flood stops: the
-/// deadline is long past, nothing re-arms it, and the only thing between the
-/// session and its close line is being scheduled once. Ten seconds is the
-/// suite's convention for a wait that exists to fail loudly rather than hang,
-/// and only a close that never comes can cross it. On the dev host the whole
-/// test takes the flood window — about two seconds — with the close itself
-/// landing mid-flood at ~1 s.
+/// `before_deadline` unit tests. While the flood runs, a loaded host can starve
+/// the session task outright, so no bound holds there. Once the flood stops,
+/// only being scheduled stands between the session and its close line, and ten
+/// seconds is the suite's bound for a wait that exists to fail rather than
+/// hang.
 const SLACK: Duration = Duration::from_secs(10);
 
 /// A budget of one packet, so exactly one payload ever crosses.
@@ -109,12 +95,9 @@ async fn a_flooded_session_closes_once_the_flood_stops_and_the_flood_crosses_not
 
     // The flood starts first, and its own first payload is the one the budget
     // allows: that packet crosses, arms the deadline, and every one after it is
-    // dropped. Flooding before arming rather than after is what makes the
-    // dropped-payload evidence below load-proof — a task spawned once the clock
-    // is already running has to cold-start inside the deadline window, and on a
-    // machine busy enough it simply does not (seen once: a session that closed
-    // having dropped a single payload, because the flood arrived after it). A
-    // flood that is already saturating the connection when the window opens has
+    // dropped. Flooding before the deadline is armed keeps the dropped-payload
+    // count below independent of how fast a spawned task starts. A flood that
+    // is already saturating the connection when the window opens has
     // no such gap. Dropped payloads re-arm nothing — that is the property under
     // test — so nothing about the ordering changes what the deadline measures.
     //
@@ -143,12 +126,9 @@ async fn a_flooded_session_closes_once_the_flood_stops_and_the_flood_crosses_not
     let armed = Instant::now();
 
     // Hold the flood over the whole deadline window and past it, then stop it
-    // deliberately before judging. Judging *during* the flood is what this test
-    // used to do, and what a loaded machine can always defeat: the flood task
-    // shares this runtime with the server it is flooding, and under enough
-    // outside pressure it starves the session task wholesale — not "the close
-    // came late" but "the session did not run at all until the flood stopped"
-    // (see `SLACK`). On a quiet host the close lands mid-flood at ~1 s and the
+    // deliberately before judging. Judging during the flood is what a loaded
+    // machine defeats (see `SLACK`). On a quiet host the close lands mid-flood
+    // at ~1 s and the
     // wait below finds the line already written; the flood outliving the close
     // costs nothing, since `send_datagram` on a closing connection just starts
     // failing.
@@ -182,14 +162,9 @@ async fn a_flooded_session_closes_once_the_flood_stops_and_the_flood_crosses_not
     // lines is a payload that arrived after the first one armed the deadline,
     // was dropped, and bought no time.
     //
-    // A count, not a rate. What it has to rule out is a flood that never ran
-    // (no line at all) and the shape seen once before the ordering above was
-    // fixed, a flood whose first dropped payload landed only after the close
-    // (one line); two lines is the smallest count that does, and no scheduling
-    // can defeat it. A rate is what a starved runner defeats: this once asked
-    // for more than a hundred, and a busy CI host delivered thirty-two in the
-    // window against thousands on the dev host, with the property under test
-    // unchanged by the number.
+    // Two lines is the smallest count that rules out both a flood that never
+    // ran and a flood whose first drop landed after the close; a rate would
+    // measure the host.
     let dropped = buffer
         .lines_since(mark, &["unanswered packet budget exhausted"])
         .len();
