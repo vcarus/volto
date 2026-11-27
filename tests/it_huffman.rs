@@ -1,16 +1,9 @@
 //! Huffman-coded field lines, from the wire (RFC 7541 Appendix B via RFC 9204).
 //!
-//! Surge Huffman-codes every request it sends, and until this file existed
-//! nothing in `cargo test` did: the crate's own QPACK encoder always writes
-//! `H = 0`, so `src/h3/huffman.rs` was reached only by its unit tests and a
-//! regression in it would have been found in production rather than here.
-//!
-//! Two halves, and they need each other. The encoder is
-//! [`common::huffman`], a second transcription of RFC 7541 Appendix B; the
-//! first test round-trips every symbol of it through the server's decoder, so
-//! the two transcriptions are checked against each other before anything is
-//! built on either. The rest send real requests coded with it, and then two
-//! literals that no conformant encoder could have produced.
+//! Surge Huffman-codes every request it sends and the crate's own QPACK encoder
+//! never does, so these tests are what reach `src/h3/huffman.rs` from the wire.
+//! The encoder is [`common::huffman`], a second transcription of RFC 7541
+//! Appendix B, checked against the server's decoder first.
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the frame lengths are ones this file writes out itself.
