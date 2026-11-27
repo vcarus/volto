@@ -309,9 +309,11 @@ impl Shaper {
             offloads_disabled: false,
         };
 
-        // One datagram per loss draw. Best effort: a kernel without one of these
-        // features refuses the flag, and the run is still worth having -- but it
-        // is worth knowing about, so it is said out loud rather than swallowed.
+        // The device behaves like a NIC rather than a loopback shortcut; netem
+        // still draws its loss on the sender's batch (see [`Counters`]). Best
+        // effort: a kernel without one of these features refuses the flag, and
+        // the run is still worth having -- but it is worth knowing about, so it
+        // is said out loud rather than swallowed.
         match Command::new("ethtool")
             .args(["-K", DEVICE, "gso", "off", "tso", "off"])
             .output()
@@ -324,7 +326,7 @@ impl Shaper {
             }
             _ => eprintln!(
                 "netem: could not turn segmentation offload off on {DEVICE}; \
-                 loss will be applied per GSO batch rather than per datagram"
+                 the run keeps the device's own offload settings"
             ),
         }
 
@@ -390,6 +392,9 @@ impl Drop for Shaper {
         if self.offloads_disabled {
             let _ = Command::new("ethtool")
                 .args(["-K", DEVICE, "gso", "on", "tso", "on"])
+                .output();
+            let _ = Command::new("ethtool")
+                .args(["-K", DEVICE, "tx-udp-segmentation", "on"])
                 .output();
         }
     }

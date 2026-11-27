@@ -195,9 +195,9 @@ applied by the same kernel code that would apply them on a wire, and it is aimed
 at the QUIC four-tuple alone — two `u32` filters on the lab server's UDP port,
 one netem per direction — so the server-to-target hop stays on unshaped
 loopback, as it broadly is in production. Segmentation offload is turned off so
-a loss draw deletes one datagram rather than a whole GSO batch, and `lo` is
-given a 1500-byte MTU so DPLPMTUD has something real to discover. The reasoning
-for each of those is in the module's own documentation.
+the device behaves like a NIC, though netem still draws its loss on the sender's
+GSO batch, and `lo` is given a 1500-byte MTU so DPLPMTUD has something real to
+discover. The reasoning for each of those is in the module's own documentation.
 
 It needs Linux, `iproute2` and `CAP_NET_ADMIN`, none of which the macOS dev host
 has, so `lossy-lab.sh` runs it in a container:
