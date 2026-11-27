@@ -1,25 +1,7 @@
 //! A lossy path under the replay, injected with `tc`/netem.
 //!
-//! # Why the replay needs one
-//!
-//! The shape replay reproduces *what the client does*: when connections arrive,
-//! how many tunnels they carry, how they end. What it has never reproduced is
-//! *the path they do it over*. Everything runs on loopback -- sub-millisecond
-//! round trip, not one packet lost -- against a production link measured at
-//! 80-95 ms whose ninetieth-percentile connection loses 13% of the packets the
-//! server sends it.
-//!
-//! That gap is not a rounding error, it is a whole half of the server that never
-//! runs: loss recovery, the congestion controller, path MTU discovery and every
-//! timer that keys off the round trip. So "the replay found no server-side
-//! fault" could only ever mean "none on a path that cannot fail", and the one
-//! production symptom the replay was built to chase -- the erasure-loss spikes
-//! on one of the captured hosts -- is loss-driven by definition and therefore
-//! structurally out of its reach.
-//!
-//! This module closes that. It puts a real qdisc on the real kernel path the
-//! replay's packets take, so the loss and the delay are applied by the same code
-//! that would apply them on a wire, not simulated inside the harness.
+//! Puts a real qdisc on the QUIC four-tuple, so loss and delay are applied by
+//! the kernel.
 //!
 //! # What it shapes, and what it deliberately does not
 //!
@@ -49,18 +31,8 @@
 //!
 //! Three further details matter enough to be defaults rather than options:
 //!
-//! * **Segmentation offload is turned off**, which helps less than it looks and
-//!   is documented here so nobody assumes otherwise. quinn hands the kernel one
-//!   `UDP_SEGMENT` batch worth many datagrams, and segmentation happens in
-//!   `validate_xmit_skb` -- *downstream* of the qdisc -- so netem takes its loss
-//!   draw on the whole batch whatever `ethtool` says. Loss is therefore bursty
-//!   in units of the sender's batch rather than the independent erasure D33/D71
-//!   settled the character of. What keeps that small is the congestion
-//!   controller: under loss the batches are, and the runs this was built for
-//!   measured about 1.5 datagrams per draw. `ethtool -K lo gso off tso off
-//!   tx-udp-segmentation off` is kept because it makes the device behave like a
-//!   NIC rather than a loopback shortcut, not because it makes the loss
-//!   per-datagram.
+//! * **Segmentation offload is turned off** so the device behaves like a NIC;
+//!   it does not make loss per-datagram, see [`Counters`].
 //! * **`lo` is given a 1500-byte MTU.** At its default 65536 every DPLPMTUD
 //!   probe succeeds by construction and path MTU discovery is not under test at
 //!   all. At 1500 the probes are real, the configured `mtu_upper_bound` of 1464
@@ -213,7 +185,6 @@ impl Spec {
                         ));
                     }
                 }
-                spec.name = text.to_owned();
                 continue;
             };
 
