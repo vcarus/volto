@@ -2388,16 +2388,17 @@ fn fragments_that_disagree_drop_the_flight() {
 }
 
 /// One packet whose own fragments cannot all join the stream drops its flight,
-/// and the hold's byte count ends where it started, whatever the fragments
-/// ahead of the refused one had written.
+/// and the hold's byte count ends where it started.
 ///
-/// Two shapes: two CRYPTO frames at offset 0 that disagree, and a fragment
-/// that fits followed by an empty CRYPTO frame at an offset past
-/// `HOLD_HELLO_BYTES`. Each is sent once into an empty hold and once beside a
-/// held flight from another address. Before the fix the first fragment's
-/// growth was taken off a count it had never been added to, which underflows
-/// in the empty hold (a panic under `poll_recv`) and leaves the count low
-/// beside another flight.
+/// Two shapes, each sent once into an empty hold and once beside a held flight
+/// from another address. Two CRYPTO frames at offset 0 that disagree reach
+/// `Hold::write`, where the first fragment has grown the stream before the
+/// second is refused, so the count has to give that growth back. An
+/// underflow of the count in the empty hold would panic under `poll_recv`. A
+/// fragment that fits followed by an empty CRYPTO frame at an offset past
+/// `HOLD_HELLO_BYTES` is dropped before anything is written, because the
+/// limit is checked on every fragment ahead of the write; it is kept as a
+/// check that this early drop leaves the count alone too.
 #[test]
 fn a_packet_whose_own_fragments_disagree_drops_its_flight_and_every_byte_of_it() {
     let crypto = nameless_crypto();
