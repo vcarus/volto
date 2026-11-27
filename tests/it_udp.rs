@@ -7,7 +7,7 @@ use std::panic::Location;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::h3client::ends_cleanly;
+use common::h3client::{ends_cleanly, ends_with_reset};
 use common::rawstream::{H3_DATAGRAM_ERROR, H3_MESSAGE_ERROR, H3_NO_ERROR, H3_REQUEST_CANCELLED};
 use common::{
     ALLOW_PRIVATE, DELIBERATE, H3Client, TIMEOUT, TestServer, assert_peer_reset,
@@ -762,19 +762,12 @@ async fn a_truncated_capsule_is_rejected() {
     stream.finish().expect("finish mid-capsule");
 
     // The server must reset the stream rather than treat this as a clean close.
-    let error = loop {
-        match tokio::time::timeout(TIMEOUT, stream.recv_data())
-            .await
-            .expect("the server responded")
-        {
-            Ok(Some(_)) => continue,
-            Ok(None) => panic!("a truncated capsule must not read as a clean end of stream"),
-            Err(error) => break error,
-        }
-    };
-
-    // H3_MESSAGE_ERROR (RFC 9114 §8.1): a message this server will not process.
-    assert_peer_reset(&error, 0x010e);
+    ends_with_reset(
+        &mut stream,
+        H3_MESSAGE_ERROR,
+        "the truncated capsule stream",
+    )
+    .await;
 }
 
 /// A DATAGRAM capsule declaring more bytes than a UDP payload can hold breaks
@@ -807,18 +800,12 @@ async fn an_oversized_datagram_capsule_is_reset_as_a_parse_error() {
         .await
         .expect("send an oversized capsule header");
 
-    let error = loop {
-        match tokio::time::timeout(TIMEOUT, stream.recv_data())
-            .await
-            .expect("the server responded")
-        {
-            Ok(Some(_)) => continue,
-            Ok(None) => panic!("an oversized capsule must not read as a clean end of stream"),
-            Err(error) => break error,
-        }
-    };
-
-    assert_peer_reset(&error, H3_DATAGRAM_ERROR);
+    ends_with_reset(
+        &mut stream,
+        H3_DATAGRAM_ERROR,
+        "the oversized capsule stream",
+    )
+    .await;
 }
 
 /// A DATAGRAM capsule whose value ends before its Context ID is a malformed
@@ -847,18 +834,12 @@ async fn a_datagram_capsule_without_a_context_id_is_a_malformed_message() {
         .await
         .expect("send an empty DATAGRAM capsule");
 
-    let error = loop {
-        match tokio::time::timeout(TIMEOUT, stream.recv_data())
-            .await
-            .expect("the server responded")
-        {
-            Ok(Some(_)) => continue,
-            Ok(None) => panic!("a malformed capsule must not read as a clean end of stream"),
-            Err(error) => break error,
-        }
-    };
-
-    assert_peer_reset(&error, H3_MESSAGE_ERROR);
+    ends_with_reset(
+        &mut stream,
+        H3_MESSAGE_ERROR,
+        "the malformed capsule stream",
+    )
+    .await;
 }
 
 /// The boundary of the size rule the session applies to what a client sends.
@@ -1355,19 +1336,12 @@ async fn a_client_that_stops_reading_capsules_gets_the_stream_reset() {
     // progress. Long enough for the one-second idle timeout to have fired.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let error = tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => panic!("a stalled capsule stream must be reset, not finished"),
-                Err(error) => return error,
-            }
-        }
-    })
-    .await
-    .expect("the server must end the stalled stream on its own");
-
-    assert_peer_reset(&error, H3_REQUEST_CANCELLED);
+    ends_with_reset(
+        &mut stream,
+        H3_REQUEST_CANCELLED,
+        "the stalled capsule stream",
+    )
+    .await;
 
     // The connection itself must be untouched: one stalled response is a stream
     // error, never a connection error.

@@ -1536,3 +1536,48 @@ fn unexpected(detail: &'static str) -> StreamError {
 fn malformed(detail: &'static str) -> StreamError {
     StreamError::Local(Violation::stream(Code::H3_MESSAGE_ERROR, detail))
 }
+
+/// Drains `stream` until the server resets it, asserting the reset carries
+/// `code`.
+///
+/// The mirror of [`ends_cleanly`], for a stream the server is supposed to cut:
+/// whatever is still in flight is read past, and a clean end is a failure,
+/// because a truncated response is indistinguishable from a complete one.
+/// `what` names the stream being waited on.
+#[track_caller]
+pub fn ends_with_reset<'a>(
+    stream: &'a mut ClientStream,
+    code: u64,
+    what: &'static str,
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        let drained = async {
+            loop {
+                match stream.recv_data().await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => panic!(
+                        "{what}, awaited at {caller}, ended cleanly: a truncated response is \
+                         indistinguishable from a complete one"
+                    ),
+                    Err(error) => return error,
+                }
+            }
+        };
+
+        let error = tokio::time::timeout(super::TIMEOUT, drained)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{what}, awaited at {caller}, was still open after {:?}",
+                    super::TIMEOUT
+                )
+            });
+
+        assert_eq!(
+            volto::h3api::peer_reset_code(&error),
+            Some(code),
+            "{what}, awaited at {caller}, should be reset with {code:#x}, got {error:?}"
+        );
+    }
+}

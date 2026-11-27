@@ -8,7 +8,7 @@ use std::panic::Location;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::h3client::ends_with_no_body;
+use common::h3client::{ends_with_no_body, ends_with_reset};
 use common::rawstream::{
     FRAME_DATA, FRAME_HEADERS, H3_CONNECT_ERROR, H3_FRAME_UNEXPECTED, H3_MESSAGE_ERROR,
     H3_REQUEST_CANCELLED, close_reason, connect_headers_frame, frame, headers_frame, read_frame,
@@ -480,17 +480,12 @@ async fn target_reset_becomes_h3_connect_error() {
         .await
         .expect("send payload");
 
-    // Matched rather than `expect_err`ed: the point is to name what a success
-    // would have meant, which a panic message from `expect_err` cannot.
-    let error = match tokio::time::timeout(TIMEOUT, stream.recv_data())
-        .await
-        .expect("the reset arrived")
-    {
-        Ok(_) => panic!("a target reset must not look like a clean end of stream"),
-        Err(error) => error,
-    };
-
-    assert_peer_reset(&error, H3_CONNECT_ERROR);
+    ends_with_reset(
+        &mut stream,
+        H3_CONNECT_ERROR,
+        "the tunnel to a reset target",
+    )
+    .await;
 }
 
 /// The same target reset, noticed by the *write* pump instead.
@@ -541,24 +536,14 @@ async fn target_reset_during_a_client_upload_becomes_h3_connect_error() {
     let send_error = send_error.expect("the client's upload must be stopped by the target's reset");
     assert_peer_reset(&send_error, H3_CONNECT_ERROR);
 
-    // Drain what the target managed to send before the reset; the flood is there
-    // to pin the read pump, not to be checked. What matters is how it ends.
-    let error = tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => panic!(
-                    "a target reset reached the client as a clean end of stream: a truncated \
-                     response is indistinguishable from a complete one"
-                ),
-                Err(error) => return error,
-            }
-        }
-    })
-    .await
-    .expect("the reset arrived");
-
-    assert_peer_reset(&error, H3_CONNECT_ERROR);
+    // What the target managed to send before the reset is read past; the flood
+    // is there to pin the read pump, not to be checked.
+    ends_with_reset(
+        &mut stream,
+        H3_CONNECT_ERROR,
+        "the tunnel to a reset target",
+    )
+    .await;
 }
 
 /// The same target reset again, read off the *request* direction.
@@ -730,18 +715,12 @@ async fn a_client_reset_cancels_the_response_direction_too() {
     // response direction stays open, which is the half under test.
     stream.stop_stream(volto::h3api::Code::H3_REQUEST_CANCELLED);
 
-    let error = match tokio::time::timeout(TIMEOUT, stream.recv_data())
-        .await
-        .expect("the server must end the response direction promptly")
-    {
-        Ok(Some(_)) => panic!("this target never writes, so there is nothing to read"),
-        Ok(None) => panic!(
-            "a cancelled request reached the client as a clean end of stream: a truncated \
-             response is indistinguishable from a complete one"
-        ),
-        Err(error) => error,
-    };
-    assert_peer_reset(&error, H3_REQUEST_CANCELLED);
+    ends_with_reset(
+        &mut stream,
+        H3_REQUEST_CANCELLED,
+        "the response direction of a cancelled request",
+    )
+    .await;
 
     // And the other operation §4.4 asks for on a client abort is unchanged.
     let end = tokio::time::timeout(TIMEOUT, ended.recv())
@@ -1257,21 +1236,7 @@ async fn a_half_closed_tunnel_whose_client_stops_reading_is_cut() {
 
     // And the client's own half is cancelled rather than left to a FIN, which a
     // truncated response would otherwise be indistinguishable from.
-    let error = tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => panic!(
-                    "an abandoned download reached the client as a clean end of stream: a \
-                     truncated response is indistinguishable from a complete one"
-                ),
-                Err(error) => return error,
-            }
-        }
-    })
-    .await
-    .expect("the reset arrived");
-    assert_peer_reset(&error, H3_REQUEST_CANCELLED);
+    ends_with_reset(&mut stream, H3_REQUEST_CANCELLED, "the abandoned download").await;
 }
 
 /// A TCP target that writes `total` bytes, ends its sending side, and then
