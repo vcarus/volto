@@ -24,9 +24,8 @@
 # would act on and stops before touching anything. Together with
 # VOLTO_DEPLOY_ROOT, which prefixes every install path, and
 # VOLTO_DEPLOY_CANDIDATE, which names a binary to check the config against
-# instead of downloading one, that puts the three branches which have broken (or
-# would break silently) in production -- the convergence check, refresh_self
-# under a piped bootstrap, and the config check above -- inside reach of
+# instead of downloading one, that puts the convergence check, refresh_self
+# under a piped bootstrap and the config check within reach of
 # tests/it_deploy.rs, with no root, no systemd and no network.
 
 # `-E` so the ERR trap the update block arms is inherited by functions;
