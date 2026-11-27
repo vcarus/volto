@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use quinn::congestion::{Controller, ControllerFactory};
 
 use super::base_loss::{Closed, READINGS};
-use super::{Bbr, BbrConfig, INITIAL_WINDOW, LOSS_TIME_THRESHOLD, Record};
+use super::{Bbr, BbrConfig, INITIAL_WINDOW, LOSS_TIME_THRESHOLD, MIN_RTT_LIFETIME, Record};
 
 /// quinn's `TIMER_GRANULARITY` in quinn-proto `src/lib.rs`: the shortest loss
 /// delay.
@@ -1030,9 +1030,9 @@ impl Sim {
             }
             let at = self.at(now);
             if !probe
-                && let Some(wake) = self
-                    .pacer
-                    .delay(self.rtt.get(), size, self.sc.packet, window, at)
+                && let Some(wake) =
+                    self.pacer
+                        .delay(self.rtt.get(), size, self.sc.packet, window, at)
             {
                 let wake = nanos(wake.saturating_duration_since(self.t0));
                 self.pacing_at = Some(wake.max(now + 1));
@@ -2302,6 +2302,32 @@ fn an_idle_gap_between_two_transfers() {
                     "{name} seed {seed}: the idle span counted as window-limited: {:?}",
                     r.record
                 );
+                let carried = 200.0 * (1.0 - drop_share);
+                assert!(
+                    r.delivered_end >= 0.95 * carried,
+                    "{name} seed {seed}: the last 10 s delivered {:.1} of {carried:.1}",
+                    r.delivered_end
+                );
+                // Over the minimum RTT's lifetime, the first ACK after the
+                // gap starts a probe, and the probe takes a raised RTT at
+                // once.
+                let resumed = to_f64(10 + gap);
+                if gap > MIN_RTT_LIFETIME.as_secs() {
+                    assert!(
+                        r.probes.iter().any(|&t| t >= resumed && t < resumed + 0.5),
+                        "{name} seed {seed}: probes {:?}",
+                        r.probes
+                    );
+                    if let Some(ms) = rtt_after {
+                        let taken = r.min_rtt_changes.iter().find(|c| c.0 >= resumed);
+                        assert!(
+                            taken.is_some_and(
+                                |&(t, v, _)| t < resumed + 1.0 && v >= 0.95 * to_f64(ms)
+                            ),
+                            "{name} seed {seed}: the first minimum after the gap {taken:?}"
+                        );
+                    }
+                }
             }
         }
     }
