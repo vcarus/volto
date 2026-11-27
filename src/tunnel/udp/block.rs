@@ -1,8 +1,5 @@
 //! The receive block of a UDP session: the block each target packet lands in,
 //! behind room for what it is sent with.
-//!
-//! [`PacketBlock`]'s fields are private to this file, so the session reaches
-//! the packet in hand only through its methods.
 
 use std::cell::RefCell;
 use std::io::{IoSliceMut, Read};
@@ -86,6 +83,10 @@ thread_local! {
 /// SETTINGS arrive keeps its block.
 const CAPSULE_ROOM: usize = h3api::DATA_HEADER_ROOM + capsule::UDP_DATAGRAM_HEADER_MAX;
 
+// The largest datagram prefix: an 8-byte Quarter Stream ID varint and the
+// 1-byte Context ID 0.
+const _: () = assert!(CAPSULE_ROOM >= 9);
+
 /// The receive side of a session's target socket: each packet lands behind
 /// room for its prefix in a [`RECV_BLOCK_SIZE`] block.
 ///
@@ -137,7 +138,7 @@ impl PacketBlock {
         Self {
             quarter_stream_id,
             prefix_len,
-            room: room.max(prefix_len),
+            room,
             block: BytesMut::new(),
             prepared: false,
             spilled: None,
