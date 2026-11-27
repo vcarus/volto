@@ -2,18 +2,11 @@
 //!
 //! # Which header
 //!
-//! Surge sends credentials on *every* CONNECT request, but its manual does not
-//! say in which field. `Proxy-Authorization` is the proxy-semantics answer and
-//! what comparable implementations use, while `Authorization` is what a client
-//! that treats the proxy as an origin would send. This is the one point the
-//! research left open (decision D3), so both are accepted: every value of
-//! `Proxy-Authorization` is tried first, then every value of `Authorization`, and
-//! any one of them matching is enough. When the first live Surge connection
-//! settles the question, nothing here needs to change.
-//!
-//! Two values is all that answers for, so a request may carry at most
-//! [`MAX_CREDENTIAL_VALUES`], and every value tried and refused is charged one
-//! authentication failure.
+//! Surge sends credentials on every CONNECT request, in `Proxy-Authorization`
+//! (D3). `Authorization` is accepted as well, for a client that treats the
+//! proxy as an origin: every value of `Proxy-Authorization` is tried first,
+//! then every value of `Authorization`, and any one matching is enough.
+//! [`MAX_CREDENTIAL_VALUES`] bounds how many values a request may carry.
 //!
 //! # Comparison discipline
 //!
@@ -48,12 +41,10 @@ pub const CREDENTIAL_FIELDS: [&str; 2] = ["proxy-authorization", "authorization"
 
 /// The most credential field values one request may carry.
 ///
-/// One per accepted field name, which is every value decision D3 asks for: a
-/// client sends its credentials once, and the open question is only which of the
-/// two names it sends them under. A request carrying more than this is refused
-/// with 400 before any of its values is tried, and every value that is tried
-/// and refused is charged one failure (decision D76), so the work one request
-/// can ask for, and the guesses it can carry, are both bounded by this number.
+/// One per accepted field name (D3). A request carrying more is refused with
+/// 400 before any value is tried, and every value tried and refused is charged
+/// one failure (D76), so this bounds both the work and the guesses one request
+/// carries.
 pub const MAX_CREDENTIAL_VALUES: usize = CREDENTIAL_FIELDS.len();
 
 /// The challenge offered when credentials are missing or wrong.
@@ -64,9 +55,8 @@ pub const MAX_CREDENTIAL_VALUES: usize = CREDENTIAL_FIELDS.len();
 ///
 /// RFC 7617 §2 makes `realm` required for Basic, so the challenge carries one.
 /// Any peer that completes a handshake can read it, so it says no more than a
-/// 407 already does: it names neither the protocol nor a product (D73 addendum
-/// of 2026-11-20).
-pub const CHALLENGE: &str = "Basic realm=\"proxy\"";
+/// 407 already does: it names neither the protocol nor a product (D73).
+const CHALLENGE: &str = "Basic realm=\"proxy\"";
 
 /// Checks request credentials against the configured users.
 pub struct Authenticator {
@@ -88,11 +78,8 @@ pub enum Denied {
         /// The user-id the client claimed. Not a secret, and the only way to tell
         /// a typo apart from a scan in the logs.
         ///
-        /// Bounded by [`crate::logfmt::bounded_bytes`] where it is built rather
-        /// than where it is logged: the peer chooses its length as well as its
-        /// bytes, and a user-id is everything before the first colon of a whole
-        /// field section, so an unbounded one costs a 49 KB allocation on the
-        /// way to a log line five times that size.
+        /// Bounded by [`crate::logfmt::bounded_bytes`] where it is built: the
+        /// peer chooses its length, up to a whole field section.
         username: String,
     },
 }
@@ -291,11 +278,9 @@ pub fn challenge_fields() -> Fields {
 
 /// Whether a field carries credentials, and so must never be logged verbatim.
 ///
-/// Both names this server accepts (decision D3), matched case-insensitively. A
-/// field name is lowercase by the time it gets here (RFC 9114 §4.2, enforced
-/// by `h3::stream`), but this must not depend on that. It reads the same list
-/// [`credentials`] does, so settling D3 cannot accept a third field name here
-/// and go on printing it in [`crate::conn`]'s request log.
+/// Both names [`credentials`] reads, from the same list, matched
+/// case-insensitively so the redaction does not depend on the codec having
+/// lowercased the name.
 pub(crate) fn is_credential_field(name: &str) -> bool {
     CREDENTIAL_FIELDS
         .iter()
@@ -337,9 +322,7 @@ fn basic_token(value: &str) -> Result<&str, Denied> {
 
 /// Decodes standard base64 (RFC 4648 §4).
 ///
-/// Hand-rolled (decision D13, by the test D2 applies to `datagram.rs`): this is
-/// the server's only base64 decoder, and ~40 lines is a smaller thing to own
-/// than another dependency in the production binary. Deliberately strict about
+/// Hand-rolled (D13). Deliberately strict about
 /// framing (length a multiple of four, padding only at the very end), because
 /// the input is an authentication credential, and lenient only about the unused
 /// low bits of a padded quantum, which some encoders leave non-zero.
@@ -479,7 +462,7 @@ mod tests {
         assert_eq!(auth.authenticate(&fields), Ok(Some("user1")));
     }
 
-    /// The fallback that makes decision D3 safe to leave open.
+    /// The fallback field (D3).
     #[test]
     fn authorization_is_accepted_as_a_fallback() {
         let auth = authenticator(&[("user1", "s3cret")]);
@@ -516,7 +499,7 @@ mod tests {
     }
 
     /// A username from one user and a password from another must not combine into
-    /// a valid credential — the trap a per-field lookup would fall into.
+    /// a valid credential, which a per-field lookup would allow.
     #[test]
     fn credentials_may_not_be_mixed_between_users() {
         let auth = authenticator(&[("a", "pw-a"), ("b", "pw-b")]);
