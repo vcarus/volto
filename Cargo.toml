@@ -63,8 +63,6 @@ quinn-proto = { version = "0.11", default-features = false }
 # (`names::host_name`). This is the crate rustls re-exports as
 # `rustls::pki_types`, so calling it directly runs the same code. `std` is
 # what the PEM reader needs, and what rustls's own `std` feature turns on.
-# `rustls-pemfile` is unmaintained (RUSTSEC-2025-0134) and was only a wrapper
-# around the same PEM code (`pem::PemObject`, rustls-pki-types >= 1.9).
 rustls-pki-types = { version = "1.16", default-features = false, features = [
     "std",
 ] }
@@ -151,15 +149,13 @@ anyhow = "1"
 
 # Safe wrappers around the syscalls that have no portable equivalent in std:
 # getrlimit(RLIMIT_NOFILE) for the startup fd-budget check (POSIX, both hosts)
-# and IP_MTU_DISCOVER for the DF bit (Linux only, behind cfg in net.rs). Both
-# used to be hand-written `libc` FFI, and replacing them is what keeps `unsafe`
-# out of `src/` apart from the TLS binding (`src/lib.rs` says which module).
+# and IP_MTU_DISCOVER for the DF bit (Linux only, behind cfg in net.rs).
 #
 # It is pure Rust with no C to build -- on Linux it issues the syscalls itself
 # rather than linking libc's -- so it adds nothing to the musl cross-build that
 # release.yml and cross.yml run.
 #
-# `net` is the sockopt module, `process` is getrlimit/setrlimit, and `system` is
+# `net` is the sockopt module, `process` is getrlimit, and `system` is
 # the `uname` that `--diagnostics` prints; `std` is rustix's own default and is
 # spelled out because the default set is off.
 #
@@ -224,23 +220,13 @@ path = "tests/interop/difforacle/oracle.rs"
 # wants `--release`; `it_resolver_pool` binds `127.0.0.1:53` and rewrites
 # `/etc/resolv.conf`, so it refuses to run outside a container it may modify.
 # Both are still worth compiling and still worth running -- just never as part
-# of a suite, which is what this feature says out loud. `cargo test` was already
-# linking both (`it_bench` pulls in the whole harness) to run nothing at all.
+# of a suite, which is what this feature says out loud.
 #
 # Not "bench": `it_resolver_pool` is a fault injection, not a measurement, and
 # what the two have in common is the operator, not the benchmark.
 #
-# Forgetting the flag cannot be mistaken for a green run. Cargo refuses the
-# invocation rather than filtering the target away:
-#
-#     $ cargo test --test it_bench
-#     error: target `it_bench` in package `volto` requires the features:
-#     `operator-runs`
-#     Consider enabling them by passing, e.g., `--features="operator-runs"`
-#
-# and exits non-zero. A plain `cargo test` simply does not build them, which is
-# the point of the gate; what would be dangerous is `--test <name>` reporting a
-# green run of nothing, and it does not.
+# `cargo test --test it_bench` without the feature is refused by cargo with a
+# non-zero exit; a plain `cargo test` does not build the two.
 #
 # `cargo clippy --all-targets --all-features -- -D warnings` in ci.yml keeps
 # them typechecked and linted, so they cannot rot behind the flag.
@@ -310,11 +296,9 @@ rcgen = { version = "0.14", default-features = false, features = [
 
 # `test-util` gives the tests a clock they drive themselves: `start_paused` plus
 # `tokio::time::advance` make "three hours pass" free and exact, which is the
-# only way to assert a *deadline* rather than assert around one. Every budget
-# test in this tree used to be a real sleep with a generous upper bound and an
-# apology in its doc comment; those are now exact, and the cases that could not
-# be written at all before -- a VM resumed after hours, where every armed timer
-# fires in the same instant -- are written.
+# only way to assert a *deadline* rather than assert around one, so a test
+# asserts a deadline exactly, including every armed timer firing at once after
+# a long suspend.
 #
 # A dev-dependency feature, so nothing in a release build changes. Even under
 # `cargo test` the clock is the real one until a test pauses it: the feature
@@ -350,13 +334,11 @@ proptest = "1"
 # the poll that panics. What it drops is the variable, type and scope records a
 # stepping debugger would want, and nothing in this workflow is one. The saving
 # is link time and disk, and it is paid once per integration test binary in
-# `tests/` -- of which there are enough for that multiplier to be the whole
-# reason this setting is here (a number would be out of date within a week).
+# `tests/`.
 #
 # `[profile.dev.package."*"] opt-level = 2` is the usual companion to this and
 # is deliberately absent: optimising the dependency graph moves what the D86
-# config-space property tests and `cargo mutants` are measuring, so it was
-# weighed and declined rather than overlooked.
+# config-space property tests and `cargo mutants` are measuring.
 [profile.dev]
 debug = "line-tables-only"
 
@@ -398,16 +380,14 @@ strip = true
 # their hot paths (quinn-proto, aws-lc-rs) are not ours to slow, and aws-lc is C,
 # which this setting does not reach. `as` casts are not checked by it either;
 # those are covered by `clippy::as_conversions`, which every cast in `src/`
-# allows explicitly with its own argument. Cost measured with `it_bench` on the
-# musl target before this was committed; see the commit message.
+# allows explicitly with its own argument.
 #
 # `strip = true` is repeated here because this table needs it. With a package
 # table present, cargo 1.100 passes this package `-C strip=debuginfo`, the
 # default of a profile that sets no `strip`, and not the `strip = true` of
 # `[profile.release]`; the dependencies still get `-C strip=symbols`. The
 # binary is linked as this package's unit, so without the line below it keeps
-# its `.symtab`, which is what cross.yml's "The built binary is stripped" step
-# reported on the first pull request that carried this table.
+# its `.symtab`.
 [profile.release.package.volto]
 overflow-checks = true
 strip = true
