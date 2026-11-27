@@ -11,9 +11,7 @@ use crate::varint::len_u64;
 ///
 /// The type byte of DATA plus a 4-byte length varint, the longest one a
 /// payload below 2^30 bytes needs. Every buffer this server reads a tunnel's
-/// bytes into is far below that. The layout is this server's own choice: what
-/// reaches the wire is the frame [`put_header`] and the payload make together,
-/// with the same minimal length encoding.
+/// bytes into is far below that.
 pub const DATA_HEADER_ROOM: usize = 5;
 
 /// Turns `block` into one DATA frame without moving its payload.
