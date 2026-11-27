@@ -22,7 +22,7 @@
 //! | c2 | Authenticates once and then idles for ever | None -- the bound is lifted for the life of the connection (`Context.authenticated`) | Nothing; the connection stays usable | `it_handshake::an_authenticated_connection_is_not_bounded` |
 //! | d | Opens a request stream and stalls before its HEADERS arrive -- or a batch of them at once, past authentication where no connection bound is left | One `max_idle_timeout` per stream, in `Resolver::resolve` (`src/h3/stream.rs`, D76 M2) | RESET_STREAM + STOP_SENDING H3_REQUEST_INCOMPLETE (0x10d) on every one of them; the connection carries on | `it_handshake::a_request_that_stalls_before_its_headers_is_reset`, `it_handshake::a_batch_of_stalled_requests_is_reset_stream_by_stream` |
 //! | d2 | Opens a unidirectional stream and never completes its type varint -- or all sixteen of its allowance at once | One `max_idle_timeout` on `read_stream_type` (`src/h3/control.rs`, review L3), concurrently per stream | STOP_SENDING H3_STREAM_CREATION_ERROR on each; the credit comes back; the connection carries on | `it_hardening::a_unidirectional_stream_that_never_names_its_type_is_abandoned`, [`a_stalled_uni_stream_allowance_is_reclaimed`] |
-//! | e | Announces a HEADERS frame larger than one frame may be | `MAX_BUFFERED_FRAME` = `MAX_FIELD_SECTION_SIZE` = 64 KiB (`src/h3/frame.rs`) | 431 then STOP_SENDING H3_EXCESSIVE_LOAD (0x107); the connection carries on | `it_settings::an_oversized_header_section_is_refused` |
+//! | e | Announces a HEADERS frame larger than one frame may be | `MAX_BUFFERED_FRAME` = `MAX_FIELD_SECTION_SIZE` = 64 KiB (`src/h3/frame.rs`) | STOP_SENDING H3_EXCESSIVE_LOAD (0x107), then 431; the connection carries on | `it_settings::an_oversized_header_section_is_refused` |
 //! | e2 | Announces full-sized HEADERS on stream after stream and finishes none | `HEADERS_BUFFER_BUDGET` = 1 MiB per connection (`src/h3/mod.rs`, D77) | 431 + H3_EXCESSIVE_LOAD on the request past the budget only; sixteen at once are all served | `it_hardening::headers_buffered_across_a_connection_are_bounded`, `it_hardening::a_request_past_the_buffering_budget_costs_only_that_request` |
 //! | e3 | Fills that budget with request streams, then sends its own well-formed control frames | The control stream has an unshared budget (`BufferBudget::unshared`), so its frames cannot be the ones refused -- a refusal there could only be a connection error | Nothing: the control frames are accepted and the connection lives | [`the_control_stream_does_not_share_the_request_buffering_budget`] |
 //! | f | Grants no flow-control window, so it never reads its 407/403/431/501 | One `max_idle_timeout` per refusal write, in `Stream::respond_within` (`src/h3/stream.rs`, review H1) | RESET_STREAM H3_REQUEST_CANCELLED (0x10c); the connection carries on | `it_hardening::a_refusal_the_peer_will_not_take_is_reset`, `it_hardening::a_431_the_peer_will_not_take_is_reset`; shipped numbers in [`the_shipped_write_deadline_ends_an_unread_refusal`] |
@@ -1009,7 +1009,7 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
 /// RFC 9114 §9 has this server skip a frame type it does not know, and §7.2.8
 /// makes the reserved grease types padding a peer MAY send; §10.5 then asks an
 /// implementation to track and limit that use. `frame::MAX_SKIPPED_FRAMES` is
-/// that limit. The flood here is zero-length grease frames -- two wire bytes
+/// that limit. The flood here is zero-length grease frames -- three wire bytes
 /// apiece, declaring no payload -- so it is also the on-wire proof that the
 /// bound counts frames rather than the bytes they carry: a byte budget would
 /// charge these nothing and never fire.
@@ -1178,8 +1178,8 @@ async fn an_unfinished_unknown_first_frame_is_refused_from_its_header() {
 /// hang up, and this server treats it as one.
 ///
 /// The second half is the rule that does bite: an identifier that grows is
-/// H3_ID_ERROR, because it would be taking back a promise about which requests
-/// the peer has already abandoned.
+/// H3_ID_ERROR, because it would raise a limit on server pushes the peer had
+/// already lowered. A client's GOAWAY carries a push ID (RFC 9114 §5.2).
 #[tokio::test]
 async fn a_goaway_from_the_peer_does_not_end_the_connection() {
     let server = TestServer::start().await;
@@ -1187,8 +1187,7 @@ async fn a_goaway_from_the_peer_does_not_end_the_connection() {
 
     let mut control = harmless_settings();
     control.extend_from_slice(&varint_frame(FRAME_GOAWAY, 8));
-    // Repeating it with an identifier that has not grown is legal and says the
-    // peer has abandoned more, not fewer, of its own requests.
+    // Repeating it with an identifier that has not grown is legal.
     control.extend_from_slice(&varint_frame(FRAME_GOAWAY, 4));
     // And the same identifier once more, which is the boundary the rule turns
     // on: only an identifier *larger* than one already received is refused, so
