@@ -36,7 +36,7 @@ A plain `cargo build --target x86_64-unknown-linux-musl` with Debian's
 C++ compiler, and bindgen, which generates the bindings at build time through
 libclang, finds no C headers for a musl target there. Go is not needed.
 
-A musl build also compiles mimalloc with the same C compiler and uses it as the global allocator in place of musl's `malloc`. A musl build measured a higher CPU cost than a glibc build of the same commit, and the allocator is the part of libc this replaces. Every other target keeps the platform allocator. The reasoning and the numbers are in `src/alloc.rs` and in the comment above the `mimalloc` dependency in `Cargo.toml`.
+A musl build also compiles mimalloc with the same C compiler and uses it as the global allocator in place of musl's `malloc`. Every other target keeps the platform allocator. The comment above the `mimalloc` dependency in `Cargo.toml` says why.
 
 The release workflow builds both
 targets with [`cross`](https://github.com/cross-rs/cross); the resulting static
@@ -528,10 +528,7 @@ start that takes that long will not finish. Outside systemd, with no
 and the socket cannot be used, the server logs one warning (`log_id=wkj009dk`,
 `log_id=h6ro04gv` or `log_id=kyd7134y`) and serves without notifications.
 
-A volto from before `Type=notify` never sends `READY=1`. Under this unit its
-start fails after `TimeoutStartSec=`, so the unit goes back with the binary on
-every rollback. `volto-deploy` keeps and restores both, and
-[rolling back](#rolling-back) has the commands for a rollback by hand.
+Rolling back to a release from before `Type=notify` needs its unit too; see [rolling back](#rolling-back).
 
 The QUIC endpoint can stop while no shutdown was asked for: quinn ends it when
 the socket's receive call fails with an error other than a connection reset.
@@ -587,11 +584,7 @@ failed is filed at `err` the same way:
 journalctl -u volto -p warning --since -24h
 ```
 
-Every line at `info` or above also carries a `log_id` field: eight lowercase
-letters and digits naming that one statement, fixed for the life of the line
-even if its wording changes. A runbook or an alert should match on the id rather
-than on the words, which a later release may rewrite. This selects the warning a
-connection that ended badly writes, and nothing else:
+A runbook or an alert matches on a line's `log_id` rather than on its words. This selects the warning a connection that ended badly writes, and nothing else:
 
 ```sh
 journalctl -u volto --since -24h | grep log_id=9pds6tk6
@@ -599,16 +592,7 @@ journalctl -u volto --since -24h | grep log_id=9pds6tk6
 
 See [`[log]`](configuration.md#log) for the rest of the line format.
 
-When a problem needs reporting rather than reading, `volto --diagnostics
---config /etc/volto/config.toml` prints the version, the parsed configuration
-with passwords redacted, descriptor limits, the UDP buffer sysctls and the
-kernel, in one paste. The two `RLIMIT_NOFILE` lines are those of the process
-that ran the command, so from an SSH shell they are the shell's and not the
-service's. The bundle says so on the line under them, and on Linux it prints the
-service's own `Max open files` values as well, read from `/proc/<pid>/limits` of
-every running volto process it finds. To read that by hand, `systemctl show -p
-MainPID volto` gives the pid. See [collecting a support
-bundle](configuration.md#collecting-a-support-bundle).
+`volto --diagnostics --config /etc/volto/config.toml` prints a support bundle with the passwords redacted; see [collecting a support bundle](configuration.md#collecting-a-support-bundle).
 
 ### The watchdog
 
