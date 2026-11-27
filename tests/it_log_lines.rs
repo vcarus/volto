@@ -996,8 +996,8 @@ fn every_production_log_statement_is_accounted_for() {
     let found = scan();
 
     // The way a source-scanning gate fails without saying so: it stops finding
-    // anything and reports that everything is accounted for (`it_scrub`'s
-    // lesson, learned the hard way). A scanner that has gone partly blind is
+    // anything and reports that everything is accounted for. A scanner that has
+    // gone partly blind is
     // caught by `the_table_names_no_statement_that_is_gone` instead, which turns
     // every statement it stopped seeing into a stale entry.
     assert!(
@@ -1418,9 +1418,7 @@ fn the_scanner_finds_a_statement_and_leaves_the_prose_about_it_alone() {
     );
     assert!(log_statements("x.rs", &prose).is_empty());
 
-    // The fourth spelling, with its level where the fields go. Nothing in
-    // `src/` writes one today, which is exactly why the scanner has to be
-    // shown reading it: the first one written must be red, not invisible.
+    // `event!`, whose level is an argument.
     let evented = log_statements(
         "x.rs",
         "    tracing::event!(Level::WARN, log_id = \"55ab77cd\", \"the sentinel fired\");\n",
