@@ -8,20 +8,9 @@
 //! stream and naming its type, building a frame, reading one back, waiting for
 //! the connection to end.
 //!
-//! What is *not* here is any assertion about what the server chose. The ones
-//! this module does make are the ones that were written identically at every
-//! call site: a response carries `:status` ([`status_of`]), a response read
-//! whole off a stream is one HEADERS frame and nothing after it
-//! ([`status_of_response`]), a stream the server refuses to read is stopped
-//! ([`stopped_code`]), a connection the server ends is ended with a code the
-//! caller names ([`close_reason`]), or with an application close at all,
-//! whose code and reason are handed back ([`application_close`]), a connection that needs more than the pre-authentication
-//! stream allowance gets itself through the door first ([`authenticate`]), and
-//! a connection that survived whatever was done to it is still answering
-//! ([`still_serving`]).
-//!
-//! D66 shape: helpers that assert are synchronous functions returning a future,
-//! so `#[track_caller]` survives to the poll that panics.
+//! The assertions here are the ones every call site made the same way; none
+//! judges what the server chose. See `common` for the D66 shape of the
+//! asserting helpers.
 
 #![allow(dead_code)]
 // Each integration test binary uses a subset of this.
@@ -49,9 +38,8 @@ use super::TIMEOUT;
 //
 // Shared between test binaries, which leaves that property intact -- what it
 // asks for is that the wire side of a test not read the server's definition,
-// not that every binary keep its own transcription. One copy is also one place
-// to check a number against its registry, and the copies had already drifted
-// apart in type and in name before they were gathered here.
+// not that every binary keep its own transcription. One copy is one place to
+// check a number against its registry.
 //
 // The three closed registries -- frame types, unidirectional stream types, and
 // the error codes of RFC 9114 §8.1 with RFC 9204 §6's beside them -- are
@@ -124,8 +112,7 @@ pub const SETTINGS_H3_DATAGRAM: u64 = 0x33;
 //
 // All `u64`, which is what a code on the wire is. The few call sites that
 // *send* one narrow it with `as u32` for the infallible
-// `quinn::VarInt::from_u32`; they used to keep a second `u32` copy of the
-// number instead, which is one of the drifts this block ends.
+// `quinn::VarInt::from_u32`.
 
 /// H3_NO_ERROR, RFC 9114 §8.1: "No error. This is used when the connection or
 /// stream needs to be closed, but there is no error to signal."
@@ -265,10 +252,7 @@ pub fn connect_udp_headers_frame(authority: &str, host: &str, port: u16) -> Vec<
 ///
 /// Port 25 is on the deny list and the port rule is checked before the resolver
 /// runs, so a request for it is answered without a packet leaving this host.
-/// That is what makes it the cheapest request a test can make when what it
-/// wants is an *answer* rather than a tunnel — and the choice depends on two
-/// facts about the server (the port is denied, and the port rule runs before
-/// the resolver), so it is stated here once rather than at every call site.
+/// So it is the cheapest request that draws an answer.
 pub const DENIED_TARGET: &str = "192.0.2.1:25";
 
 /// Opens a request stream and asserts the server answers it.
@@ -277,9 +261,6 @@ pub const DENIED_TARGET: &str = "192.0.2.1:25";
 /// [`DENIED_TARGET`]: nothing has to be listening, and the answer still proves
 /// the connection is serving rather than merely unclosed -- which is the
 /// difference most hostile cases turn on.
-///
-/// Written as a synchronous function returning a future so `#[track_caller]`
-/// survives to the poll that panics (D66).
 #[track_caller]
 pub fn still_serving(connection: &quinn::Connection) -> impl Future<Output = ()> + '_ {
     expect_denied(
@@ -359,8 +340,7 @@ async fn expect_denied(
 /// reason the frame types above are spelled out: these are the bytes the
 /// server is asked to read.
 ///
-/// The type and `bytes` leave in a single `write_all`, which is how every call
-/// site wrote it. A test whose subject is a type varint that arrives in pieces
+/// The type and `bytes` leave in one `write_all`. A test whose subject is a type varint that arrives in pieces
 /// -- or never arrives at all -- writes its own bytes instead.
 ///
 /// The stream is handed back rather than dropped: dropping a
@@ -433,13 +413,11 @@ pub struct Refusals {
 
 /// Reads every stream in `streams` to its end at once, collecting the answers.
 ///
-/// The shape six tests of the connection-wide HEADERS budget (D77) share: a
-/// batch of request streams that have each announced a frame, all of them read
-/// at the same time, because which of them the server refuses is up to the order
-/// its tasks reach them in and only the count and the status are the subject.
-/// What is announced stays with the caller, since it differs (a full-sized
-/// HEADERS at five of the six sites, a PUSH_PROMISE header at the sixth), as
-/// does `capacity`, which each caller sizes to the batch it is judging.
+/// The shape the tests of the connection-wide HEADERS budget (D77) share: a
+/// batch of announced request streams read at once, since which ones the
+/// server refuses depends on the order its tasks reach them. What is announced
+/// stays with the caller, as does `capacity`, which each caller sizes to the
+/// batch it is judging.
 ///
 /// # Two invariants, both of which turn a test green for the wrong reason
 ///
@@ -453,8 +431,8 @@ pub struct Refusals {
 /// The collecting side sees the end of the answers only once every sender is
 /// dropped. This function clones one sender per reader and drops its own before
 /// returning, so `answers.recv()` yields `None` once the last reader has
-/// finished, and a caller that drains to the end terminates. A seventh copy that
-/// kept a sender alive would hang there instead.
+/// finished, and a caller that drains to the end terminates. A sender kept
+/// alive elsewhere would hang it.
 pub fn collect_refusals(
     streams: Vec<(quinn::SendStream, quinn::RecvStream)>,
     capacity: usize,
@@ -579,9 +557,6 @@ pub fn status_of(block: &[u8]) -> String {
 /// frame at a time: the bytes must be one HEADERS frame and nothing after it,
 /// which is asserted here rather than assumed, and the field section behind that
 /// frame header is what carries the status.
-///
-/// `#[track_caller]` because those three assertions belong to the call site;
-/// [`status_of`] needs none, its own failures being `expect`s on the decoder.
 #[track_caller]
 pub fn status_of_response(response: &[u8]) -> String {
     let (frame_type, used) = decode_varint(response).expect("a frame type");
