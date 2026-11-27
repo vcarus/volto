@@ -6,16 +6,17 @@
 //! covers on its own; what is new here is the pass that turns a decoded section
 //! into a [`Request`].
 //!
-//! Even inputs: the whole path a peer's bytes take — a field block through
+//! Even inputs: the whole path a peer's bytes take: a field block through
 //! [`qpack::decode`], then [`build_request`]. This is the reachability check:
 //! only a section some encoding could have produced gets validated.
 //!
 //! Odd inputs: a section cut straight out of the input, so the fuzzer varies
 //! *pseudo-header combinations* rather than QPACK encodings. Names and values
 //! are drawn from dictionaries as well as from raw bytes, because the rules
-//! worth reaching — a CONNECT carrying `:scheme`, an `:authority` disagreeing
-//! with Host, `:protocol` on a request that is not CONNECT — are combinations
-//! of plausible fields, which random bytes practically never spell.
+//! worth reaching are combinations of plausible fields, which random bytes
+//! practically never spell. Examples are a CONNECT carrying `:scheme`, an
+//! `:authority` disagreeing with Host, and `:protocol` on a request that is
+//! not CONNECT.
 //!
 //! Both modes check the same invariants on a request that was accepted. They
 //! are what the rest of the crate is entitled to assume of a [`Request`]:
@@ -187,7 +188,7 @@ fn check(request: &Request) {
         }
 
         // RFC 9110 §5.5's optional whitespace was excluded before anything
-        // evaluated the value -- which is what makes the agreement check below
+        // evaluated the value. That is what makes the agreement check below
         // and `auth` read the value the peer actually sent.
         let bytes = value.as_bytes();
         assert!(
@@ -253,9 +254,9 @@ fn check(request: &Request) {
         //
         // An upgrade token is a `protocol-name` (RFC 9110 §16.7) and
         // `protocol-name = token` (§7.8), so an accepted `:protocol` carries no
-        // octet outside `tchar` -- CR, LF and NUL among them, which is what
-        // makes it safe for the two log lines that record it and for whatever
-        // reads `Request.protocol` next.
+        // octet outside `tchar`, CR, LF and NUL among them. That is what makes
+        // it safe for the two log lines that record it and for whatever reads
+        // `Request.protocol` next.
         assert!(
             token(protocol.as_bytes()).is_some(),
             "a :protocol is a token: {protocol:?}"
