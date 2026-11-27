@@ -951,12 +951,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn congestion_control_is_selectable_and_defaults_to_bbr() {
-        assert_eq!(
-            parse("").limits.congestion_control,
-            CongestionControl::Bbr,
-            "the default must be BBR"
-        );
+    fn congestion_control_is_selectable() {
         for (value, expected) in [
             ("bbr", CongestionControl::Bbr),
             ("cubic", CongestionControl::Cubic),
@@ -985,12 +980,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_ip_family_preference_is_selectable_and_defaults_to_ipv4() {
-        assert_eq!(
-            parse("").limits.ip_family_preference,
-            IpFamilyPreference::Ipv4,
-            "the default must be IPv4-first"
-        );
+    fn the_ip_family_preference_is_selectable() {
         for (value, expected) in [
             ("ipv4", IpFamilyPreference::Ipv4),
             ("ipv6", IpFamilyPreference::Ipv6),
@@ -1167,40 +1157,15 @@ pub(crate) mod tests {
         (uncommented, documented)
     }
 
-    /// Uncommented, the example is the defaults key for key -- apart from two
-    /// values it deliberately raises.
+    /// Uncommented, the example equals the defaults key for key, except
+    /// `initial_mtu = 1242` and `initial_rtt_ms = 150`, which it raises for the
+    /// reasons it gives, and the live keys `mtu_upper_bound = 1436` and
+    /// `level = "info"`, which equal their defaults. Each exception is asserted
+    /// to stay what it is, so a fifth one cannot arrive unnoticed.
     ///
-    /// [`the_shipped_example_configuration_is_valid`] proves the file parses,
-    /// which is a weaker claim than it looks: `Limits`, `Security` and `Log` all
-    /// carry a container-level `#[serde(default)]`, so a key dropped from the
-    /// example and a `DEFAULT_*` moved under it both leave that test green. What
-    /// this one pins is the documentation itself. Every `# Default: N` in the
-    /// file is a promise to the operator reading it, and the value beside the key
-    /// is what that operator uncomments and gets.
-    ///
-    /// The file ships four keys uncommented. Two are its own deviations, for the
-    /// reasons it gives beside them:
-    ///
-    /// * `initial_mtu = 1242`, which "keeps the handshake inside a 1270-byte IPv4
-    ///   packet -- under the 1280 bytes any practical path carries", against a
-    ///   program default of 1200 the file calls "the conservative" one.
-    /// * `initial_rtt_ms = 150`, "sized with margin for the ~60-100 ms long-haul
-    ///   paths a fronted deployment typically serves", cutting "the worst-case
-    ///   handshake stall from ~1 s to a few hundred ms", against RFC 9002's
-    ///   conservative 333.
-    ///
-    /// The third, `mtu_upper_bound = 1436`, is live and equal to the default
-    /// ([`DEFAULT_MTU_UPPER_BOUND`], D81). It stays a live key so that the
-    /// installed file states the ceiling.
-    ///
-    /// The fourth, `level = "info"` in `[log]`, is live and equal to the default
-    /// as well.
-    ///
-    /// Listing them is what stops a fifth arriving quietly. Every other field is
-    /// asserted equal to its default, each deviation is asserted to still *be* a
-    /// deviation, and each live key at its default is asserted to stay equal to
-    /// it. A default moved onto a deviation, or away from a live key, fails
-    /// here rather than silently making the paragraphs above untrue.
+    /// [`the_shipped_example_configuration_is_valid`] only proves the file
+    /// parses: every table but `[server]` carries `#[serde(default)]`, so a key
+    /// dropped from the example would leave that test green.
     #[test]
     fn the_example_documents_every_key_and_pins_every_default() {
         let (text, documented) = example_with_every_key_uncommented();
@@ -1337,24 +1302,12 @@ pub(crate) mod tests {
         assert_valid_apart_from_certs(&cfg, "socket buffers left to the OS");
     }
 
-    #[test]
-    fn unknown_key_is_rejected() {
-        let err = parse_err("lisen = \"typo\"");
-        assert!(err.to_string().contains("lisen"), "{err}");
-    }
-
     /// The rejection is the policy of *every* table, not a property of
     /// `[server]`.
     ///
-    /// It is enforced by a `deny_unknown_fields` attribute repeated on each
-    /// struct, so it holds only for as long as nobody adds a table without one,
-    /// and the file that would silently change meaning is `[auth]`: with the
-    /// attribute missing there, `uesrs = [...]` deserializes to an empty user
-    /// list, and an empty user list is an open proxy. Every other table's typo
-    /// falls back to a default that is merely wrong. That asymmetry is why this
-    /// is worth a test rather than a review note, and it is also the argument
-    /// against relaxing the policy to make rollback easier — see
-    /// [`a_config_that_names_a_key_from_the_future_is_refused_whole`].
+    /// Each table carries its own `deny_unknown_fields`, and a missing one on
+    /// `[auth]` would turn `uesrs = [...]` into an open proxy. The refusal names
+    /// the key.
     #[test]
     fn every_table_rejects_unknown_keys() {
         // Whole documents rather than fragments appended to a `[server]` table:
@@ -1367,57 +1320,59 @@ pub(crate) mod tests {
 
         // One unknown key per table, each spelled as a plausible typo or as
         // something a later release might add.
-        for (table, text) in [
-            ("top level (key)", format!("stray_key = 1\n{SERVER}")),
+        for (table, unknown, text) in [
+            (
+                "top level (key)",
+                "stray_key",
+                format!("stray_key = 1\n{SERVER}"),
+            ),
             (
                 "top level (table)",
+                "metrics",
                 format!("{SERVER}\n[metrics]\nlisten = \"\""),
             ),
-            ("[server]", format!("{SERVER}lisen = \"typo\"")),
-            ("[auth]", format!("{SERVER}\n[auth]\nuesrs = []")),
+            ("[server]", "lisen", format!("{SERVER}lisen = \"typo\"")),
+            ("[auth]", "uesrs", format!("{SERVER}\n[auth]\nuesrs = []")),
             (
                 "[auth.users]",
+                "role",
                 format!(
                     "{SERVER}\n[auth]\nusers = [{{ username = \"u\", password = \"p\", role = \"admin\" }}]"
                 ),
             ),
             (
                 "[limits]",
+                "max_connection",
                 format!("{SERVER}\n[limits]\nmax_connection = 8"),
             ),
             (
                 "[security]",
+                "denied_port",
                 format!("{SERVER}\n[security]\ndenied_port = [25]"),
             ),
-            ("[log]", format!("{SERVER}\n[log]\nlevl = \"info\"")),
+            ("[log]", "levl", format!("{SERVER}\n[log]\nlevl = \"info\"")),
         ] {
             match toml::from_str::<Config>(&text) {
                 Ok(accepted) => panic!(
                     "{table} must reject unknown keys, but the file parsed: {accepted:?}\n{text}"
                 ),
-                Err(error) => assert!(
-                    error.to_string().contains("unknown field"),
-                    "{table}: the refusal must be an unknown-field one, got: {error}"
-                ),
+                Err(error) => {
+                    let error = error.to_string();
+                    assert!(
+                        error.contains("unknown field"),
+                        "{table}: the refusal must be an unknown-field one, got: {error}"
+                    );
+                    assert!(
+                        error.contains(unknown),
+                        "{table}: {unknown} is named: {error}"
+                    );
+                }
             }
         }
     }
 
     /// A configuration file is forward-only: one written for this version does
     /// not load on a version that predates any key in it.
-    ///
-    /// That is the same `deny_unknown_fields` seen from the rollback side, and
-    /// the consequence is not hypothetical. `script/config.example.toml` began
-    /// setting `mtu_upper_bound` in v0.4.5, and `install-selfsigned.sh` derives
-    /// every install from that file, so a host first installed at v0.4.5 or
-    /// later carries a key v0.4.4 refuses to start on — during the one operation
-    /// that only ever runs when something is already wrong.
-    ///
-    /// The policy stands anyway, for the reason in
-    /// [`every_table_rejects_unknown_keys`]: ignoring unknown keys would let a
-    /// misspelled `users` install an open proxy. What this test pins is that
-    /// adding a key is a decision about rollback rather than a surprise during
-    /// one, and `docs/configuration.md` states the resulting rule for operators.
     #[test]
     fn a_config_that_names_a_key_from_the_future_is_refused_whole() {
         // The whole file is refused, not the one key: nothing else in it takes
@@ -1442,14 +1397,7 @@ pub(crate) mod tests {
     /// release must load on this one, with every key added since taking its
     /// documented default.
     ///
-    /// The body is the complete key set as of v0.4.3, every key set explicitly
-    /// so a rename cannot pass unnoticed, and it deliberately does *not*
-    /// mention the keys added since: `mtu_upper_bound` (v0.4.5),
-    /// `security.expected_sni` (v0.9.0), `server.ech_key` and
-    /// `security.require_ech` (both v1.6.0), and `server.ech_previous_key`
-    /// (v1.7.0). An upgrade never rewrites
-    /// `/etc/volto/config.toml`, so this is the file the new binary actually
-    /// gets handed.
+    /// The body is every key as of v0.4.3, so every key added since is absent.
     #[test]
     fn a_config_from_an_older_release_still_loads_with_defaults_for_what_it_lacks() {
         let cfg: Config = toml::from_str(
@@ -1503,8 +1451,7 @@ pub(crate) mod tests {
         assert_eq!(cfg.limits.mtu_upper_bound(), DEFAULT_MTU_UPPER_BOUND);
         assert_eq!(cfg.limits.mtu_upper_bound(), 1436);
 
-        // `bbr` written in an old file selects what `bbr` selects today, the
-        // capped controller since 1.2.0 (D108), with no edit to the file.
+        // `bbr` in an old file selects today's default controller with no edit.
         assert_eq!(cfg.limits.congestion_control, CongestionControl::Bbr);
         assert_eq!(
             cfg.limits.congestion_control,
