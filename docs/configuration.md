@@ -557,8 +557,9 @@ floor without loss, after a peak several times what the floor carries, is one
 the controller may have held below what the path carried: it sizes the window by
 the lowest round trip it has seen, and a path whose round trip has risen, or
 whose acknowledgements arrive in clumps, keeps packets in the window for longer
-than that. The other five are means over the window-limited time, and print `-`
-when there was none. `window_turnover_permille=` is how many minimum RTTs the
+than that. The other five are read over the window-limited time, four as means
+and `base_loss_peak_ppm=` as the highest value, and print `-` when there was
+none. `window_turnover_permille=` is how many minimum RTTs the
 window took to deliver its own size; the steady gain allows 1250 on a path
 without loss, and a connection well above that delivered less than the
 controller's own estimate. `flight_over_min_rtt_permille=` is how long the
