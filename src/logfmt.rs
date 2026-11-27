@@ -48,8 +48,8 @@ pub const ABSENT: &str = "-";
 
 /// Longest peer-chosen token echoed into a log line whole.
 ///
-/// `connect-udp` is 11 bytes and a plausible user-id is shorter still, so
-/// nothing this server expects to see is ever cut.
+/// `connect-udp` is 11 bytes and a configured user-id is at most this long, so
+/// nothing this server expects to see is cut.
 ///
 /// Visible to the crate because one thing depends on it beyond the shape of a
 /// log line: [`crate::config`] refuses a configured user-id longer than this,
