@@ -127,6 +127,24 @@ impl std::future::Future for Handshake {
     }
 }
 
+/// How [`Server::run`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an endpoint that stopped on its own is a failure the caller has to report"]
+pub enum Stopped {
+    /// The shutdown trigger fired, and the drain ran.
+    Shutdown,
+    /// `quinn::Endpoint::accept` returned `None` while the trigger had not fired.
+    ///
+    /// quinn's endpoint driver ends when the socket's receive call returns any
+    /// error but `ConnectionReset`, and from then on `accept` returns `None`
+    /// (quinn 0.11 `src/endpoint.rs`: `State::drive_recv`, `Drop for
+    /// EndpointDriver`, `Accept::poll`). No connection can be accepted or
+    /// served after that, and the tasks of the ones still open have been
+    /// dropped without a drain. The caller has to end the process with an
+    /// error, so that the service manager starts it again (D124).
+    EndpointLost,
+}
+
 /// A bound QUIC endpoint ready to accept connections.
 pub struct Server {
     endpoint: quinn::Endpoint,
@@ -341,14 +359,15 @@ impl Server {
         move || endpoint.open_connections()
     }
 
-    /// Accepts connections until the endpoint closes or shutdown is triggered.
+    /// Accepts connections until the endpoint closes or shutdown is triggered,
+    /// and says which of the two ended it.
     ///
     /// Each connection is handled in its own task, so a failure only ever affects
     /// that connection. The tasks are tracked in a `JoinSet` rather than detached,
     /// because the shutdown path needs to know when they are finished, and
     /// because dropping the set is what cuts off anything still running once
     /// the grace period is over.
-    pub async fn run(&self) {
+    pub async fn run(&self) -> Stopped {
         let config = self.config();
         info!(
             log_id = "77jqt7xj",
@@ -406,7 +425,8 @@ impl Server {
 
                 incoming = self.endpoint.accept() => {
                     let Some(incoming) = incoming else {
-                        // The endpoint was closed from elsewhere.
+                        // The endpoint stopped without the trigger; see
+                        // `Stopped::EndpointLost` for how.
                         break;
                     };
 
@@ -425,6 +445,9 @@ impl Server {
 
         if shutdown.is_fired() {
             self.drain(&mut connections).await;
+            Stopped::Shutdown
+        } else {
+            Stopped::EndpointLost
         }
     }
 
@@ -1521,6 +1544,98 @@ pub(crate) mod tests {
             Arc::ptr_eq(&bound.server.live(), &before),
             "nor the generation an accept reads"
         );
+    }
+
+    /// A socket whose every receive fails with an error other than
+    /// `ConnectionReset`, the one error quinn's endpoint driver does not end on.
+    #[derive(Debug)]
+    struct FailingSocket(SocketAddr);
+
+    /// The poller [`FailingSocket`] hands out: the socket is always writable.
+    #[derive(Debug)]
+    struct AlwaysWritable;
+
+    impl quinn::UdpPoller for AlwaysWritable {
+        fn poll_writable(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl quinn::AsyncUdpSocket for FailingSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+            Box::pin(AlwaysWritable)
+        }
+
+        fn try_send(&self, _transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+            _bufs: &mut [std::io::IoSliceMut<'_>],
+            _meta: &mut [quinn::udp::RecvMeta],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other("an injected receive failure")))
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(self.0)
+        }
+    }
+
+    /// An endpoint whose driver ends on a receive error stops the accept loop,
+    /// and `run` says so rather than reporting a shutdown.
+    ///
+    /// The receive error is the real one: the endpoint is moved onto a socket
+    /// whose receive fails, so quinn's driver returns the error, its `Drop`
+    /// marks the driver lost and `accept` returns `None`. The trigger is never
+    /// fired. Before D124 `run` returned the same `()` for this as for a
+    /// shutdown, and the process exited with status 0.
+    #[tokio::test]
+    async fn a_lost_endpoint_ends_the_accept_loop_as_a_failure() {
+        let bound = bound_server("");
+        let server = Arc::new(bound.server);
+        let addr = server.local_addr().expect("the bound address");
+
+        let running = tokio::spawn({
+            let server = server.clone();
+            async move { server.run().await }
+        });
+        server
+            .endpoint
+            .rebind_abstract(Arc::new(FailingSocket(addr)))
+            .expect("the endpoint takes the failing socket");
+
+        let stopped = tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the accept loop must end once the driver is lost")
+            .expect("the accept loop task");
+        assert_eq!(stopped, Stopped::EndpointLost);
+        assert!(
+            !server.shutdown.is_fired(),
+            "nothing fired the trigger, so this was not a shutdown"
+        );
+    }
+
+    /// A fired trigger still ends the loop as a shutdown.
+    #[tokio::test]
+    async fn a_fired_trigger_ends_the_accept_loop_as_a_shutdown() {
+        let bound = bound_server("shutdown_grace = 0\n");
+        let server = Arc::new(bound.server);
+        let running = tokio::spawn({
+            let server = server.clone();
+            async move { server.run().await }
+        });
+        server.trigger.fire();
+        let stopped = tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the drain must end")
+            .expect("the accept loop task");
+        assert_eq!(stopped, Stopped::Shutdown);
     }
 
     /// A QUIC connection over the loopback whose server side uses `transport`,

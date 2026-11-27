@@ -185,6 +185,15 @@ const ACCOUNTED: &[Accounted] = &[
         reason: "The last line the process writes.",
     },
     Accounted {
+        id: "9lq1eh39",
+        file: "main.rs",
+        message: "the QUIC endpoint stopped without a shutdown; exiting with an error \
+                  so that the service manager starts volto again",
+        bound: Bound::Lifecycle,
+        reason: "Once, as the last line the process writes: the accept loop has \
+                 ended and the process exits after it (D124).",
+    },
+    Accounted {
         id: "huvnt4b6",
         file: "main.rs",
         message: "could not install the SIGHUP handler; reload is unavailable",
