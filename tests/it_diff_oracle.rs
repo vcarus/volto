@@ -206,7 +206,7 @@ fn a_field_line_with_an_empty_name_is_refused_as_a_request() {
 #[test]
 fn a_prefixed_integer_spelled_at_length_decodes_to_the_same_value() {
     // 0xff = indexed static, six-bit prefix full, so 63 plus the continuation.
-    // 0x81 adds 1 and continues; eight 0x80 octets add nothing and continue;
+    // 0x81 adds 1 and continues; seven 0x80 octets add nothing and continue;
     // 0x00 adds nothing and ends. Index 64 is `:status: 204`.
     let block = bytes("0000 ff81 8080 8080 8080 8000");
     assert_eq!(decode(&block), vec![field(b":status", b"204")]);
@@ -221,8 +221,14 @@ fn a_prefixed_integer_spelled_at_length_decodes_to_the_same_value() {
     let block = bytes("0000 ff80 8080 8080 8080 8000");
     assert_eq!(decode(&block), vec![field(b":status", b"100")]);
 
-    // Ten continuation octets is the last shift the accumulator has room for;
-    // the eleventh is refused rather than silently ignored.
+    // The k-th continuation octet is shifted by 7 * (k - 1). The tenth, nine
+    // 0x80 octets and 0x00, has shift 63, the last a 64-bit accumulator has
+    // room for, and decodes.
+    let block = bytes("0000 ff80 8080 8080 8080 8080 00");
+    assert_eq!(decode(&block), vec![field(b":status", b"100")]);
+
+    // The eleventh, ten 0x80 octets and 0x00, has shift 70 and is refused
+    // rather than silently ignored.
     let block = bytes("0000 ff80 8080 8080 8080 8080 8000");
     let error = qpack::decode(&block, MAX_FIELD_SECTION_SIZE).expect_err("refused");
     assert_eq!(error.code(), Code::QPACK_DECOMPRESSION_FAILED);
