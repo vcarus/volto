@@ -53,11 +53,8 @@ pub(super) fn decrypt(
     // without a check, so a packet too short for that would panic rather
     // than fail. RFC 9001 §5.4.2 puts the sample there.
     //
-    // The half of that test which does not need a cipher is asked first,
-    // above the key derivation, because deriving Initial secrets is nearly
-    // the whole cost of judging a packet and a packet with no room for the
-    // four bytes is refused under every cipher there is. No packet changes
-    // verdict: a sample end past the packet end follows from this one.
+    // Checked before the key derivation, which is most of a packet's cost;
+    // `open_with` checks the half that needs the cipher's sample size.
     let number_end_limit = header.packet_number_offset.checked_add(4)?;
     if number_end_limit > header.packet_end {
         return None;
@@ -218,8 +215,7 @@ impl InitialHeader {
             return None;
         }
 
-        // The Token Length and Length fields are QUIC varints, the same encoding
-        // `crate::datagram` reads for HTTP Datagrams (RFC 9000 §16).
+        // The Token Length and Length fields are QUIC varints (RFC 9000 §16).
         let (token_length, read) = peek_varint(datagram.get(at..)?)?;
         at = at.checked_add(read)?;
         at = at.checked_add(usize::try_from(token_length).ok()?)?;
