@@ -67,7 +67,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{
-    ALLOW_PRIVATE, H3Client, TestServer, connect_request, echoes, open_tcp_tunnel, respond_to,
+    ALLOW_PRIVATE, H3Client, TestServer, connect_request, echoes, open_tcp_tunnel, proxy_status,
     spawn_echo_target,
 };
 use volto::h3api::Status;
@@ -270,27 +270,16 @@ fn a_connection_keeps_its_lookup_slot_while_the_pool_is_parked() {
         // The guarantee, from a connection that arrived after the flood.
         let mut victim = H3Client::connect(&server).await;
         let start = Instant::now();
-        let opened = tokio::time::timeout(
-            VICTIM_BOUND,
-            respond_to(&mut victim, connect_request(&target)),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            panic!("the victim's tunnel to {target} did not open within {VICTIM_BOUND:?}")
-        });
-        assert_eq!(
-            opened.status,
-            Status::OK,
-            "a name that needs no resolver was refused while the pool was parked: {:?}",
-            opened
-                .fields
-                .get("proxy-status")
-                .and_then(|value| value.to_str())
-        );
+        // `open_tcp_tunnel` asserts the 200 and prints any Proxy-Status, so a
+        // refusal names its reason.
+        let mut stream = tokio::time::timeout(VICTIM_BOUND, open_tcp_tunnel(&mut victim, &target))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the victim's tunnel to {target} did not open within {VICTIM_BOUND:?}")
+            });
         println!("victim tunnel opened in {:?}", start.elapsed());
 
         // And it is a tunnel, not just a 200.
-        let mut stream = open_tcp_tunnel(&mut victim, &target).await;
         echoes(&mut stream, b"still working").await;
 
         // Serial at worst, from the same victim: every one of these parks
@@ -320,10 +309,7 @@ fn a_connection_keeps_its_lookup_slot_while_the_pool_is_parked() {
                 response.status,
                 Status::OK,
                 "concurrent victim lookup {nth} was refused while the pool was parked: {:?}",
-                response
-                    .fields
-                    .get("proxy-status")
-                    .and_then(|value| value.to_str())
+                proxy_status(&response)
             );
         }
 
@@ -340,13 +326,7 @@ fn a_connection_keeps_its_lookup_slot_while_the_pool_is_parked() {
                 .expect("a response");
 
                 assert_eq!(response.status, Status::GATEWAY_TIMEOUT);
-                assert_eq!(
-                    response
-                        .fields
-                        .get("proxy-status")
-                        .and_then(|value| value.to_str()),
-                    Some("volto; error=dns_timeout"),
-                );
+                assert_eq!(proxy_status(&response), Some("volto; error=dns_timeout"));
             }
         }
     });
