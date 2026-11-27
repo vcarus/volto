@@ -20,7 +20,7 @@ use common::rawstream::{
 };
 use common::{
     H3Client, TIMEOUT, TestServer, client_endpoint_with_transport, connect_quic, connect_request,
-    field_value, finish_connect, send_udp_payload, spawn_udp_echo_target,
+    field_value, finish_connect, send_udp_payload, spawn_udp_echo_target, spawn_udp_target,
 };
 use volto::capsule::CapsuleDecoder;
 use volto::datagram;
@@ -417,14 +417,18 @@ async fn a_session_waits_for_the_peer_settings_until_the_bound() {
 /// tries for a response that arrived before the bound could have passed.
 const SETTINGS_ATTEMPTS: usize = 20;
 
+/// How long that test waits for the target to stay silent before it sends the
+/// SETTINGS: well below [`PEER_SETTINGS_WAIT`], so the SETTINGS and the answer
+/// still fit inside the bound.
+const UNSET_WINDOW: Duration = Duration::from_millis(200);
+
 /// SETTINGS that are read within the bound end the wait, and the session is on
 /// QUIC datagrams from its first packet (D119).
 ///
-/// The request and a datagram for it go out first and the SETTINGS a moment
-/// later. A server that sets the session up without waiting has the target's
-/// answer before it has read the SETTINGS, and sends it as a capsule on the
-/// request stream. That is the order a slow control stream reader produced in
-/// CI, where the client had sent its SETTINGS first.
+/// The request and a datagram for it go out first, and the SETTINGS only after
+/// [`UNSET_WINDOW`] in which the target must hear nothing: a server that sets
+/// the session up without waiting relays the datagram at once. A target that
+/// reports each packet it receives tells the two apart without a fixed sleep.
 ///
 /// An attempt counts only when the response arrived less than the bound after
 /// the client began to connect: only then is it certain that the SETTINGS ended
@@ -433,9 +437,17 @@ const SETTINGS_ATTEMPTS: usize = 20;
 #[tokio::test]
 async fn a_session_set_up_once_the_settings_are_read_answers_on_datagrams() {
     let server = TestServer::start().await;
-    let target = spawn_udp_echo_target().await;
 
     for _ in 0..SETTINGS_ATTEMPTS {
+        // A target of its own per attempt, so a packet relayed late on an
+        // earlier connection is not counted against this one.
+        let (heard, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let target = spawn_udp_target(move |packet| {
+            let _ = heard.send(());
+            Some(packet.to_vec())
+        })
+        .await;
+
         let started = Instant::now();
         let (_endpoint, connection) = connect_quic(&server).await;
         let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
@@ -449,9 +461,21 @@ async fn a_session_set_up_once_the_settings_are_read_answers_on_datagrams() {
         .expect("send the CONNECT-UDP request");
         send_udp_payload(&connection, quarter_stream_id, b"ahead of the settings");
 
-        // Long enough for a server that does not wait to have relayed the
-        // datagram and its answer.
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        // D119 itself: with no SETTINGS read and the bound not passed, the
+        // session does not exist, so nothing reaches the target.
+        if tokio::time::timeout(UNSET_WINDOW, arrivals.recv())
+            .await
+            .is_ok()
+        {
+            assert!(
+                started.elapsed() >= PEER_SETTINGS_WAIT,
+                "the target heard from the session {:?} after the client began to \
+                 connect, before any SETTINGS were sent and before the bound of \
+                 {PEER_SETTINGS_WAIT:?}",
+                started.elapsed()
+            );
+            continue;
+        }
         let _control = open_uni_stream(&connection, STREAM_CONTROL, &datagram_settings()).await;
 
         let (frame_type, _) = read_frame(&mut recv).await;
