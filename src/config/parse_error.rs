@@ -7,17 +7,14 @@ use anyhow::anyhow;
 /// The `toml` crate's `Display` for a deserialization error prints the offending
 /// line under a caret, the way a compiler does. That is the wrong shape for this
 /// file, and only for this file: a syntax error on a `password = ...` line puts
-/// the password on stderr at startup and into the journal on every `SIGHUP`
-/// reload, where `Restart=on-failure` reprints it every few seconds until
-/// somebody notices. So the error never reaches the chain at all. What is
+/// the password on stderr at startup and on every `SIGHUP` reload, and
+/// `Restart=on-failure` repeats a failing start every few seconds. So the error
+/// never reaches the chain at all. What is
 /// reported is the parser's own message plus the position it points at, and the
 /// configuration text is not in scope for either.
 ///
-/// The operator loses nothing they need: the file, the line and the column are
-/// all still named, which is what it takes to find a typo. What the message
-/// carries is the parser's account of what it found and what it expected there,
-/// rather than a copy of what was written. See [`redact_quoted`] for the half
-/// of that account which is a copy after all.
+/// The file, line and column are still named. See [`redact_quoted`] for the
+/// part of the message that would otherwise copy the value.
 pub(super) fn parse_error(path: &Path, text: &str, error: &toml::de::Error) -> anyhow::Error {
     let message = redact_quoted(error.message());
 
@@ -38,11 +35,6 @@ pub(super) fn parse_error(path: &Path, text: &str, error: &toml::de::Error) -> a
 }
 
 /// What a redacted quoted segment is replaced by.
-///
-/// Backticks are kept around it so the sentence still reads the way the parser
-/// wrote it, and they are kept whichever quotes the segment had: one marker to
-/// look for is worth more than a faithful copy of the punctuation around
-/// something that is no longer there.
 const REDACTED: &str = "`<redacted>`";
 
 /// Replaces every quoted segment of a parser message with [`REDACTED`].
@@ -103,10 +95,7 @@ fn redact_quoted(message: &str) -> String {
 /// closing quote is `\\`'s second half, so the skip lands on that quote rather
 /// than over it.
 ///
-/// A backtick segment is `{}`-rendered and has no escapes at all, so a backtick
-/// inside the value cannot be told from the closing one by its own bytes. It is
-/// told apart by what follows: see [`closing_backtick`]. Honouring escapes there
-/// would make a backslash in a value skip the character after it.
+/// A backtick segment has no escapes; see [`closing_backtick`].
 ///
 /// Bytes rather than characters throughout. Neither the backslash nor either
 /// quote can appear inside a multi-byte UTF-8 character, so a skip that lands
@@ -386,7 +375,7 @@ mod tests {
             ),
             // The two clauses serde writes after the value, inside the value.
             // A segment that ended at the first backtick followed by one of
-            // them closed after `x` and printed the rest (R7-L4).
+            // them closed after `x` and printed the rest.
             (
                 "expected-clause-in-enum-value",
                 config_with_raw_congestion_control("\"x`, expected hunter2-TAILSECRET\""),
@@ -496,14 +485,8 @@ mod tests {
         );
     }
 
-    /// A double-quoted segment with nothing closing it must run out *at* the end
-    /// of the message rather than one byte past it.
-    ///
-    /// The scan indexes bytes directly, so a bound that admitted the length
-    /// itself would panic on the empty slot behind the last character — inside
-    /// the error path whose whole job is to keep a password off stderr, and on
-    /// the input that reaches it, since serde renders an unterminated string in
-    /// the file as a value with no closing quote of its own.
+    /// A double-quoted segment with nothing closing it redacts to the end of the
+    /// message.
     #[test]
     fn an_unclosed_double_quoted_segment_runs_out_at_the_end() {
         assert_eq!(closing_quote("hunter2", '"'), None, "no quote at all");
