@@ -55,8 +55,7 @@ fn fd_budget_is_tight(limit: u64, max_connections: u32, max_targets_per_conn: u3
 ///
 /// `max_connections = 0` means no cap on connections at all, which makes the
 /// product meaningless; the check falls back to one connection's quota there,
-/// which is the weakest claim that is still true. `Config::warnings` already
-/// says what removing that cap costs, and this is not the place to say it twice.
+/// which is the weakest claim that is still true.
 fn fd_budget(max_connections: u32, max_targets_per_conn: u32) -> u64 {
     let connections = u64::from(max_connections.max(1));
     connections * u64::from(max_targets_per_conn) + FD_HEADROOM
@@ -64,10 +63,6 @@ fn fd_budget(max_connections: u32, max_targets_per_conn: u32) -> u64 {
 
 /// One direction of the endpoint socket's buffer, with the names its messages
 /// need.
-///
-/// The two directions differ only in which setsockopt they use and which sysctl
-/// caps them, so they are one code path with this as the parameter rather than
-/// two near-identical ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SocketBuffer {
     /// `SO_RCVBUF`: what the kernel holds for us until the endpoint reads it.
@@ -131,8 +126,7 @@ pub(super) struct RequestedBuffers {
 /// What the kernel reports the endpoint socket's buffers are, after being asked.
 ///
 /// Carried from [`Server::bind`] to [`Server::run`] for one reason: the startup
-/// line prints them. They are also the only place the granted sizes are visible
-/// at all, since neither quinn nor this module reads them again.
+/// line prints them.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct SocketBuffers {
     /// `SO_RCVBUF` as the kernel reports it, or `None` if it would not say.
@@ -154,10 +148,6 @@ impl SocketBuffers {
 }
 
 /// Asks the kernel for `requested` bytes of buffer and reports what it granted.
-///
-/// The socket half of the pair; [`socket_buffer_was_capped`] is the judgement.
-/// Every fact that depends on the direction lives on [`SocketBuffer`], so this
-/// function does not branch on the variant at all.
 ///
 /// Nothing here is fatal, and that is deliberate. A refused `setsockopt` leaves
 /// the socket exactly where it was, on the operating system's default, so
@@ -342,12 +332,6 @@ mod tests {
 
     /// The read-back convention differs by platform, so the judgement takes it
     /// as a parameter and both branches are asserted on any host.
-    ///
-    /// Linux reports twice what it granted; macOS reports it unchanged. The two
-    /// middle cases below are the ones an equality check would get wrong, and
-    /// the band is the case a plain `<` gets wrong on Linux: a request above the
-    /// ceiling but below twice the ceiling reads as satisfied although the
-    /// kernel granted only the ceiling.
     #[test]
     fn a_capped_socket_buffer_is_recognised() {
         // Linux, request satisfied: doubled on the way back.
