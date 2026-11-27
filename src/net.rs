@@ -554,8 +554,8 @@ impl ConnectionResolver {
     ///
     /// Within each branch the order is not interchangeable: the per-connection
     /// permit is taken *first*, so a connection already at its own limit
-    /// queues on that limit rather than on the server's, and never sits in a
-    /// server-wide queue holding a permit it is not using. Losing the race
+    /// queues on that limit rather than on the server's, and never holds a
+    /// server-wide permit while it waits on its own limit. Losing the race
     /// drops that branch and gives back whatever it held.
     ///
     /// No semaphore is ever closed, and a closed one is the only error
