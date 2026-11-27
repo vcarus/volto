@@ -35,7 +35,7 @@ use std::process::{Command, Output, Stdio};
 use scripts::{
     Scratch, loadable_config_text, path_with_stubs, plant_binary_without_the_flag,
     plant_placeholder_certificates, real_binary, real_tool, repo_root, run_within_deadline,
-    scratch_tree, stderr_of, stdout_of, try_real_tool, write_executable,
+    scratch_tree, stderr_of, stdout_of, write_executable,
 };
 use volto::config::{Config, EXAMPLE_PLACEHOLDER_PASSWORD};
 
@@ -51,7 +51,7 @@ fn installer_script() -> PathBuf {
 /// the environment, and `VOLTO_INSTALL_ROOT` relocates it, so a shell that
 /// exports one of them would change every run. A caller sets what it means.
 fn installer(script: &Path) -> Command {
-    let mut command = Command::new("bash");
+    let mut command = Command::new(real_tool("bash"));
     command
         .arg(script)
         .current_dir(repo_root())
@@ -330,22 +330,19 @@ fn credentials_with_a_pipe_or_an_ampersand_reach_the_config_verbatim() {
     }
 }
 
-/// Writes, in `dir`, a wrapper for each of `tools` that records its arguments
-/// in `dir/argv.log` and then runs the tool, and returns `dir` to put in front
-/// of `PATH`.
-///
-/// A wrapper runs the stand-in of the same name in `stubs` when there is one,
-/// and the host's tool otherwise. A tool the host does not have is skipped.
-fn plant_argv_recorders(dir: &Path, stubs: Option<&Path>, tools: &[&str]) -> PathBuf {
+/// Writes, in `dir`, a recorder for each of `tools` that appends the tool's
+/// name and arguments to `dir/argv.log` and then runs it: the stand-in of the
+/// same name in `stubs` when there is one, the host's tool otherwise. Returns
+/// `dir`, which a run then uses as its whole `PATH`.
+fn plant_argv_recorders(dir: &Path, stubs: &Path, tools: &[&str]) -> PathBuf {
     fs::create_dir_all(dir).expect("the recorder directory must be creatable");
     let log = dir.join("argv.log");
     for tool in tools {
-        let target = match stubs.map(|stubs| stubs.join(tool)) {
-            Some(stub) if stub.is_file() => stub,
-            _ => match try_real_tool(tool) {
-                Some(real) => real,
-                None => continue,
-            },
+        let stub = stubs.join(tool);
+        let target = if stub.is_file() {
+            stub
+        } else {
+            real_tool(tool)
         };
         write_executable(
             &dir.join(tool),
@@ -359,77 +356,87 @@ fn plant_argv_recorders(dir: &Path, stubs: Option<&Path>, tools: &[&str]) -> Pat
     dir.to_path_buf()
 }
 
-/// Every external command the installer runs, by name.
+/// Every tool the installer runs on `--print-config` and on a first install,
+/// and `cat`, which the stand-ins run as well. The list is what the runs of
+/// [`the_password_is_on_no_command_line_the_installer_runs`] call, with
+/// nothing else on `PATH`, and that test holds it to exactly that.
 const INSTALLER_TOOLS: &[&str] = &[
-    "sed",
-    "grep",
-    "awk",
-    "head",
-    "cut",
-    "wc",
-    "cat",
-    "tr",
-    "mktemp",
-    "rm",
-    "openssl",
-    "install",
-    "mv",
-    "chown",
-    "chgrp",
-    "chmod",
-    "date",
-    "hostname",
-    "id",
-    "systemctl",
-    "sleep",
-    "useradd",
-    "ufw",
-    "dirname",
-    "find",
-    "cmp",
-    "apt-get",
+    "awk", "cat", "chmod", "chown", "cut", "date", "dirname", "grep", "hostname", "id", "install",
+    "mktemp", "mv", "openssl", "rm", "sleep", "systemctl", "ufw", "wc",
 ];
 
+/// Looked up by the installer with `command -v` and never run.
+const LOOKED_UP_ONLY: &[&str] = &["apt-get"];
+
+/// Exports to the bash that `command` runs a `command_not_found_handle` that
+/// appends the name of each command it could not find to `log`. bash 4 and
+/// later run that function for every such command, one whose error output goes
+/// to `/dev/null` included.
+fn record_missing_commands<'a>(command: &'a mut Command, log: &Path) -> &'a mut Command {
+    command.env(
+        "BASH_FUNC_command_not_found_handle%%",
+        format!(
+            "() {{ printf '%s\\n' \"$1\" >> '{}'; return 127; }}",
+            log.display()
+        ),
+    )
+}
+
 /// The password never appears on the argument vector of a program the
-/// installer runs (R8-M1).
+/// installer runs.
 ///
-/// `/proc/<pid>/cmdline` is readable by every local user. The config used to
-/// be written by `sed` with the password inside its script argument, and
-/// checked by `grep -F` with the password as its pattern. Every external
-/// command is wrapped here, on `--print-config` and on the full install path,
-/// and none of them may have been handed the password.
+/// `/proc/<pid>/cmdline` is readable by every local user. Both runs here,
+/// `--print-config` and a first install, have the recorders' directory as
+/// their whole `PATH`, and every tool they run is recorded. A tool with no
+/// recorder is not found and is named in `missing`, which fails the test, so
+/// a new tool cannot take the password unseen. A tool called by its absolute
+/// path is out of a recorder's reach; `the_installer_calls_no_tool_by_its_path`
+/// holds the script to the calls that must be made that way.
 #[test]
 fn the_password_is_on_no_command_line_the_installer_runs() {
     const SECRET: &str = "argv-canary-4f1e9";
-    let script = installer_script();
+    let root = scratch_tree(
+        "install",
+        "argv",
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    );
+    let stubs = plant_root_stubs(&root, 0, "active");
+    // An active firewall, so the run takes the branch that opens the port.
+    write_executable(
+        &stubs.join("ufw"),
+        "#!/bin/sh\n[ \"$1\" = status ] && echo 'Status: active'\nexit 0\n",
+    );
+    let planted: Vec<&str> = INSTALLER_TOOLS.iter().chain(LOOKED_UP_ONLY).copied().collect();
+    let recorders = plant_argv_recorders(&root.join("recorders"), &stubs, &planted);
+    let missing = root.join("missing");
 
-    let print_root = scratch_tree("install", "argv-print", &[]);
-    let recorders = plant_argv_recorders(&print_root.join("recorders"), None, INSTALLER_TOOLS);
+    let probe = run_within_deadline(
+        record_missing_commands(&mut Command::new(real_tool("bash")), &missing)
+            .args(["-c", "a-command-nobody-has 2>/dev/null; true"])
+            .env("PATH", &recorders)
+            .stdin(Stdio::null()),
+    );
+    assert!(probe.status.success(), "{}", stderr_of(&probe));
+    assert_eq!(
+        fs::read_to_string(&missing).ok().as_deref(),
+        Some("a-command-nobody-has\n"),
+        "this test needs a bash that runs command_not_found_handle (bash 4 or later)"
+    );
+    fs::remove_file(&missing).expect("the probe's record must be removable");
+
     let output = run_within_deadline(
-        installer(&script)
+        record_missing_commands(&mut installer(&installer_script()), &missing)
             .args(["--print-config", "-u", "alice", "-w", SECRET])
-            .env("PATH", path_with_stubs(&recorders)),
+            .env("PATH", &recorders),
     );
     assert!(output.status.success(), "{}", stderr_of(&output));
     assert!(
         stdout_of(&output).contains(SECRET),
         "the generated config must carry the password"
     );
-    let log = fs::read_to_string(recorders.join("argv.log")).unwrap_or_default();
-    assert!(
-        log.lines().all(|line| !line.contains(SECRET)),
-        "--print-config handed the password to another program:\n{log}"
-    );
 
-    let root = scratch_tree(
-        "install",
-        "argv-install",
-        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-    );
-    let stubs = plant_root_stubs(&root, 0, "active");
-    let recorders = plant_argv_recorders(&root.join("recorders"), Some(&stubs), INSTALLER_TOOLS);
     let output = run_within_deadline(
-        installer(&script)
+        record_missing_commands(&mut installer(&installer_script()), &missing)
             .args([
                 "--binary",
                 real_binary().to_str().expect("a UTF-8 path to the binary"),
@@ -438,7 +445,7 @@ fn the_password_is_on_no_command_line_the_installer_runs() {
             ])
             .env("VOLTO_INSTALL_ROOT", &root)
             .env("PASSWORD", SECRET)
-            .env("PATH", path_with_stubs(&recorders)),
+            .env("PATH", &recorders),
     );
     assert!(output.status.success(), "{}", stderr_of(&output));
     let config = fs::read_to_string(root.join("etc/volto/config.toml"))
@@ -447,14 +454,91 @@ fn the_password_is_on_no_command_line_the_installer_runs() {
         config.contains(&format!("password = \"{SECRET}\"")),
         "the installed config must carry the password from the environment:\n{config}"
     );
+
+    assert_eq!(
+        fs::read_to_string(&missing).unwrap_or_default(),
+        "",
+        "the installer ran a command that has no recorder; add it to INSTALLER_TOOLS"
+    );
     let log = fs::read_to_string(recorders.join("argv.log")).unwrap_or_default();
-    assert!(
-        log.lines().any(|line| line.starts_with("openssl ")),
-        "the recorders must have seen the install run: {log}"
+    let ran: std::collections::BTreeSet<&str> = log
+        .lines()
+        .filter_map(|line| line.split(' ').next())
+        .collect();
+    let listed: std::collections::BTreeSet<&str> = INSTALLER_TOOLS.iter().copied().collect();
+    assert_eq!(
+        ran, listed,
+        "INSTALLER_TOOLS must be the tools the two runs call, no more and no fewer"
     );
     assert!(
         log.lines().all(|line| !line.contains(SECRET)),
-        "the install path handed the password to another program:\n{log}"
+        "the installer handed the password to another program:\n{log}"
+    );
+}
+
+/// The first word of each command in the shell line `line`: at its start,
+/// after `$(`, `(`, a backtick, `|`, `&`, `;` or `{`, and past the words that
+/// precede a command and any variable assignment.
+fn command_words(line: &str) -> Vec<&str> {
+    const KEYWORDS: [&str; 11] = [
+        "if", "then", "else", "elif", "do", "while", "until", "!", "exec", "time", "command",
+    ];
+    line.split(['(', '`', '|', '&', ';', '{'])
+        .filter_map(|segment| {
+            segment.split_whitespace().find(|word| {
+                !KEYWORDS.contains(word)
+                    && !(word.contains('=') && !word.starts_with(['-', '"', '$', '[']))
+            })
+        })
+        .collect()
+}
+
+/// The installer runs no tool by its absolute path, which a recorder on
+/// `PATH` cannot see, except the three that must be: `"$BINARY"`, the volto it
+/// was handed, asked for `--help` and `--check-config`; `"$BIN"`, the
+/// installed one, asked for `--version`; and `"$1"` in
+/// `check_config_as_the_unit`, which is `$BINARY` again. None of the three is
+/// given the password.
+///
+/// This one is a text check, because a run cannot show a call that bypasses
+/// `PATH`: the call reaches the real tool, and nothing records it.
+#[test]
+fn the_installer_calls_no_tool_by_its_path() {
+    let text = fs::read_to_string(installer_script()).expect("the installer must be readable");
+    let mut heredoc: Option<String> = None;
+    let mut by_path = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        if let Some(end) = &heredoc {
+            if line == end {
+                heredoc = None;
+            }
+            continue;
+        }
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some((_, tag)) = line.split_once("<<").filter(|_| !line.contains("<<<")) {
+            heredoc = Some(tag.trim().trim_matches('\'').to_owned());
+        }
+        for word in command_words(line) {
+            let unquoted = word.trim_matches('"');
+            let variable = unquoted.strip_prefix('$').is_some_and(|name| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || "_{}".contains(ch))
+            });
+            if word.starts_with('/') || word.starts_with("./") || variable {
+                by_path.insert(word.to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        by_path,
+        ["\"$1\"", "\"$BIN\"", "\"$BINARY\""]
+            .map(str::to_owned)
+            .into(),
+        "the installer calls a tool by its path, which the argv recorders cannot see"
     );
 }
 
