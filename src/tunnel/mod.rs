@@ -729,10 +729,11 @@ pub(crate) async fn resolve_within(
     budget: Option<Duration>,
     family: IpFamilyPreference,
 ) -> Result<Resolved, ResolveFailure> {
-    let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
+    let limit = budget.map(|budget| (tokio::time::Instant::now() + budget, budget));
+    let deadline = limit.map(|(deadline, _)| deadline);
 
     let Some(preferred) = crate::net::Family::preferred(family) else {
-        let addresses = within_budget(resolver.lookup(host, port), budget).await?;
+        let addresses = until_deadline(resolver.lookup(host, port), limit).await?;
         return Ok(Resolved {
             addresses,
             other: None,
@@ -751,8 +752,7 @@ pub(crate) async fn resolve_within(
     let mut other = crate::net::OtherFamily::new(host, port, preferred.other());
     let first = until_deadline(
         resolver.lookup_family(host, port, preferred, &mut other),
-        deadline,
-        budget,
+        limit,
     )
     .await;
     let first_failure = match first {
@@ -766,7 +766,7 @@ pub(crate) async fn resolve_within(
         Err(failure) => failure,
     };
 
-    match ask_other(&mut other, resolver, deadline, budget).await {
+    match ask_other(&mut other, resolver, limit).await {
         Ok(addresses) => Ok(Resolved {
             addresses,
             other: None,
@@ -786,59 +786,39 @@ fn reported(first: ResolveFailure, second: ResolveFailure) -> ResolveFailure {
     }
 }
 
-/// The other family's answer, waited for until `deadline`.
+/// The other family's answer, waited for until the deadline of `limit`.
 ///
 /// A lookup that was never started is not started once the deadline has
 /// passed, because nothing would wait for its answer.
 async fn ask_other(
     other: &mut crate::net::OtherFamily,
     resolver: &crate::net::ConnectionResolver,
-    deadline: Option<tokio::time::Instant>,
-    budget: Option<Duration>,
+    limit: Option<(tokio::time::Instant, Duration)>,
 ) -> Result<Vec<std::net::SocketAddr>, ResolveFailure> {
-    if let (Some(deadline), Some(budget)) = (deadline, budget)
+    if let Some((deadline, budget)) = limit
         && !other.is_started()
         && tokio::time::Instant::now() >= deadline
     {
         return Err(ResolveFailure::TimedOut(budget));
     }
-    until_deadline(other.addresses(resolver), deadline, budget).await
+    until_deadline(other.addresses(resolver), limit).await
 }
 
-/// [`within_budget`] against a deadline taken earlier, so that two lookups
-/// share one budget. `budget` is what a timeout reports.
+/// Waits for `lookup` until the deadline of `limit`, which also holds the
+/// budget a timeout reports. `None` waits for as long as the lookup takes.
+///
+/// A deadline rather than a budget, so that two lookups can share one. Apart
+/// from [`resolve_within`] so the budget can be tested against a lookup that
+/// never answers, which no real resolver can be made to do on demand.
 async fn until_deadline<F>(
     lookup: F,
-    deadline: Option<tokio::time::Instant>,
-    budget: Option<Duration>,
+    limit: Option<(tokio::time::Instant, Duration)>,
 ) -> Result<Vec<std::net::SocketAddr>, ResolveFailure>
 where
     F: std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>>,
 {
-    let resolved = match deadline {
-        Some(deadline) => match tokio::time::timeout_at(deadline, lookup).await {
-            Ok(resolved) => resolved,
-            Err(_) => return Err(ResolveFailure::TimedOut(budget.unwrap_or_default())),
-        },
-        None => lookup.await,
-    };
-
-    resolved.map_err(ResolveFailure::Failed)
-}
-
-/// Applies a resolution budget to `lookup`.
-///
-/// Split from [`resolve_within`] so the budget can be tested against a lookup
-/// that never answers, which no real resolver can be made to do on demand.
-async fn within_budget<F>(
-    lookup: F,
-    budget: Option<Duration>,
-) -> Result<Vec<std::net::SocketAddr>, ResolveFailure>
-where
-    F: std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>>,
-{
-    let resolved = match budget {
-        Some(budget) => match tokio::time::timeout(budget, lookup).await {
+    let resolved = match limit {
+        Some((deadline, budget)) => match tokio::time::timeout_at(deadline, lookup).await {
             Ok(resolved) => resolved,
             Err(_) => return Err(ResolveFailure::TimedOut(budget)),
         },
@@ -1385,7 +1365,8 @@ async fn judge(
     let mut addresses = resolved.addresses;
     let mut allowed = Vec::new();
     if let Some(mut other) = resolved.other {
-        let (found, took) = timed(ask_other(&mut other, resolver, resolved.deadline, budget)).await;
+        let limit = resolved.deadline.zip(budget);
+        let (found, took) = timed(ask_other(&mut other, resolver, limit)).await;
         resolve += took;
         if let Ok(found) = found {
             allowed = usable(&found);
@@ -1693,6 +1674,11 @@ mod tests {
         assert_eq!(took, Duration::from_millis(30));
     }
 
+    /// The deadline `budget` from now, with the budget a timeout reports.
+    fn limit(budget: Duration) -> Option<(tokio::time::Instant, Duration)> {
+        Some((tokio::time::Instant::now() + budget, budget))
+    }
+
     /// A resolver that never answers costs the request its budget and no more,
     /// and is reported as the timeout it is rather than as an ordinary lookup
     /// failure — the two carry different statuses.
@@ -1704,7 +1690,7 @@ mod tests {
     async fn a_resolver_that_never_answers_costs_only_the_budget() {
         let budget = Duration::from_secs(crate::config::DEFAULT_CONNECT_TIMEOUT);
 
-        let mut waiting = Box::pin(within_budget(std::future::pending(), Some(budget)));
+        let mut waiting = Box::pin(until_deadline(std::future::pending(), limit(budget)));
 
         tokio::time::advance(budget - Duration::from_millis(1)).await;
         assert!(
@@ -1738,7 +1724,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_clock_that_jumps_hours_still_reports_the_budget() {
         let budget = Duration::from_secs(10);
-        let mut waiting = Box::pin(within_budget(std::future::pending(), Some(budget)));
+        let mut waiting = Box::pin(until_deadline(std::future::pending(), limit(budget)));
         assert!(poll_once(waiting.as_mut()).is_none());
 
         tokio::time::advance(Duration::from_secs(3 * 60 * 60)).await;
@@ -1921,16 +1907,19 @@ mod tests {
         let addresses = vec!["192.0.2.1:443".parse().expect("address")];
 
         for budget in [None, Some(Duration::from_secs(10))] {
-            let resolved = within_budget(std::future::ready(Ok(addresses.clone())), budget)
-                .await
-                .expect("a lookup that answers must succeed");
+            let resolved = until_deadline(
+                std::future::ready(Ok(addresses.clone())),
+                budget.and_then(limit),
+            )
+            .await
+            .expect("a lookup that answers must succeed");
             assert_eq!(resolved, addresses);
         }
 
         // And a resolver that says no keeps saying no, as `dns_error`.
-        let failure = within_budget(
+        let failure = until_deadline(
             std::future::ready(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
-            Some(Duration::from_secs(10)),
+            limit(Duration::from_secs(10)),
         )
         .await
         .expect_err("a lookup that fails must fail");
