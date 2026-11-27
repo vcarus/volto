@@ -1595,18 +1595,20 @@ async fn a_request_still_connecting_ends_with_its_connection() {
     let idle = proxy.metrics().num_alive_tasks();
 
     let mut client = H3Client::connect(&server).await;
-    let _request = client
+    let mut request = client
         .send
         .send_request(connect_request(&blackhole.to_string()))
         .await
         .expect("send the request");
 
     // An IP literal needs no resolution, so the connect starts as soon as the
-    // request arrives.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // request arrives. Unanswered after this wait means it is still connecting
+    // when the connection closes.
     assert!(
-        proxy.metrics().num_alive_tasks() > idle,
-        "the proxy has no task for the connection at all"
+        tokio::time::timeout(Duration::from_millis(500), request.recv_response())
+            .await
+            .is_err(),
+        "the request must still be connecting when the connection closes"
     );
 
     client.quic.close(0u32.into(), b"done");
