@@ -1222,18 +1222,60 @@ fn every_entry_carries_a_reason_and_a_distinct_key() {
 #[test]
 fn a_sampled_entry_lives_beside_a_sampler() {
     let root = source_root();
+    let samplers = sampler_names();
+    assert!(
+        !samplers.is_empty(),
+        "no `logfmt::Sampler` field or local found in {}: the reader is broken",
+        root.display()
+    );
 
     for entry in ACCOUNTED.iter().filter(|e| e.bound == Bound::Sampled) {
-        let path = root.join(entry.file);
-        let text = read_text(&path);
+        let code = production_code(&read_text(&root.join(entry.file)));
+        let records = samplers.iter().any(|name| {
+            code.match_indices(&format!("{name}.record()"))
+                .any(|(at, _)| !code[..at].chars().next_back().is_some_and(is_identifier))
+        });
         assert!(
-            production_code(&text).contains(".record()"),
+            records,
             "src/{}: {:?} is marked as sampled, but nothing in that file records \
-             into a `logfmt::Sampler`",
+             into a `logfmt::Sampler` (one of {samplers:?})",
             entry.file,
             entry.message
         );
     }
+}
+
+/// The names `src/` gives a `logfmt::Sampler`: a field typed as one, and a
+/// field or local bound to `Sampler::new()`.
+///
+/// Read from the text: the identifier before the `:` or `=` that precedes the
+/// type's name, its path stripped.
+fn sampler_names() -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for path in rust_files(&source_root()) {
+        let code = production_code(&read_text(&path));
+        for (at, _) in code.match_indices("Sampler") {
+            let before = code[..at]
+                .trim_end_matches("crate::logfmt::")
+                .trim_end_matches("logfmt::")
+                .trim_end();
+            let Some(before) = before.strip_suffix(':').or_else(|| before.strip_suffix('='))
+            else {
+                continue;
+            };
+            let before = before.trim_end();
+            let start = before
+                .char_indices()
+                .rev()
+                .take_while(|(_, ch)| is_identifier(*ch))
+                .last()
+                .map_or(before.len(), |(at, _)| at);
+            if start < before.len() {
+                names.insert(before[start..].to_string());
+            }
+        }
+    }
+    names
 }
 
 /// Each shape that writes a line without a plain statement is read or refused,
