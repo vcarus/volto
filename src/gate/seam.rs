@@ -309,12 +309,17 @@ impl HoldPolicy {
 /// writes its seeds both call it, so a seed's outcome in the test is its
 /// outcome in the target. The format is in the target's module
 /// documentation, `fuzz/fuzz_targets/hold.rs`. Byte 0 is the policy the run
-/// begins under; then each record is one header byte, a big-endian `u16`
-/// length, and that many bytes of body, cut at the end of the input.
+/// begins under, and its bit 5 says whether released datagrams wait; then
+/// each record is one header byte, a big-endian `u16` length, and that many
+/// bytes of body, cut at the end of the input.
 #[doc(hidden)]
 pub struct HoldInput<'a> {
     /// The policy byte 0 selects.
     pub policy: HoldPolicy,
+    /// Bit 5 of byte 0: the released datagrams are taken only when the input
+    /// ends, so they count against the hold's byte bound meanwhile, as they
+    /// do on the socket until the next receive call.
+    pub keep_released: bool,
     rest: &'a [u8],
     after: Duration,
 }
@@ -347,6 +352,7 @@ impl<'a> HoldInput<'a> {
         let (&policy, rest) = data.split_first()?;
         Some(Self {
             policy: HoldPolicy::from_byte(policy),
+            keep_released: policy & 0x20 != 0,
             rest,
             after: Duration::ZERO,
         })

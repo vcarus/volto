@@ -2431,9 +2431,14 @@ fn the_hold_bounds_are_the_values_they_are_documented_as() {
 }
 
 /// Whatever is sent, the hold stays inside its bounds: no more flights than
-/// the table holds, no more bytes than the hold may take, a flight that grows
-/// past its own budget dropped, and a ClientHello longer than libssl reads
-/// dropped as soon as its length says so.
+/// the table holds, a flight that grows past its own budget dropped, and a
+/// ClientHello longer than libssl reads dropped as soon as its length says
+/// so.
+///
+/// Nothing here completes, so no released datagram waits, and the held flights
+/// alone cannot pass `HOLD_TOTAL_BYTES`, which is `HOLD_FLIGHTS` flights of
+/// `HOLD_FLIGHT_BYTES`. The byte bound is reached in
+/// `released_datagrams_that_wait_make_the_hold_evict_its_oldest_flights`.
 #[test]
 fn the_hold_stays_inside_its_bounds_under_a_flood() {
     let crypto = nameless_crypto();
@@ -2533,6 +2538,95 @@ fn the_hold_stays_inside_its_bounds_under_a_flood() {
         &Dropped::TooLong,
         "an offset past libssl's",
     );
+}
+
+/// Released datagrams count against `HOLD_TOTAL_BYTES` until the next receive
+/// call hands them to quinn. With the bound nearly spent by them, a flight that
+/// grows evicts the oldest flights ahead of it, one at a time, until it fits,
+/// and a flight with none ahead of it left to evict is dropped itself. The
+/// released datagrams are never evicted, and the count never passes the
+/// bound.
+///
+/// On the socket the released queue fills within one receive batch, since
+/// `screen_one` runs for every datagram of the batch before `deliver` takes
+/// the queue.
+#[test]
+fn released_datagrams_that_wait_make_the_hold_evict_its_oldest_flights() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    // No list and no `require_ech`, so a whole ClientHello without ECH is
+    // admitted and released at once.
+    let mut screening = Screening::new(hold_policy(&key, &[], false));
+    let admitted = initial(
+        &*crypto,
+        &CLIENT_CID,
+        &crypto_frame_at(0, &named_hello("localhost")),
+    );
+    // A flight that never completes, one datagram at a time.
+    let ping = |dcid: u8| initial(&*crypto, &[dcid; 8], &[0x01]);
+    let step = MIN_INITIAL_DATAGRAM;
+    let receive = |screening: &mut Screening, from: SocketAddr, datagram: &[u8]| {
+        let outcome = screening.receive(Duration::ZERO, from, datagram);
+        assert!(
+            screening.held_bytes() <= HOLD_TOTAL_BYTES,
+            "the byte bound: {} counted",
+            screening.held_bytes()
+        );
+        assert_eq!(screening.recounted_bytes(), screening.held_bytes());
+        outcome
+    };
+
+    // Admitted flights nobody takes, until less than three datagrams of room
+    // is left.
+    let mut waiting = 0;
+    while screening.held_bytes() + 3 * step <= HOLD_TOTAL_BYTES {
+        assert_eq!(
+            receive(&mut screening, from(1), &admitted),
+            (Screened::Released, Vec::new())
+        );
+        waiting += 1;
+    }
+    let room = HOLD_TOTAL_BYTES - screening.held_bytes();
+    assert!((2 * step..3 * step).contains(&room), "{room} bytes of room");
+    assert_eq!(screening.flights(), 0);
+
+    // Two flights fit, oldest first.
+    for (port, dcid) in [(2, 0x61), (3, 0x62)] {
+        assert_eq!(
+            receive(&mut screening, from(port), &ping(dcid)),
+            (Screened::Held, Vec::new())
+        );
+    }
+    // A third flight has no room, and the oldest makes way for it, though the
+    // table has room for sixty-one more.
+    assert_eq!(
+        receive(&mut screening, from(4), &ping(0x63)),
+        (Screened::Held, vec![(from(2), Dropped::Evicted)])
+    );
+    assert_eq!(screening.flights(), 2);
+    // Its next datagram has none either, and the next oldest makes way.
+    assert_eq!(
+        receive(&mut screening, from(4), &ping(0x63)),
+        (Screened::Held, vec![(from(3), Dropped::Evicted)])
+    );
+    assert_eq!(screening.flights(), 1);
+    // With no flight ahead of it, it is the one dropped.
+    assert_eq!(
+        receive(&mut screening, from(4), &ping(0x63)),
+        (Screened::Dropped, vec![(from(4), Dropped::Evicted)])
+    );
+    assert_eq!(screening.flights(), 0);
+
+    // Every released datagram is still there, in order, and taking them
+    // empties the hold.
+    let released = screening.released();
+    assert_eq!(released.len(), waiting);
+    assert!(
+        released
+            .iter()
+            .all(|(source, bytes)| *source == from(1) && *bytes == admitted)
+    );
+    assert_eq!(screening.held_bytes(), 0);
 }
 
 /// No reload empties the replay record: not one that keeps the key, not one
@@ -3424,23 +3518,30 @@ fn hold_input(policy: u8, records: &[Record]) -> Vec<u8> {
 
 /// Runs a hold fuzz input through `volto::gate::HoldInput`, the reader the
 /// target uses, with the target's current key `key` and previous key
-/// `previous`, and returns what became of its last datagram, checking the
-/// byte count against the hold's contents after every step as the target does.
-fn run_hold_input(key: &Arc<EchKey>, previous: &Arc<EchKey>, input: &[u8]) -> Screened {
+/// `previous`, and returns what became of its last datagram and the flights
+/// it dropped, checking the byte count against the hold's contents and the
+/// byte bound after every step as the target does.
+fn run_hold_input(
+    key: &Arc<EchKey>,
+    previous: &Arc<EchKey>,
+    input: &[u8],
+) -> (Screened, Vec<(SocketAddr, Dropped)>) {
     let input = HoldInput::new(input).expect("a policy byte");
+    let keep_released = input.keep_released;
     let mut screening = Screening::new(input.policy.policy(key, previous));
-    let mut last = Screened::Passed;
+    let mut last = (Screened::Passed, Vec::new());
     for step in input {
         match step {
             HoldStep::Datagram(record) => {
-                last = screening
-                    .receive(record.after, record.from, &record.datagram)
-                    .0;
+                last = screening.receive(record.after, record.from, &record.datagram);
             }
             HoldStep::Reload(policy) => screening.set(policy.policy(key, previous)),
         }
         assert_eq!(screening.recounted_bytes(), screening.held_bytes());
-        screening.released();
+        assert!(screening.held_bytes() <= HOLD_TOTAL_BYTES, "the byte bound");
+        if !keep_released {
+            screening.released();
+        }
     }
     last
 }
@@ -3728,12 +3829,51 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
     std::fs::create_dir_all(&directory).expect("a corpus directory to write seeds into");
     for (name, input, outcome) in seeds {
         assert_eq!(
-            run_hold_input(&key, &previous, &input),
+            run_hold_input(&key, &previous, &input).0,
             outcome,
             "the seed {name}"
         );
         std::fs::write(directory.join(name), &input).expect("a seed file");
     }
+
+    // Released datagrams that wait (bit 5 of the policy byte) until the hold
+    // has to evict for its byte bound. A sealed PING is five bytes of input
+    // and a datagram of 1200, which is what lets an input of about 22 KB fill
+    // 4 MiB. Each admitted flight is fifty PINGs and a whole ClientHello
+    // without ECH, which the empty list of policy 0x20 admits; then flight A
+    // sends two PINGs and flight B sends PINGs until one more does not fit.
+    let sealed = |source: u8, frames: Vec<u8>| Record {
+        source,
+        steps: 0,
+        body: Body::Sealed {
+            selector: 0,
+            frames,
+        },
+    };
+    let ping = |source: u8| sealed(source, vec![0x01]);
+    let per_flight = 51 * MIN_INITIAL_DATAGRAM;
+    let flights = HOLD_TOTAL_BYTES / per_flight;
+    let room = HOLD_TOTAL_BYTES - flights * per_flight;
+    let b_fits = room / MIN_INITIAL_DATAGRAM - 2;
+    let mut records = Vec::new();
+    for _ in 0..flights {
+        records.extend((0..50).map(|_| ping(0)));
+        records.push(sealed(0, crypto_frame_at(0, &named_hello("localhost"))));
+    }
+    records.extend([ping(1), ping(1)]);
+    records.extend((0..=b_fits).map(|_| ping(2)));
+    let input = hold_input(0x20, &records);
+    let source = |index: u16| SocketAddr::from(([127, 0, 0, 1], 40_000 + index));
+    assert_eq!(
+        run_hold_input(&key, &previous, &input),
+        (Screened::Held, vec![(source(1), Dropped::Evicted)]),
+        "the seed released-datagrams-wait-at-the-byte-bound"
+    );
+    std::fs::write(
+        directory.join("released-datagrams-wait-at-the-byte-bound"),
+        &input,
+    )
+    .expect("a seed file");
 }
 
 /// The port a probe sent from stays taken after the probe has returned.

@@ -14,6 +14,11 @@
 //! the name list, bit 2 puts the previous key beside the current one, as a
 //! server holds it during a key rotation, bit 3 swaps the two keys' places,
 //! as the rotation itself does, and bit 4 leaves the server with no ECH key.
+//! Bit 5 keeps released datagrams waiting: the target takes them only when
+//! the input ends, so they count against `HOLD_TOTAL_BYTES` as they do on the
+//! socket until the next receive call, and a run can reach that bound and make
+//! the hold evict for it. The other bits of a reload's byte keep their
+//! meaning, and its bit 5 is ignored.
 //! Then records of one header byte, a big-endian `u16` length, and that many
 //! bytes of body. The header's low two bits pick one of four source
 //! addresses, bit 2 says how the body is read, and the top five bits are the
@@ -52,7 +57,9 @@
 //! tries each of that policy's keys in turn, not the set's lookup by config_id,
 //! so ECH under the previous key is admitted only when the policy byte holds
 //! that key, and `EchKey::opens` refuses an extension that names another
-//! key's config_id before it decrypts.
+//! key's config_id before it decrypts. With bit 5 set the datagrams taken at
+//! the end belong to many flights, so the rule table oracle is not run on
+//! them; the check that each was held, from its address, still is.
 //!
 //! The ECH keys are fixed: the current one ([`gate::hold_input_key`],
 //! config_id 7) and the previous one ([`gate::hold_input_previous_key`],
@@ -159,6 +166,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let mut policy = input.policy.clone();
+    let keep_released = input.keep_released;
     let mut list = Names::new(&policy.names);
     let mut screening = Screening::new(policy.policy(&KEY, &PREVIOUS));
 
@@ -207,25 +215,22 @@ fuzz_target!(|data: &[u8]| {
             screening.held_bytes(),
             "the byte count is what the hold holds"
         );
-        let released = screening.released();
-        if screened == Screened::Released {
-            let keys: Vec<&EchKey> = policy
-                .keys(&KEY, &PREVIOUS)
-                .into_iter()
-                .map(|key| &**key)
-                .collect();
-            admitted_by_the_rules(&released, &keys, policy.require_ech, &policy.names);
-        } else {
-            assert!(
-                released.is_empty(),
-                "datagrams released by a record that released nothing"
-            );
-        }
-        for released in released {
-            let Some(at) = held.iter().position(|entry| *entry == released) else {
-                panic!("a released datagram was never held from that address");
-            };
-            held.swap_remove(at);
+        if !keep_released {
+            let released = screening.released();
+            if screened == Screened::Released {
+                let keys: Vec<&EchKey> = policy
+                    .keys(&KEY, &PREVIOUS)
+                    .into_iter()
+                    .map(|key| &**key)
+                    .collect();
+                admitted_by_the_rules(&released, &keys, policy.require_ech, &policy.names);
+            } else {
+                assert!(
+                    released.is_empty(),
+                    "datagrams released by a record that released nothing"
+                );
+            }
+            take_held(&mut held, released);
         }
 
         assert!(screening.flights() <= HOLD_FLIGHTS, "the table bound");
@@ -244,4 +249,25 @@ fuzz_target!(|data: &[u8]| {
             "only an admitted flight adds to the replay record"
         );
     }
+
+    if keep_released {
+        let released = screening.released();
+        take_held(&mut held, released);
+        assert_eq!(
+            screening.recounted_bytes(),
+            screening.held_bytes(),
+            "the byte count once the waiting datagrams are taken"
+        );
+    }
 });
+
+/// Removes each of `released` from `held`, where it has to be: a released
+/// datagram is one the hold kept, from the address it came from.
+fn take_held(held: &mut Vec<(SocketAddr, Vec<u8>)>, released: Vec<(SocketAddr, Vec<u8>)>) {
+    for released in released {
+        let Some(at) = held.iter().position(|entry| *entry == released) else {
+            panic!("a released datagram was never held from that address");
+        };
+        held.swap_remove(at);
+    }
+}
