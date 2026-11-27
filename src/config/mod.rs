@@ -1029,37 +1029,20 @@ pub(crate) mod tests {
         }
     }
 
-    /// `bbr-capped`, the name the capped controller had in v1.1.0 and v1.1.1
-    /// and an alias of `bbr` in 1.2.0, is not accepted since 1.3.0 (D108, user
-    /// ruling 2026-10-03). The refusal names the accepted values, so the fix
-    /// for a 1.1.x file is in the message.
+    /// A controller name that is not offered is refused, naming the key, the
+    /// value and the accepted values, so the fix is in the message.
+    ///
+    /// `bbr-capped` and `bbr-uncapped` are names older releases accepted
+    /// (D108). The parser's own error names the accepted values; the startup
+    /// error redacts them and keeps the line and column.
     #[test]
-    fn bbr_capped_is_no_longer_accepted() {
-        let err = parse_err("[limits]\ncongestion_control = \"bbr-capped\"").to_string();
-        assert!(err.contains("bbr-capped"), "{err}");
-        assert!(err.contains("`bbr`"), "{err}");
-    }
-
-    /// `bbr-uncapped`, which selected quinn's BBR as it ships from 1.2.0 to
-    /// 1.7.0, is not accepted since the controller stopped using quinn's BBR
-    /// (D108, user ruling 2026-11-22). The parser's own error names the
-    /// accepted values; the startup error redacts them and keeps the line and
-    /// column.
-    #[test]
-    fn bbr_uncapped_is_no_longer_accepted() {
-        let err = parse_err("[limits]\ncongestion_control = \"bbr-uncapped\"").to_string();
-        assert!(err.contains("bbr-uncapped"), "{err}");
-        assert!(err.contains("`bbr`"), "{err}");
-        assert!(
-            err.contains("`cubic`") && err.contains("`newreno`"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn an_unknown_congestion_controller_is_rejected() {
-        let err = parse_err("[limits]\ncongestion_control = \"reno\"");
-        assert!(err.to_string().contains("congestion_control"), "{err}");
+    fn a_congestion_controller_that_is_not_offered_is_refused() {
+        for value in ["bbr-capped", "bbr-uncapped", "reno"] {
+            let err = parse_err(&format!("[limits]\ncongestion_control = \"{value}\"")).to_string();
+            for named in ["congestion_control", value, "`bbr`", "`cubic`", "`newreno`"] {
+                assert!(err.contains(named), "{value}: {named} is named: {err}");
+            }
+        }
     }
 
     #[test]
