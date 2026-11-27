@@ -36,8 +36,8 @@
 //! bytes enter the value rather than where the value is logged, it applies both
 //! rules at once and returns something the rest of the program may print with
 //! `Display` from then on. [`peer_error`] applies it to the value this server
-//! meets such bytes in, a QUIC connection error, so that the two places one of
-//! those reaches a log line apply the rule by calling the same function.
+//! meets such bytes in, a QUIC connection error, so that every place one of
+//! those reaches a log line applies the rule by calling the same function.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -134,8 +134,7 @@ pub fn escaped_bytes(token: &[u8]) -> String {
 /// path by which a `quinn::ConnectionError` reaches a log line goes through
 /// here first, so that "a connection error a peer may have authored is escaped
 /// where it enters this program" is one function rather than a rule to
-/// remember. The handshake that never completed ([`crate::quic`]) and the
-/// connection that did ([`crate::h3api::ConnectionError`]) are the two paths.
+/// remember.
 ///
 /// Every other variant is this server's own account of what went wrong (a
 /// timeout, a transport error it raised itself) and is left alone.
