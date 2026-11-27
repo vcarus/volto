@@ -1,21 +1,16 @@
 //! Scaffolding for the test binaries that run a program instead of linking one.
 //!
-//! `it_cli`, `it_deploy`, `it_installer`, `it_scrub`, `it_clock`,
-//! `it_log_lines` and
-//! `it_release_assets` judge volto from the outside: a shell script run as a
-//! file, the binary run as a process, or the tracked tree read as text. None of
-//! them opens a QUIC connection, and none of them wants the harness in
-//! [`super`] — which builds certificates with `rcgen`, binds a server and
-//! speaks HTTP/3.
+//! The binaries that run a program, run a script, or read the tracked tree as
+//! text judge volto from the outside. None of them opens a QUIC connection,
+//! and none of them wants the harness in [`super`], which builds certificates
+//! with `rcgen`, binds a server and speaks HTTP/3.
 //!
 //! That is why this is a leaf module reached with
 //! `#[path = "common/scripts.rs"] mod scripts;` rather than an item inside
 //! `common`. `tests/common/mod.rs` does not declare it, so `mod common;` does
 //! not compile it, and a binary that names it this way links exactly what the
-//! file below uses: the standard library. D66's QR5 rejected sharing anything
-//! with these binaries on the grounds that `mod common;` would drag rcgen,
-//! quinn and rustls into a process that only runs `bash`; that objection is
-//! about `mod common;`, and this is the way round it.
+//! file below uses: the standard library. D66 allows sharing with them only
+//! through a leaf module like this one.
 //!
 //! Nothing here asserts anything about volto. It is paths, process output, and
 //! the files a run has to plant before it can ask a question: the certificate
@@ -38,13 +33,7 @@ pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The `src/` tree, which is what the two gates that read this crate as text
-/// scan.
-///
-/// Beside [`rust_files`] rather than inside it, because "which directory" and
-/// "which files in it" are separate questions: the callers below hand the root
-/// to `strip_prefix` as well, so a failure names `src/foo.rs` rather than an
-/// absolute path.
+/// The `src/` tree, which the text gates scan.
 pub fn source_root() -> PathBuf {
     repo_root().join("src")
 }
@@ -70,10 +59,7 @@ pub fn real_binary() -> PathBuf {
 /// Every `.rs` file under `root`, in a stable order so a failure names the same
 /// file twice running.
 ///
-/// The two gates that read this crate as text -- `it_clock`, which refuses the
-/// wall clock, and `it_log_lines`, which accounts for every production log
-/// statement -- both start here, so "what `src/` is" is one answer rather than
-/// two that can drift.
+/// The text gates share this one list.
 pub fn rust_files(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -98,11 +84,10 @@ pub fn rust_files(root: &Path) -> Vec<PathBuf> {
 
 /// The text of a file this gate cannot do its job without.
 ///
-/// `it_scrub`'s lesson pointed the other way: a check that reads a file has to
-/// fail loudly when the file is not there, or a rename turns the gate into a
-/// no-op that nobody notices. So this panics naming the path rather than
-/// returning a `Result` a caller could quietly ignore, and the five gates that
-/// read the tree as text share one wording for it.
+/// A check that reads a file has to fail loudly when the file is not there, or
+/// a rename turns the gate into a no-op that nobody notices. So this panics
+/// naming the path rather than returning a `Result` a caller could quietly
+/// ignore.
 pub fn read_text(path: &Path) -> String {
     fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
