@@ -212,8 +212,9 @@ mtu_upper_bound = 1436
 # Keep BBR on a long, lossy path: a loss-based controller (cubic, newreno) takes
 # every lost packet for congestion, and its downloads stall there. Use cubic only
 # on a clean path, or as a fallback. "bbr" is volto's own controller: its window
-# is at most 1.25 times the bandwidth-delay product it measures, and lower where
-# the path's queue is too short to hold the difference. The values "bbr-capped"
+# is at most 1.25 times the bandwidth-delay product it measures plus what the
+# path's own loss takes out of it, and lower where the path's queue is too short
+# to hold the difference. The values "bbr-capped"
 # (1.1.x) and "bbr-uncapped" (1.2.0 to 1.7.0) are no longer accepted.
 # docs/configuration.md#notes-that-matter-in-practice
 # Default: "bbr"
