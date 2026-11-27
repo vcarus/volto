@@ -16,11 +16,8 @@
 //!
 //! [`Config::warnings`] reports the first of those at startup.
 //!
-//! Rejecting unknown keys also makes a configuration file forward-only: one
-//! written for this version does not load on a release that predates any key in
-//! it, so the file has to be edited before a rollback rather than after the
-//! service fails to start. `docs/configuration.md` carries the operator's half
-//! of that (which key arrived in which release, and why the policy stays).
+//! Rejecting unknown keys makes a file forward-only; `docs/configuration.md`
+//! (Version compatibility) gives the rollback rule.
 
 mod parse_error;
 mod validate;
@@ -64,8 +61,7 @@ pub const DEFAULT_UDP_SESSION_TIMEOUT: u64 = 180;
 
 /// Default cap on simultaneously open QUIC connections.
 ///
-/// Sized against the rest of the budget rather than picked at random: what the
-/// startup check compares against `RLIMIT_NOFILE` is
+/// What the startup check compares against `RLIMIT_NOFILE` is
 /// `max_connections * max_targets_per_conn` plus 64 descriptors of headroom,
 /// which is 256 * 256 + 64 = 65600 here, against the `LimitNOFILE=131072` the
 /// shipped systemd unit sets. Raising either limit past that point means raising
@@ -141,11 +137,8 @@ pub const MIN_INITIAL_MTU: u16 = 1200;
 /// ceiling 1452 and not 1500: quinn documents `initial_mtu` as "the initial
 /// value to be used as the maximum UDP payload size before running MTU
 /// discovery", and Ethernet's 1500-byte MTU leaves 1472 bytes of payload over
-/// IPv4 (20-byte header + 8-byte UDP) and 1452 over IPv6 (40 + 8). The ceiling
-/// stays at the both-families value even though `mtu_upper_bound` may claim
-/// IPv4's extra 20 bytes. Discovery reaches a size only after a probe of it is
-/// acknowledged, and the black-hole detector takes the size back down when
-/// traffic at it is lost. This value is sent blind in the handshake.
+/// IPv4 (20-byte header + 8-byte UDP) and 1452 over IPv6 (40 + 8). This value
+/// is sent blind in the handshake.
 ///
 /// There is no floor to fall back to if this is wrong. quinn applies the value
 /// with a `max()` against the 1200-byte minimum and no `min()` above it, so the
@@ -166,13 +159,9 @@ pub const MAX_INITIAL_MTU: u16 = 1452;
 /// arbitrarily high upper bound, regardless of the network path's MTU". That
 /// holds only on a path that drops a packet it cannot carry.
 ///
-/// A probe that is acknowledged does not show that the path carries that size
-/// under load. On a measured relay path, packets with a UDP payload above 1436
-/// arrived with DF cleared: single probes got through, discovery adopted the
-/// size, and bulk traffic at it was lost until the black-hole detector dropped
-/// the size to 1200. 1436 is the largest UDP payload that crossed that path
-/// with DF set (D81). It is below 1452, so the default is safe on either
-/// family.
+/// An acknowledged probe does not show that the path carries the size under
+/// load: 1436 is the largest UDP payload a measured relay path carried with DF
+/// set (D81), and it is below 1452, so it holds on either family.
 pub const DEFAULT_MTU_UPPER_BOUND: u16 = 1436;
 
 /// The largest `mtu_upper_bound` this server accepts, in bytes.
@@ -193,9 +182,7 @@ pub const MAX_MTU_UPPER_BOUND: u16 = 1472;
 /// quinn's own default, straight from RFC 9002's `kInitialRtt`. It seeds the
 /// loss-recovery timers during the handshake, when no RTT sample exists yet: a
 /// lost handshake packet waits roughly three times this value before it is
-/// resent. On a path whose RTT is known (the `rtt_ms` field in the connection
-/// logs), 1.5–2x that measurement recovers a lost handshake in a fraction of
-/// the default wait. The margin is not optional: a value below the real RTT
+/// resent. The margin is not optional: a value below the real RTT
 /// makes the timer fire early and retransmit packets that were never lost.
 pub const DEFAULT_INITIAL_RTT_MS: u64 = 333;
 
@@ -221,19 +208,10 @@ const MAX_IDLE_TIMEOUT_CEILING: u64 = 3600;
 
 /// Largest accepted `shutdown_grace`, in seconds.
 ///
-/// The same number as [`MAX_IDLE_TIMEOUT_CEILING`], for half of the same
-/// reason: past an hour a wait stops describing anything anybody observes, and
-/// a drain that long exceeds any service manager's stop timeout (systemd's
-/// default `TimeoutStopSec` is 90 seconds).
-///
-/// The other half is this key's own, and it is the opposite of the timers'.
-/// A grace period that cannot be added to `Instant::now()` does not panic:
-/// `tokio::time::timeout` turns a duration it cannot add into a deadline in the
-/// far future, so an absurd `u64` of seconds fails quietly. That removes the
-/// bound `crate::quic`'s drain is built around, and the process waits on
-/// connections that may never end until a `SIGKILL` arrives, which is the
-/// ungraceful ending the grace period exists to avoid. Bounding the key keeps
-/// that state unreachable.
+/// Past an hour a drain outlives any service manager's stop timeout. Unlike the
+/// timers, an absurd value does not panic: `tokio::time::timeout` sets no
+/// deadline when `Instant::now() + grace` overflows, so the drain would wait
+/// until `SIGKILL`. The ceiling keeps that unreachable.
 const MAX_SHUTDOWN_GRACE: u64 = MAX_IDLE_TIMEOUT_CEILING;
 
 /// Default UDP socket receive buffer to request, in bytes.
@@ -245,12 +223,8 @@ const MAX_SHUTDOWN_GRACE: u64 = MAX_IDLE_TIMEOUT_CEILING;
 /// sysctl is only a ceiling on what an application may *request*, not an
 /// allocation.
 ///
-/// Like the per-stream flow-control window in [`crate::quic`], 2 MiB costs
-/// nothing until a burst needs it. The bursts it covers are ordinary ones: a
-/// batch of packets arriving while the read loop is elsewhere, a GSO segment
-/// train, a scheduling delay. Without it such a burst is dropped silently. The
-/// kernel counts the drop as `receive buffer errors` in `netstat -su`, and the
-/// sender has to retransmit.
+/// 2 MiB costs nothing until a burst needs it; without it a burst is dropped
+/// and counted as `receive buffer errors` in `netstat -su`.
 ///
 /// Requested when the socket is created, so this is a startup-only setting.
 /// Zero leaves the operating system's own value alone.
@@ -389,11 +363,8 @@ impl std::fmt::Debug for User {
 /// throughput where CUBIC and NewReno stall, matching what the Linux kernel does
 /// for TCP with `net.ipv4.tcp_congestion_control = bbr`.
 ///
-/// The value `bbr` selects volto's own controller ([`crate::congestion`],
-/// D108), whose window is at most 1.25 times the bandwidth-delay product it
-/// measures, plus what the path's own loss takes out of it. quinn's BBR overestimates the bottleneck and loses the difference
-/// on a bulk download, so it is not offered: the value `bbr-uncapped`, which
-/// selected it from 1.2.0 to 1.7.0, is no longer accepted.
+/// `bbr` selects volto's own controller ([`crate::congestion`], D108). quinn's
+/// BBR is not offered.
 ///
 /// The other controllers are kept as a fallback, so an operator who hits
 /// trouble with the default can switch without recompiling.
@@ -428,16 +399,9 @@ pub enum CongestionControl {
 /// there is no failover behind that choice.
 ///
 /// [`System`](Self::System) keeps RFC 6724 ordering, which on glibc an operator
-/// can shape further through `gai.conf`. shadowsocks-rust carries the same
-/// choice as `ipv6_first`, likewise off by default.
+/// can shape further through `gai.conf`.
 ///
-/// The preference also decides what is asked of the resolver. With `Ipv4` or
-/// `Ipv6` the preferred family is looked up alone, and a tunnel does not wait
-/// for the other family's answer while it has a preferred address to try. The
-/// other family is looked up at the same time when the connection has a lookup
-/// slot to spare, and otherwise only when it is needed (`tunnel::resolve_within`
-/// and [`crate::net::OtherFamily`]). The order in which addresses are tried
-/// is the same either way. `System` is one lookup of both families.
+/// How the preference shapes the lookups is in [`crate::net::OtherFamily`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IpFamilyPreference {
@@ -460,9 +424,8 @@ pub struct Limits {
     /// this long to complete, which is the only thing keeping a half-closed
     /// tunnel from holding its socket and its slot for as long as the QUIC
     /// connection lasts (`tunnel::tcp` module docs). Both uses reach the tunnel
-    /// as [`crate::tunnel::Context::stall_budget`]. The name is the CONNECT-UDP
-    /// half alone because it is the older one and a configuration key cannot be
-    /// renamed without breaking every deployed config file.
+    /// as [`crate::tunnel::Context::stall_budget`]. A configuration key cannot
+    /// be renamed without breaking every deployed file, so the name stays.
     pub udp_session_timeout: u64,
     /// Concurrent tunnels allowed on one QUIC connection.
     pub max_targets_per_conn: u32,
@@ -475,8 +438,7 @@ pub struct Limits {
     pub max_connections: u32,
     /// Seconds allowed for reaching a target. Zero disables the budget.
     ///
-    /// Spent twice per request: once on name resolution, once on the whole list
-    /// of addresses it resolved to. See [`DEFAULT_CONNECT_TIMEOUT`].
+    /// See [`DEFAULT_CONNECT_TIMEOUT`].
     pub connect_timeout: u64,
     /// Which address family a resolved target is tried on first.
     ///
@@ -492,16 +454,11 @@ pub struct Limits {
     /// authenticated request, so an unauthenticated peer is never worth the
     /// configured value.
     ///
-    /// Between 1 and 65536. The ceiling is not a formality: the credit is
-    /// reserved slot by slot when the allowance is granted rather than when a
-    /// stream is opened, so the whole allowance is paid for at once, at the
-    /// connection's first authenticated request.
+    /// Between 1 and 65536; see `MAX_STREAMS_BIDI_CEILING`.
     pub max_streams_bidi: u32,
     /// Seconds a QUIC connection may go without traffic before it is closed.
     ///
-    /// Only half of what decides that: RFC 9000 §10.1 takes the minimum of both
-    /// endpoints' advertisements, so a client advertising less wins. See
-    /// [`DEFAULT_MAX_IDLE_TIMEOUT`].
+    /// See [`DEFAULT_MAX_IDLE_TIMEOUT`].
     pub max_idle_timeout: u64,
     /// Seconds between keep-alive packets. Zero disables them.
     ///
@@ -524,12 +481,8 @@ pub struct Limits {
     pub mtu_discovery: bool,
     /// Ceiling for path MTU discovery, in bytes. Between `initial_mtu` and 1472.
     ///
-    /// A UDP payload size like `initial_mtu`. The default of 1436 is below
-    /// quinn's 1452 because an acknowledged probe does not show that the path
-    /// carries that size under load; [`DEFAULT_MTU_UPPER_BOUND`] gives the
-    /// measurement. An operator who has measured their own path at bulk rate
-    /// can raise it, at most to 1472. Moot when `mtu_discovery` is off, which is
-    /// warned about rather than rejected. See [`MAX_MTU_UPPER_BOUND`].
+    /// A UDP payload size like `initial_mtu`; see [`DEFAULT_MTU_UPPER_BOUND`]
+    /// and [`MAX_MTU_UPPER_BOUND`]. Moot when `mtu_discovery` is off.
     ///
     /// `None` when the key is absent, which is what lets an absent ceiling
     /// follow `initial_mtu` up while a written one is checked exactly. Read the
@@ -552,15 +505,9 @@ pub struct Limits {
     /// applies nothing, and says so, exactly as one carrying a different
     /// `listen` does.
     ///
-    /// Two things the kernel does with the request are worth knowing before
-    /// reading a log line about it. It is capped at a host ceiling
-    /// (`net.core.rmem_max` on Linux, `kern.ipc.maxsockbuf` on macOS), and a
-    /// host may fail the call outright instead of clamping. And on Linux the value
-    /// read back is *double* what was granted, because the accounting includes
-    /// per-packet overhead, so a satisfied 2 MiB request reads as 4194304 both
-    /// here and in `ss -uanpm`. Either way the endpoint still comes up, and volto
-    /// warns at startup when it got less than it asked for. See
-    /// [`DEFAULT_SOCKET_RECV_BUFFER`]. At most [`MAX_SOCKET_BUFFER`].
+    /// What the kernel grants and how it is read back is in [`crate::quic`]'s
+    /// socket setup; see [`DEFAULT_SOCKET_RECV_BUFFER`]. At most
+    /// [`MAX_SOCKET_BUFFER`].
     pub socket_recv_buffer: usize,
     /// UDP socket send buffer to request, in bytes. Zero keeps the OS default.
     ///
@@ -739,12 +686,9 @@ impl Limits {
     /// A ceiling the file sets is used as written; `validate` has already held
     /// it to `initial_mtu..=`[`MAX_MTU_UPPER_BOUND`]. An absent one is
     /// [`DEFAULT_MTU_UPPER_BOUND`], raised to `initial_mtu` when that is larger.
-    /// The raise exists because the default (1436) is below
-    /// [`MAX_INITIAL_MTU`] (1452): a file may set `initial_mtu` anywhere up to
-    /// 1452 and no ceiling, and it has to load. quinn would raise a ceiling
-    /// below the starting size to that size on its own; this makes the same
-    /// value explicit, so the transport and the logs see the ceiling that is
-    /// actually used.
+    /// The raise lets a file set `initial_mtu` up to 1452 without a ceiling;
+    /// quinn would raise a lower ceiling to the starting size anyway, and this
+    /// makes the value the logs see the one in use.
     pub fn mtu_upper_bound(&self) -> u16 {
         self.mtu_upper_bound
             .unwrap_or_else(|| DEFAULT_MTU_UPPER_BOUND.max(self.initial_mtu))
@@ -820,16 +764,11 @@ const MAX_TARGETS_PER_CONN_CEILING: u32 = 65_536;
 /// The same number as [`MAX_TARGETS_PER_CONN_CEILING`], because one tunnel is
 /// one stream: credit past the ceiling on tunnels could not carry one anyway.
 ///
-/// It is rejected rather than tolerated because of where the cost is paid.
-/// quinn does not allocate a stream when one is opened: `StreamsState` reserves
-/// a slot for every unit of the credit when the allowance is granted, once per
-/// connection at its first authenticated request. The cost grows with the
-/// credit. D86 measured it on the dev host, when it was paid per handshake:
-/// about 11 ms at the default of 1024, 135 ms at this ceiling, 7.3 s at a
-/// million, and no completed handshake within ten seconds at four million.
-/// `u32::MAX`, which a config file can hold, is a thousand times more again. A
-/// typo here gives every connection's first request a stall, the same kind of
-/// self-inflicted outage `MAX_INITIAL_MTU` is written against.
+/// Rejected rather than tolerated: quinn reserves a slot for every unit of
+/// credit when the allowance is granted (`StreamsState::ensure_remote_streams`),
+/// once per connection at its first authenticated request, and the cost grows
+/// with the credit (D86). `u32::MAX` would stall every connection's first
+/// request.
 const MAX_STREAMS_BIDI_CEILING: u32 = MAX_TARGETS_PER_CONN_CEILING;
 
 /// The longest host name a `server_name` extension can carry, in bytes.
