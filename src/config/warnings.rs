@@ -411,9 +411,23 @@ mod tests {
         );
     }
 
-    /// A certificate for `names`, written to a fresh directory; returns the
-    /// paths a `[server]` section can point at.
-    fn minted_certificate(names: &[&str]) -> (std::path::PathBuf, std::path::PathBuf) {
+    /// A certificate and its private key in a directory of their own, which is
+    /// removed with everything in it when this is dropped, however the test
+    /// ends.
+    struct Minted {
+        dir: std::path::PathBuf,
+        cert: std::path::PathBuf,
+        key: std::path::PathBuf,
+    }
+
+    impl Drop for Minted {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A certificate for `names`, written to a fresh directory.
+    fn minted_certificate(names: &[&str]) -> Minted {
         let issued = rcgen::generate_simple_self_signed(
             names
                 .iter()
@@ -433,7 +447,7 @@ mod tests {
         let key = dir.join("key.pem");
         std::fs::write(&cert, issued.cert.pem()).expect("write the certificate");
         std::fs::write(&key, issued.signing_key.serialize_pem()).expect("write the key");
-        (cert, key)
+        Minted { dir, cert, key }
     }
 
     fn parse_with_certificate(cert: &std::path::Path, key: &std::path::Path, body: &str) -> Config {
@@ -460,8 +474,7 @@ mod tests {
     fn a_configuration_file_readable_by_others_is_warned_about() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let (cert, key) = minted_certificate(&["proxy.example"]);
-        let dir = cert.parent().expect("the certificate is in a directory");
+        let Minted { dir, cert, key } = &minted_certificate(&["proxy.example"]);
         for (mode, warns) in [(0o644, true), (0o604, true), (0o640, false), (0o600, false)] {
             let path = dir.join(format!("config-{mode:o}.toml"));
             std::fs::write(
@@ -497,10 +510,10 @@ mod tests {
     /// warning that has to be there.
     #[test]
     fn an_expected_name_the_certificate_does_not_cover_is_warned_about() {
-        let (cert, key) = minted_certificate(&["proxy.example"]);
+        let Minted { cert, key, .. } = &minted_certificate(&["proxy.example"]);
         let warnings = parse_with_certificate(
-            &cert,
-            &key,
+            cert,
+            key,
             "[security]\nexpected_sni = [\"proxy.example\", \"porxy.example\"]",
         )
         .warnings();
@@ -520,10 +533,10 @@ mod tests {
     /// complaint, not this one's.
     #[test]
     fn covered_expected_names_draw_no_warning() {
-        let (cert, key) = minted_certificate(&["proxy.example", "localhost"]);
+        let Minted { cert, key, .. } = &minted_certificate(&["proxy.example", "localhost"]);
         let warnings = parse_with_certificate(
-            &cert,
-            &key,
+            cert,
+            key,
             "[security]\nexpected_sni = [\"PROXY.example.\", \"localhost\"]",
         )
         .warnings();
