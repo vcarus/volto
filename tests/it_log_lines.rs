@@ -524,26 +524,19 @@ const ACCOUNTED: &[Accounted] = &[
     },
 ];
 
-/// The macros a production log line is written with.
+/// The macros a production log line is written with, named up to the `!`.
 ///
-/// The trailing `(` is part of the name on purpose: it is what tells a macro
-/// invocation from a mention of one, and every call in this crate is written
-/// with parentheses.
+/// A call is the name, optional whitespace, and an opening `(`, `[` or `{`.
+/// [`read_file`] refuses a name followed by anything else.
 ///
-/// `event!` is the fourth spelling and the only one nothing in `src/` uses
-/// today. It is listed rather than left as a note because a gate that fails by
-/// default is this file's whole design: `tracing::event!(Level::WARN, ..)` is a
-/// production log statement, and without the entry it would be the one shape
-/// that reaches the journal with no table row behind it.
-///
-/// No level has to be parsed to place one. [`invocation`] takes the last string
-/// literal between the balanced parentheses, and `Level::WARN` carries none, so
-/// an `event!` is read exactly as the other three are. That does make this
-/// stricter in one direction: `event!(Level::DEBUG, ..)` is accounted where a
-/// `debug!` is not. For a spelling this crate has chosen not to use at all,
-/// that is the safe way round -- the first `event!` written here arrives with a
-/// decision about its bound, whatever level it carries.
-const PRODUCTION_MACROS: [&str; 4] = ["info!(", "warn!(", "error!(", "event!("];
+/// `event!` is listed though `src/` writes none, so the first one is red; its
+/// level is an argument, so `event!(Level::DEBUG, ..)` is accounted too, which
+/// is the safe direction.
+const PRODUCTION_MACROS: [&str; 4] = ["info!", "warn!", "error!", "event!"];
+
+/// The names of [`PRODUCTION_MACROS`] without the `!`, as a `use` item names
+/// them.
+const LEVEL_NAMES: [&str; 4] = ["info", "warn", "error", "event"];
 
 /// A production log statement found in `src/`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -572,14 +565,30 @@ impl Statement {
 ///
 /// Read out of the invocation's own source rather than through [`invocation`],
 /// which takes the *last* literal because that is where `tracing` puts the
-/// message. `log_id` is a field, so it is found by name: the first `log_id`,
-/// its `=`, and the string literal after it.
+/// message. `log_id` is a field, so it is found by name: the whole word
+/// `log_id` outside any literal, its `=`, and the string literal after it. A
+/// field whose name ends in `log_id`, such as `catalog_id`, is not it.
 fn log_id(invocation: &str) -> Option<String> {
-    let after = invocation.split_once("log_id")?.1.trim_start();
-    let value = after.strip_prefix('=')?.trim_start();
-    let rest = value.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    const FIELD: &str = "log_id";
+    let mut at = 0;
+    while at < invocation.len() {
+        if let Some(len) = literal_len(invocation, at) {
+            at += len;
+            continue;
+        }
+        let rest = &invocation[at..];
+        if rest.starts_with(FIELD)
+            && !invocation[..at].chars().next_back().is_some_and(is_identifier)
+            && !rest[FIELD.len()..].chars().next().is_some_and(is_identifier)
+        {
+            let value = rest[FIELD.len()..].trim_start().strip_prefix('=')?;
+            let value = value.trim_start().strip_prefix('"')?;
+            let end = value.find('"')?;
+            return Some(value[..end].to_string());
+        }
+        at += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    None
 }
 
 /// Whether `id` is the shape D100 requires: eight lowercase letters and digits.
@@ -730,13 +739,14 @@ fn unescape(chars: impl Iterator<Item = char>) -> String {
     out
 }
 
-/// The macro invocation whose opening parenthesis is at `open`: the index just
+/// The macro invocation whose opening delimiter is at `open`: the index just
 /// past its closing one, and the last string literal inside it.
 ///
 /// The last literal is the message: `tracing` takes the structured fields first
 /// and the message last, and every call in this crate is written that way. A
-/// literal in a field value — there is none today — would be overtaken by the
-/// message that follows it.
+/// literal in a field value (there is none today) would be overtaken by the
+/// message that follows it. The three kinds of bracket are counted as one
+/// depth, which the compiler's own balancing makes safe.
 fn invocation(chars: &[(usize, char)], open: usize) -> (usize, String) {
     let mut depth = 0usize;
     let mut message = String::new();
@@ -750,11 +760,11 @@ fn invocation(chars: &[(usize, char)], open: usize) -> (usize, String) {
                 message = unescape(chars[index + 1..last].iter().map(|(_, ch)| *ch));
                 index = end;
             }
-            '(' => {
+            '(' | '[' | '{' => {
                 depth += 1;
                 index += 1;
             }
-            ')' => {
+            ')' | ']' | '}' => {
                 depth -= 1;
                 index += 1;
                 if depth == 0 {
@@ -774,10 +784,46 @@ fn is_identifier(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
+/// What the scanner read out of one file.
+struct FileScan {
+    /// The production log statements it found.
+    statements: Vec<Statement>,
+    /// Each place where a log line could be written in a shape the scanner
+    /// cannot read, named `src/<file>:<line>` with the reason.
+    refused: Vec<String>,
+}
+
 /// Every production log statement in one file's code.
+///
+/// Panics, naming each place, if [`read_file`] refused any part of the file:
+/// a shape the scanner cannot read is a failure, not a file with fewer lines.
 fn log_statements(file: &str, code: &str) -> Vec<Statement> {
+    let scanned = read_file(file, code);
+    assert!(
+        scanned.refused.is_empty(),
+        "the log-line scanner cannot read these places, so it cannot account for \
+         the lines they may write; rewrite them as a plain statement:\n  {}",
+        scanned.refused.join("\n  ")
+    );
+    scanned.statements
+}
+
+/// The production log statements in one file's code, and the places it
+/// refuses.
+///
+/// Four shapes can write a production line without a statement the scan
+/// would read, and each is refused where it occurs: a level macro name with
+/// no delimiter after it, a `use` that imports a level macro under another
+/// name, a `macro_rules!` whose body calls a level macro or a macro passed in
+/// as `$name!`, and a `#[instrument]` attribute with `err` or `ret`, which
+/// writes an event of its own. A call with brackets or braces is read like
+/// one with parentheses.
+fn read_file(file: &str, code: &str) -> FileScan {
     let chars: Vec<(usize, char)> = code.char_indices().collect();
-    let mut found = Vec::new();
+    let mut scanned = FileScan {
+        statements: Vec::new(),
+        refused: Vec::new(),
+    };
     let mut index = 0;
 
     while index < chars.len() {
@@ -790,25 +836,40 @@ fn log_statements(file: &str, code: &str) -> Vec<Statement> {
             continue;
         }
 
-        let name = PRODUCTION_MACROS
-            .iter()
-            .find(|name| code[offset..].starts_with(**name));
-
         // `tracing::warn!` is reached through a path, so what precedes the name
         // may be a colon; what it may not be is another identifier character,
-        // which is what would make this the tail of a different macro's name.
+        // which is what would make this the tail of a different name.
         let starts_a_name = index == 0 || !is_identifier(chars[index - 1].1);
+        if !starts_a_name {
+            index += 1;
+            continue;
+        }
+        let rest = &code[offset..];
 
-        if let (Some(name), true) = (name, starts_a_name) {
-            let open = index + name.chars().count() - 1;
+        if let Some(name) = PRODUCTION_MACROS.iter().find(|name| rest.starts_with(**name)) {
+            let mut open = index + name.chars().count();
+            while chars.get(open).is_some_and(|(_, ch)| ch.is_whitespace()) {
+                open += 1;
+            }
+            if !chars
+                .get(open)
+                .is_some_and(|(_, ch)| matches!(ch, '(' | '[' | '{'))
+            {
+                scanned.refused.push(format!(
+                    "src/{file}:{}: `{name}` with no delimiter after it",
+                    line_at(code, offset)
+                ));
+                index = open;
+                continue;
+            }
             let (end, message) = invocation(&chars, open);
             // The invocation's own source, for the field lookup: `end` is an
-            // index into `chars` just past the closing parenthesis, and the
-            // last invocation in a file ends at the end of it.
+            // index into `chars` just past the closing delimiter, and the last
+            // invocation in a file ends at the end of it.
             let close = chars
                 .get(end)
                 .map_or(code.len(), |(byte_offset, _)| *byte_offset);
-            found.push(Statement {
+            scanned.statements.push(Statement {
                 file: file.to_string(),
                 line: line_at(code, offset),
                 id: log_id(&code[offset..close]),
@@ -818,10 +879,91 @@ fn log_statements(file: &str, code: &str) -> Vec<Statement> {
             continue;
         }
 
+        if let Some(reason) = unreadable(rest) {
+            scanned.refused.push(format!(
+                "src/{file}:{}: {reason}",
+                line_at(code, offset)
+            ));
+        }
         index += 1;
     }
 
-    found
+    scanned
+}
+
+/// Why the item at the start of `rest` can write a log line the scan cannot
+/// read, or `None` when it cannot.
+fn unreadable(rest: &str) -> Option<&'static str> {
+    let words = |item: &str| -> Vec<String> {
+        item.split(|ch: char| !is_identifier(ch))
+            .filter(|word| !word.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+
+    if rest.starts_with("use ") {
+        let item = words(&rest[..rest.find(';').unwrap_or(rest.len())]);
+        let renamed = item
+            .windows(2)
+            .any(|pair| LEVEL_NAMES.contains(&pair[0].as_str()) && pair[1] == "as");
+        if item.iter().any(|word| word == "tracing") && renamed {
+            return Some("a level macro imported under another name");
+        }
+    }
+
+    if let Some(after) = rest.strip_prefix("macro_rules!") {
+        let body = &after[..balanced_len(after)];
+        let calls_a_level = PRODUCTION_MACROS.iter().any(|name| {
+            body.match_indices(name)
+                .any(|(at, _)| !body[..at].chars().next_back().is_some_and(is_identifier))
+        });
+        let calls_a_parameter = body.match_indices('$').any(|(at, _)| {
+            let name: String = body[at + 1..].chars().take_while(|ch| is_identifier(*ch)).collect();
+            !name.is_empty() && body[at + 1 + name.len()..].starts_with('!')
+        });
+        if calls_a_level || calls_a_parameter {
+            return Some(
+                "a `macro_rules!` that writes a log line, whose callers' level and \
+                 `log_id` the scanner cannot see",
+            );
+        }
+    }
+
+    if let Some(after) = rest.strip_prefix("#[") {
+        let attribute = words(&after[..balanced_len(rest) - 2]);
+        let writes_an_event = attribute.iter().any(|word| word == "err" || word == "ret");
+        if attribute.iter().any(|word| word == "instrument") && writes_an_event {
+            return Some("an `#[instrument]` with `err` or `ret`, which writes an event of its own");
+        }
+    }
+
+    None
+}
+
+/// The length in bytes of `text` up to and including the bracket that closes
+/// the first one opened in it, literals skipped; all of `text` if none closes.
+fn balanced_len(text: &str) -> usize {
+    let mut depth = 0usize;
+    let mut at = 0;
+    while at < text.len() {
+        if let Some(len) = literal_len(text, at) {
+            at += len;
+            continue;
+        }
+        let ch = text[at..].chars().next().expect("at is inside text");
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    return at + 1;
+                }
+            }
+            _ => {}
+        }
+        at += ch.len_utf8();
+    }
+    text.len()
 }
 
 /// Every production log statement in `src/`, in a stable order.
@@ -1092,6 +1234,90 @@ fn a_sampled_entry_lives_beside_a_sampler() {
             entry.message
         );
     }
+}
+
+/// Each shape that writes a line without a plain statement is read or refused,
+/// never skipped.
+#[test]
+fn the_scanner_reads_or_refuses_every_shape_that_writes_a_line() {
+    let refused = |code: &str| read_file("x.rs", &production_code(code)).refused;
+
+    // 1. Brackets and braces are delimiters like parentheses, and rustfmt
+    //    leaves them as they are. A space before the delimiter is read too.
+    let delimited = log_statements(
+        "x.rs",
+        "warn!{ log_id = \"aa11bb22\", \"braced\" };\n\
+         warn![log_id = \"cc33dd44\", \"bracketed\"];\n\
+         warn! (log_id = \"ee55ff66\", \"spaced\");\n",
+    );
+    assert_eq!(
+        delimited
+            .iter()
+            .map(|s| (s.line, s.id.as_deref(), s.message.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, Some("aa11bb22"), "braced"),
+            (2, Some("cc33dd44"), "bracketed"),
+            (3, Some("ee55ff66"), "spaced"),
+        ]
+    );
+
+    // 2. A level macro imported under another name has calls the scan cannot
+    //    find, so the import is refused where it is.
+    for import in [
+        "use tracing::warn as alert;\n",
+        "use tracing::{debug, info as note};\n",
+    ] {
+        let places = refused(&format!("{import}fn f() {{ note!(\"x\"); }}\n"));
+        assert_eq!(places.len(), 1, "{import:?}: {places:?}");
+        assert!(places[0].starts_with("src/x.rs:1: "), "{places:?}");
+    }
+    assert!(
+        refused("use tracing::{debug, info, warn};\nuse std::io::Error as IoError;\n").is_empty(),
+        "an import by the macro's own name, or a rename of something else, is fine"
+    );
+
+    // 3. A wrapper whose body calls a macro passed in as `$level!`, or a level
+    //    macro itself, hides its callers' level and `log_id`.
+    for wrapper in [
+        "macro_rules! close_line {\n    ($level:ident, $($field:tt)*) => { $level!($($field)*) };\n}\n",
+        "macro_rules! loud {\n    ($($field:tt)*) => { warn!($($field)*) };\n}\n",
+    ] {
+        let places = refused(&format!("fn g() {{}}\n{wrapper}"));
+        assert!(
+            places.iter().any(|place| place.starts_with("src/x.rs:2: ")),
+            "{wrapper:?}: {places:?}"
+        );
+    }
+    assert!(
+        refused("macro_rules! codes {\n    ($value:expr) => { const X: u64 = $value; };\n}\n")
+            .is_empty(),
+        "a macro that writes no line is fine"
+    );
+
+    // 4. `#[instrument]` with `err` or `ret` writes an event with no macro text.
+    for attribute in [
+        "#[tracing::instrument(err)]\n",
+        "#[instrument(skip(self), ret)]\n",
+    ] {
+        let places = refused(&format!("fn g() {{}}\n{attribute}fn f() {{}}\n"));
+        assert_eq!(places.len(), 1, "{attribute:?}: {places:?}");
+        assert!(places[0].starts_with("src/x.rs:2: "), "{places:?}");
+    }
+    assert!(
+        refused("#[instrument(skip(retries))]\nfn f() {}\n").is_empty(),
+        "a span with no event is fine, and `retries` is not `ret`"
+    );
+
+    // 5. `log_id` is the whole field name, so a field whose name ends in it is
+    //    not read as the id, and neither is a mention inside a literal.
+    let named = log_statements(
+        "x.rs",
+        "info!(catalog_id = \"zzzz9999\", note = \"log_id = \\\"yyyy8888\\\"\", \
+         log_id = \"ab12cd34\", \"m\");\n",
+    );
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].id.as_deref(), Some("ab12cd34"));
 }
 
 /// The scanner can fail, which is the half a passing gate never shows.
