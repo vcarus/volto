@@ -25,7 +25,7 @@
 
 // One of the package's argued exceptions to `unsafe_code = "deny"`: a global
 // allocator is an `unsafe` contract by definition, and these methods only
-// forward to the inner allocator and touch atomics on the way past.
+// forward to the inner allocator and report to the recorder on the way past.
 #![allow(unsafe_code)]
 #![allow(dead_code)] // Each measuring binary uses a subset of this.
 
@@ -86,9 +86,9 @@ impl<R> Default for PassThrough<R> {
 
 // SAFETY: every method forwards to `A`, which is a correct `GlobalAlloc` by its
 // own `unsafe impl`, and returns exactly what it returned. The bookkeeping
-// between the calls allocates nothing itself -- the implementations of
-// `Record` in the test binaries only touch atomics -- so it cannot re-enter the
-// allocator.
+// between the calls allocates nothing itself: the implementations of `Record`
+// in the test binaries touch only atomics and const-initialised thread-locals
+// without destructors, so it cannot re-enter the allocator.
 unsafe impl<R: Record, A: GlobalAlloc> GlobalAlloc for PassThrough<R, A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         unsafe {
