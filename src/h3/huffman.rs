@@ -114,10 +114,6 @@ struct Table {
 }
 
 /// Builds [`Table`] from [`CODES`] on first use.
-///
-/// Derived rather than checked in: the canonical form is a consequence of the
-/// RFC's table, so generating it here keeps one copy of the data and lets the
-/// tests verify the derivation.
 fn table() -> &'static Table {
     static TABLE: OnceLock<Table> = OnceLock::new();
 
@@ -161,9 +157,7 @@ fn table() -> &'static Table {
 
 /// Decodes a Huffman-encoded string literal.
 ///
-/// Every failure is the same stream error, carrying QPACK_DECOMPRESSION_FAILED
-/// and ending only the request that carried the literal. This is this server's
-/// own rule, not one RFC 7541 or RFC 9204 states; `failed` below says why.
+/// Every failure is `failed`'s stream error.
 pub fn decode(encoded: &[u8]) -> Result<Vec<u8>, Violation> {
     let table = table();
 
