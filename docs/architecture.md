@@ -237,12 +237,9 @@ credentials check: twice `limits.max_idle_timeout` for one request to
 authenticate. It is armed once at the handshake and never re-armed by a new
 stream, so what it bounds is the connection rather than a pause in it; twice, so
 that the transport's own idle timeout stays the first thing to fire on a peer
-that has simply gone away. The clock is read on each pass as well as awaited,
-because awaiting it alone is not enough: a timeout only reports a lapsed
-deadline on a poll where the work underneath it was not already finished, so a
-peer with another request stream always queued — one opened and finished empty
-costs it nothing and the server nothing but a stream error — was never measured
-against the deadline at all. Without it a peer that finishes the QUIC handshake
+that has simply gone away. The clock is read on each pass, because a peer that
+keeps another request stream queued would otherwise never let the timeout fire.
+Without it a peer that finishes the QUIC handshake
 and then says nothing holds a `max_connections` slot for as long as it keeps its
 socket open. It is lifted for the life of the connection the moment one request
 authenticates, so a client reusing an idle connection between requests is
@@ -257,9 +254,8 @@ size, and it is a transport parameter: the handshake advertises
 `INITIAL_BIDI_STREAMS` = 16 concurrent bidirectional streams rather than the
 configured `limits.max_streams_bidi`, and the first request to pass the
 credentials check raises the connection to the configured value in one step.
-Before it, a peer that has proved nothing holds at most 16 request streams — 16
-parked request tasks and 16 refusals to write, where 1024 of each were free —
-and its whole HEADERS buffering is bounded twice over by the same number, since
+Before it, a peer that has proved nothing holds at most 16 request streams, 16
+parked request tasks and 16 refusals to write, and its whole HEADERS buffering is bounded twice over by the same number, since
 16 field sections at the `MAX_FIELD_SECTION_SIZE` = 64 KiB per-frame cap are
 exactly the `HEADERS_BUFFER_BUDGET` = 1 MiB budget below. Running into the
 allowance is backpressure rather than an error: the peer's own stack holds the
@@ -406,10 +402,6 @@ in either direction — is deliberately not put on a timer, because a target tha
 has taken the client's FIN may legitimately take minutes to answer and cutting it
 would break the half-closes this proxy exists to carry; what limits those is
 capacity rather than time, `max_connections` × `max_targets_per_conn` sockets.
-Without the write bound, a half-closed tunnel whose surviving peer stopped taking
-bytes held the target socket, its file descriptor and the tunnel slot until the
-QUIC connection ended — which this server's own keep-alives can postpone
-indefinitely.
 
 Not on a timer is not unwatched. Such a tunnel still ends the moment the client
 says it wants no more of it: the response direction watches for the client's
@@ -422,10 +414,7 @@ keeps a quiet half-closed tunnel alive.
 The last row cancels both directions because RFC 9114 §4.4 asks for it: "If the
 stream is reset or reading is aborted by the client, a proxy SHOULD perform the
 same operation on the other direction in order to ensure that both directions of
-the stream are cancelled." Without it a client that reset only its sending side
-had the response direction finished with a clean FIN, so a truncated response
-read as a complete one, and a client that sent STOP_SENDING had its own sending
-side stopped with code 0 rather than with an HTTP/3 code.
+the stream are cancelled."
 
 ### UDP tunnels
 
@@ -466,10 +455,7 @@ kernel. Sessions have their own idle timeout (default
 where idle means no packet crossed the proxy: the clock is re-armed by a payload
 reaching the target or the target answering, never by bytes alone, so a peer
 dripping fragments of a capsule that never completes is reclaimed on schedule.
-As on the connection bound above, that clock is read on each pass and not only
-awaited: a peer with another payload always queued — the ones the amplification
-cap drops re-arm nothing, and cost it only bandwidth — kept the session's wait
-finishing on its own and the deadline was never measured against it. One pass
+As on the connection bound, the clock is read on each pass. One pass
 forwards up to 32 packets or payloads that one source already has ready, so the
 other sources and the clock are read again at least once per 32. Closing the
 socket must also close the request stream.
@@ -595,12 +581,8 @@ is what a CONNECT proxy needs, and it is stated in full:
 - **Request validation** — RFC 9114 §4.1.2, §4.3 and §4.4 plus RFC 8441 §4: the
   point at which a field section becomes a request or is refused as malformed.
 - **The message vocabulary** — a status, a method, a request and a list of field
-  lines, in `src/h3/message.rs`. These were the `http` crate's until decision
-  D78; carrying it meant every decoded field was validated and copied a second
-  time into a `HeaderName`/`HeaderValue`, and the pseudo-headers were folded into
-  a URI that the tunnels then took apart again. A field section is now decoded
-  once, validated once, and carried in one type, and the crate is gone from the
-  dependency tree.
+  lines, in `src/h3/message.rs`. A field section is decoded once, validated
+  once, and carried in one type. D78 gives why this is not the `http` crate.
 
 What it leaves out, deliberately:
 
@@ -691,20 +673,13 @@ connection that has already ended, where the closure is the connection going
 away rather than a fault the peer committed. That is the exemption the control
 stream makes for the same race.
 
-HTTP Datagrams are hand-rolled in `src/datagram.rs`, over the varints of
-`src/varint.rs`. That started as a way around `h3-datagram` 0.0.2, which tagged
-every datagram with Quarter Stream ID 0 and so misrouted every session after the
-first on a connection. It is simply ours now: about 120 lines of varint and
-Context ID work with no dependency behind them.
-
 ## The h3api facade
 
 `src/h3api.rs` is the facade over `src/h3`: the only module allowed to name a
 type from it, so that everything else — `conn`, `quic`, the tunnels — sees
-`bytes` and `quinn` types plus the handful of names it exports. The facade began
-as insulation from a 0.0.x dependency's API churn and was kept on its own terms:
-it is the list of what a proxy actually asks of HTTP/3, and it is short enough to
-read in one sitting.
+`bytes` and `quinn` types plus the handful of names it exports. It is the list
+of what a proxy actually asks of HTTP/3, and it is short enough to read in one
+sitting.
 
 The message types — `Request`, `Status`, `Fields` — are re-exported through it
 rather than wrapped in something else. The rule the facade enforces is about
