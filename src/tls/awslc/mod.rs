@@ -5,22 +5,16 @@
 //! libssl from the same `aws-lc-sys` build that backs aws-lc-rs, which
 //! quinn-proto and [`keys`] use. libssl runs the TLS 1.3 state machine and
 //! hands over traffic secrets per encryption level through BoringSSL's QUIC
-//! method table; [`keys`] turns those into quinn's packet and header keys. This module implements
-//! quinn-proto's `crypto::ServerConfig` and `crypto::Session` over it.
+//! method table; [`keys`] turns those into quinn's packet and header keys.
+//! This module implements quinn-proto's `crypto::ServerConfig` and
+//! `crypto::Session` over it.
 //!
-//! The D106 second SNI gate is a ClientHello callback here. AWS-LC calls it
-//! after ECH has been decided, so the name it judges is the inner one when ECH
-//! is accepted and the outer one when it is not. The same callback is the
-//! second line behind the socket gate's ECH rules (D115); `judge_client_hello`
-//! says what it refuses and why.
+//! The D106 second SNI gate and the second line behind the socket gate's ECH
+//! rules (D115) are the ClientHello callback [`judge_client_hello`].
 //!
-//! This is the one module of the crate that may use `unsafe` (`crate` says
-//! why). The rule inside it: every `unsafe` block carries a `SAFETY:` comment
-//! naming what makes it sound, every `unsafe fn` a `# Safety` section, and the
-//! file that needs none (`keys.rs`) forbids it. The ClientHello parser the
-//! provider reads the outer ClientHello with is [`crate::hello`], outside this
-//! module, so it is held to the crate's `deny(unsafe_code)` as well as its own
-//! `forbid`.
+//! Every `unsafe` block here carries a `SAFETY:` comment naming what makes it
+//! sound, every `unsafe fn` a `# Safety` section, and `keys.rs`, which needs
+//! none, forbids it.
 //!
 //! # Callbacks and the state they share
 //!
@@ -78,10 +72,6 @@ use keys::{Secret, Suite, Version};
 
 /// What a finished handshake reports to `quic::peer_info`, which downcasts
 /// `Session::handshake_data` to this type.
-///
-/// The first two fields are the ones quinn's rustls provider reports in its
-/// own `HandshakeData`, under the same names. That type exists only when quinn
-/// is built with a rustls feature, and the server's quinn is not.
 #[derive(Debug)]
 pub(crate) struct HandshakeData {
     /// The negotiated ALPN identifier.
@@ -402,7 +392,7 @@ fn checked_index(index: c_int) -> Result<c_int> {
 }
 
 /// The four QUIC encryption levels, as libssl numbers them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Level {
     Initial,
     EarlyData,
@@ -629,14 +619,13 @@ unsafe extern "C" fn on_keylog(ssl: *const sys::SSL, line: *const c_char) {
     keylog.write(line.to_bytes());
 }
 
-/// ALPN: the first of the server's identifiers that the client offered, which
-/// is how rustls chose.
+/// ALPN: the first of the server's identifiers that the client offered.
 ///
 /// A client that offers none of them, or no ALPN at all, is refused with
-/// `no_application_protocol` by libssl, as rustls refused it: for QUIC,
-/// `ssl_negotiate_alpn` turns a missing extension and a "no match" answer here
-/// into that alert. RFC 9001 §8.1: "When using ALPN, endpoints MUST immediately
-/// close a connection (see Section 10.2 of [QUIC-TRANSPORT]) with a
+/// `no_application_protocol` by libssl: for QUIC, `ssl_negotiate_alpn` turns
+/// a missing extension and a "no match" answer here into that alert.
+/// RFC 9001 §8.1: "When using ALPN, endpoints MUST immediately close a
+/// connection (see Section 10.2 of [QUIC-TRANSPORT]) with a
 /// no_application_protocol TLS alert (QUIC error code 0x0178; see Section 4.8)
 /// if an application protocol is not negotiated."
 ///
@@ -698,10 +687,9 @@ unsafe extern "C" fn select_alpn(
 /// ECHConfigList, which libssl would otherwise send as `retry_configs` in
 /// EncryptedExtensions (RFC 9849 §7.1). The callback runs before the server
 /// writes any handshake message, so a refusal here sends no ServerHello and no
-/// EncryptedExtensions. When ECH was not accepted, libssl reports the outer
-/// ClientHello, so `SSL_client_hello_get0_ext` finds the outer extension; when
-/// it was, the inner one, whose extension is the inner variant, and the rule
-/// does not ask.
+/// EncryptedExtensions. `SSL_client_hello_get0_ext` reads the same
+/// ClientHello `SSL_get_servername` reports (below), so with ECH accepted it
+/// finds the inner variant, which the rule does not ask about.
 ///
 /// `SSL_get_servername` reports the inner ClientHello's name when ECH was
 /// accepted and the outer one otherwise (`ssl.h`, `SSL_CTX_set1_ech_keys`: "If
@@ -792,19 +780,19 @@ unsafe fn server_name(ssl: *const sys::SSL) -> Option<String> {
 }
 
 /// `raw` if it is a DNS name by the rustls-pki-types `DnsName` rule
-/// (`names::host_name`), the rule rustls's server applied to a `server_name`.
+/// (`names::host_name`).
 fn dns_name(raw: &str) -> Option<String> {
     crate::names::host_name(raw).map(|name| name.as_ref().to_owned())
 }
 
 /// The file `[log] keylog` writes to, opened once per configuration build.
 ///
-/// What rustls's `KeyLogFile` did: `SSLKEYLOGFILE` is read when the
-/// configuration is built, the file is opened for appending and created if
-/// missing, and an unset variable or a file that cannot be opened makes keylog
-/// a no-op rather than a startup failure. The no-op is reported at debug.
-/// Unlike rustls, a file created here is readable by its owner only, because
-/// it holds every traffic secret; an existing file keeps its mode.
+/// `SSLKEYLOGFILE` is read when the configuration is built, the file is opened
+/// for appending and created if missing, and an unset variable or a file that
+/// cannot be opened makes keylog a no-op rather than a startup failure. The
+/// no-op is reported at debug. A file created here is readable by its owner
+/// only, because it holds every traffic secret; an existing file keeps its
+/// mode.
 struct KeyLog(Mutex<File>);
 
 impl KeyLog {
@@ -913,7 +901,7 @@ struct Session {
 }
 
 /// What the outer ClientHello said, for the debug line.
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 struct OuterHello {
     server_name: Option<String>,
     ech: Option<hello::EchOuter>,
@@ -1231,13 +1219,12 @@ impl crypto::Session for Session {
         // client's Finished is verified (`do_read_client_finished`), so the
         // 1-RTT keys are handed over then, a round trip after the write secret.
         // The server therefore sends no 0.5-RTT packet: its first
-        // NEW_CONNECTION_ID frames leave after the client's Finished. The
-        // server also cannot decrypt a 1-RTT packet before the handshake
-        // completes, which RFC 9001 §5.7 forbids anyway: "Endpoints
-        // in either role MUST NOT decrypt 1-RTT packets from their peer prior
-        // to completing the handshake." quinn-proto discards a 1-RTT packet
-        // that arrives before the keys (`unprotect_header`, "discarding
-        // unexpected Data packet"), and the client sends it again.
+        // NEW_CONNECTION_ID frames leave after the client's Finished. A 1-RTT
+        // packet that arrives before the keys is discarded by quinn-proto
+        // (`unprotect_header`) and sent again by the client. RFC 9001 §5.7
+        // forbids decrypting it earlier in any case: "Endpoints in either role
+        // MUST NOT decrypt 1-RTT packets from their peer prior to completing
+        // the handshake."
         let i = next.index();
         // Taken together or not at all, so a lone secret waits for its pair.
         if shared.write[i].is_none() || shared.read[i].is_none() {
