@@ -50,31 +50,16 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
-      # `tests/it_deploy.rs` and `tests/it_installer.rs` both name shellcheck as
-      # the coverage for the half of `script/*.sh` no test on either host can
-      # run -- the download, the checksum, the rollback, the certificate, the
-      # systemd unit, everything behind `must run as root`. That claim was an
-      # assertion until this step: nothing in CI ran shellcheck, so a new
-      # unquoted expansion in the rollback path would have shipped. It lives in
-      # this job because this is the job that compiles nothing, and shellcheck
-      # is preinstalled on the ubuntu runner image, so it costs the checkout it
-      # was already paying for.
+      # shellcheck reads every line of the tracked scripts, including the lines
+      # no test runs. It sits in this job because this job compiles nothing, and
+      # shellcheck is on the runner image.
       #
-      # Default severity, which is `style`: all six scripts are clean at it
-      # today, including the info-level checks, and a finding that is wrong for
-      # a particular line is turned off in place with a
-      # `# shellcheck disable=SCxxxx` carrying its reason (there are four: two
-      # on word splitting in deploy.sh and two on a `trap` in
-      # install-selfsigned.sh).
+      # Default severity (`style`). A finding that is wrong for one line is
+      # turned off there with `# shellcheck disable=SCxxxx` and its reason.
       #
-      # Every tracked script, not `script/*.sh`, which was two of the six. The
-      # three it used to miss are tests/interop/run-local.sh, the fixture
-      # tests/interop/serve.sh and tests/replay/lossy-lab.sh; a quoting bug in
-      # serve.sh breaks the only independent judge of src/h3 and no gate would
-      # say why. Listed by `git ls-files` so a new script is covered when it
-      # arrives rather than when somebody remembers. Floor first, the way the
-      # other readers in this file judge: six scripts today, and a listing that
-      # comes back short says so instead of linting whatever it found.
+      # Every tracked script, listed by `git ls-files` so a new one is covered
+      # when it arrives. The floor fails a listing that comes back short, and
+      # tests/it_release_assets.rs holds it at the number of tracked scripts.
       - name: shellcheck
         run: |
           set -euo pipefail
@@ -174,22 +159,13 @@ jobs:
     #
     # Stable, not the nightly `cargo fuzz` itself needs: libfuzzer-sys type-checks
     # on stable, and this job only asks whether the targets still compile
-    # against today's `src`. That keeps the answer about this tree alone --
-    # release.yml now needs this workflow green, and a nightly regression is not
-    # a reason to hold a release.
+    # against today's `src`. That keeps the answer about this tree alone:
+    # release.yml needs this workflow green, and a nightly regression is not a
+    # reason to hold a release.
     #
-    # `--locked` does two things. It makes the job answer for the graph that is
-    # committed rather than for whatever cargo resolves on the morning it runs,
-    # which is the only way a green check here and a green container run weeks
-    # later are statements about the same thing. And it stops a silent resolve:
-    # without it, a rot check quietly updates the lockfile in the runner and
-    # reports on a graph nobody chose, so a dependency that broke the targets
-    # and a `src` change that broke them read identically in the log.
-    #
-    # Refreshing it is `cargo generate-lockfile --manifest-path fuzz/Cargo.toml`
-    # -- inside `fuzz/` only. These are two workspaces with two lockfiles, so
-    # touching one does not touch the other, and a refresh at the root leaves
-    # this one exactly where it was.
+    # `--locked`, so the job answers for the committed `fuzz/Cargo.lock`.
+    # Refresh it with `cargo generate-lockfile --manifest-path fuzz/Cargo.toml`:
+    # the two workspaces have separate lockfiles.
     name: fuzz targets compile
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -236,9 +212,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Fails the check on a vulnerability. Informational advisories -- an
       # unmaintained or yanked crate -- are reported in the check run without
-      # failing, so they can be seen and acted on at leisure (that is how the
-      # `rustls-pemfile` advisory was noticed and the crate dropped). Should a
-      # real vulnerability ever have to be accepted, add its RUSTSEC id to
+      # failing, so they can be seen and acted on at leisure. Should a real
+      # vulnerability ever have to be accepted, add its RUSTSEC id to
       # `ignore:` with the reason rather than deleting this job.
       #
       # Pinned to a main-branch commit rather than a release: v2.0.0 still
@@ -320,9 +295,8 @@ jobs:
         run: tests/systemd-check.sh target/debug/volto
 
   interop:
-    # Cross-implementation checks. `cargo test` has volto on both ends: since
-    # HTTP/3 moved into `src/h3`, its client (`tests/common/h3client.rs`) is
-    # built on the server's own codec, so the two agree by construction even
+    # Cross-implementation checks. `cargo test` has volto on both ends: its
+    # client (`tests/common/h3client.rs`) is built on the server's own codec, so the two agree by construction even
     # where both are wrong. Here a real volto process is driven by two clients
     # that share no code, no QUIC stack and no reading of the RFCs with it or
     # with each other: Go's quic-go/masque-go for CONNECT-UDP and ECH, and
@@ -342,8 +316,8 @@ jobs:
       # The name in the generated certificate. The client validates against it.
       VOLTO_SNI: localhost
       # Authentication is on, exactly as in a real deployment: masque-go can set
-      # `Proxy-Authorization`, so the credentialed path — the one Surge uses on
-      # every CONNECT — is what gets exercised, and the suite also asserts that
+      # `Proxy-Authorization`, so the credentialed path, the one Surge uses on
+      # every CONNECT, is what gets exercised, and the suite also asserts that
       # omitting credentials draws a 407. These are not secrets: they exist for
       # the lifetime of one job, on a loopback socket.
       VOLTO_USER: interop
@@ -406,7 +380,7 @@ jobs:
         env:
           VOLTO_CERT: ${{ github.workspace }}/interop/cert.pem
         # `-count=1` defeats Go's test result cache, which keys on the binary and
-        # the environment and knows nothing about the server on the other end —
+        # the environment and knows nothing about the server on the other end:
         # a restored cache entry would let this job pass without a single packet
         # being sent. The timeout is the backstop for a tunnel that hangs instead
         # of failing: `go test` then panics and the job fails.
@@ -437,15 +411,10 @@ jobs:
           pip install -r tests/interop/aioquic/requirements.txt
           python tests/interop/aioquic/interop_test.py
 
-      # Both suites green is not the whole claim. This job is the only
-      # independent judge of src/h3, because the in-tree test client is built on
-      # volto::h3, and until now it only printed the server log for a human who
-      # was not going to read it, under an `if: always()` step whose output
-      # nothing judges. A regression that both foreign clients tolerate while
-      # the server logs an error went green here. The filter is the one
-      # ./run-local.sh has always applied, moved into the shared fixture so both
-      # callers use the same list. Before the teardown, so a failure here still
-      # gets the log printed by the step below.
+      # The server log must be clean as well: a regression both clients
+      # tolerate can still log an error. The filter is shared with
+      # ./run-local.sh through serve.sh. Before the teardown, so a failure here
+      # still gets the log printed.
       - name: The server log is clean
         if: ${{ !cancelled() && steps.server.outcome == 'success' }}
         run: |
