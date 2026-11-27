@@ -774,15 +774,15 @@ fn restoring_the_previous_files_starts_rather_than_restarts_the_service() {
 /// Whether the shell line `line` runs `curl` as a command.
 ///
 /// `curl` counts as a command word at the start of the line, after a `$(`, a
-/// `(`, a backtick, a pipe, `&&`, `||`, `;` or `{`, after a keyword that
-/// precedes a command (`if`, `then`, `else`, `elif`, `do`, `while`, `until`,
-/// `!`, `exec`, `time`), and after a variable assignment. A `curl` in an
-/// argument list, such as the preflight's `for tool in curl tar ...`, is not
-/// a call.
+/// `(`, a backtick, a pipe, `&&`, `||`, `;`, `{` or a glued backslash, after a
+/// word that precedes a command (`if`, `then`, `else`, `elif`, `do`, `while`,
+/// `until`, `!`, `exec`, `time`, `command`), and after a variable assignment.
+/// A `curl` in an argument list, such as the preflight's `for tool in curl tar
+/// ...`, is not a call.
 fn runs_curl(line: &str) -> bool {
-    const SEPARATORS: [&str; 7] = ["$(", "(", "`", "|", "&", ";", "{"];
-    const KEYWORDS: [&str; 10] = [
-        "if", "then", "else", "elif", "do", "while", "until", "!", "exec", "time",
+    const SEPARATORS: [&str; 8] = ["$(", "(", "`", "|", "&", ";", "{", "\\"];
+    const KEYWORDS: [&str; 11] = [
+        "if", "then", "else", "elif", "do", "while", "until", "!", "exec", "time", "command",
     ];
 
     line.match_indices("curl").any(|(at, _)| {
@@ -820,6 +820,8 @@ fn runs_curl_finds_curl_in_every_command_position() {
         "if curl \"$URL\"; then",
         "X=1 curl \"$URL\"",
         "exec curl \"$URL\"",
+        "command curl \"$URL\"",
+        "\\curl \"$URL\"",
     ] {
         assert!(runs_curl(line), "a curl call was not seen: {line}");
     }
@@ -852,10 +854,17 @@ fn curl_seconds(call: &str, flag: &str) -> Option<u64> {
 ///
 /// systemd disables the start timeout for `Type=oneshot`, so the timer service
 /// carries its own `TimeoutStartSec`. When that timeout fires, systemd sends
-/// SIGTERM, and the script traps only ERR and EXIT. A SIGTERM inside the binary
-/// swap window would leave the new files in place with no health check and no
-/// rollback. So the worst case of every curl call, added up, must leave time
-/// for the rest of the run.
+/// SIGTERM. Inside the binary swap window the script then rolls the update
+/// back (`a_signal_inside_the_swap_window_rolls_the_update_back`), so the
+/// release is not installed, and the rollback has only the service's stop
+/// timeout to finish in. So the worst case of every curl call, added up, must
+/// leave time for the rest of the run.
+///
+/// The rest of the run is read from the unit and the script, so raising
+/// `TimeoutStopSec`, `TimeoutStartSec` or the health wait turns this red: a
+/// restart and a rollback restart, each a stop and a start at the unit's
+/// timeouts, the health wait between them, and a minute for the local steps
+/// (the checksum, the unpack, the config check and the copies).
 ///
 /// The worst case of one call is `--max-time` when it does not retry. With
 /// `--retry` it is `--retry-max-time`, after which curl starts no retry, plus
@@ -920,23 +929,48 @@ fn every_network_call_and_the_timer_service_are_bounded() {
                 &heredoc[..end]
             )
         });
-    let timeout: u64 = match timeout.strip_suffix("min") {
-        Some(minutes) => minutes.parse::<u64>().expect("whole minutes") * 60,
-        None => timeout
-            .trim_end_matches('s')
-            .parse()
-            .expect("TimeoutStartSec in whole minutes or seconds"),
-    };
+    let timeout = systemd_seconds(timeout);
 
-    // The rest of the run: the checksum, the config check, the swap, the
-    // restart and the three-second health wait.
-    let rest_of_the_run = 120;
+    let unit = fs::read_to_string(repo_root().join("script/masque.service"))
+        .expect("the unit must be readable");
+    let unit_seconds = |key: &str| {
+        let value = unit
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("script/masque.service sets no {key}"));
+        systemd_seconds(value)
+    };
+    let (stop, start) = (
+        unit_seconds("TimeoutStopSec"),
+        unit_seconds("TimeoutStartSec"),
+    );
+    let restart = text
+        .find("systemctl restart \"$SERVICE_NAME\"\n")
+        .expect("the update path restarts the service");
+    let health_wait: u64 = text[restart..]
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("sleep "))
+        .expect("the update path waits before its health check")
+        .parse()
+        .expect("the health wait in whole seconds");
+    let rest_of_the_run = 2 * (stop + start) + health_wait + 60;
     assert!(
         worst_case + rest_of_the_run <= timeout,
         "the curl calls can take {worst_case} s, which with {rest_of_the_run} s for \
          the rest of the run exceeds TimeoutStartSec ({timeout} s): systemd could \
          stop the run inside the binary swap window"
     );
+}
+
+/// A systemd time span in whole minutes (`15min`) or seconds (`15s`, `15`).
+fn systemd_seconds(value: &str) -> u64 {
+    match value.strip_suffix("min") {
+        Some(minutes) => minutes.parse::<u64>().expect("whole minutes") * 60,
+        None => value
+            .trim_end_matches('s')
+            .parse()
+            .unwrap_or_else(|_| panic!("{value} is not whole minutes or seconds")),
+    }
 }
 
 /// The bootstrap one-liner from the release notes: piped into `bash`, `$0` is
