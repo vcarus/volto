@@ -238,6 +238,23 @@ impl ReloadHandle {
         self.endpoint.set_server_config(Some((*live.quic).clone()));
         drop(swapping);
 
+        self.report(path, &config, ech.as_ref(), warnings);
+        Ok(config)
+    }
+
+    /// The lines a reload that has been applied writes: what is now in force,
+    /// then each startup-only key the file changed, the configuration's own
+    /// warnings, and the descriptor budget.
+    ///
+    /// Each one reports what was swapped and decides nothing, which is why
+    /// [`Self::reload`] calls this after it has let go of the swap.
+    fn report(
+        &self,
+        path: &Path,
+        config: &Config,
+        ech: Option<&Arc<tls::EchKeySet>>,
+        warnings: Vec<String>,
+    ) {
         info!(
             log_id = "aie853ib",
             path = %path.display(),
@@ -248,11 +265,11 @@ impl ReloadHandle {
             // the key file's check accepted, an LDH host name, so `Display`
             // is safe.
             ech = ech.is_some(),
-            ech_config_id = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.current().config_id())),
+            ech_config_id = %crate::logfmt::or_dash(ech.map(|e| e.current().config_id())),
             ech_previous_config_id = %crate::logfmt::or_dash(
-                ech.as_ref().and_then(|e| e.previous()).map(|e| e.config_id())
+                ech.and_then(|e| e.previous()).map(|e| e.config_id())
             ),
-            ech_public_name = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.current().public_name())),
+            ech_public_name = %crate::logfmt::or_dash(ech.map(|e| e.current().public_name())),
             // Whether the gate drops every handshake without ECH (D115).
             require_ech = config.security.require_ech,
             "configuration reloaded; new connections will use it"
@@ -331,7 +348,5 @@ impl ReloadHandle {
         // `Server::bind` runs belongs here too. An operator raising a quota
         // during an incident is the case D19 wrote it for.
         warn_if_fd_budget_is_tight(&config.limits);
-
-        Ok(config)
     }
 }
