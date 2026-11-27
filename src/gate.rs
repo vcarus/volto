@@ -86,11 +86,8 @@
 //! whole GRO run of datagrams described by one stride, and cutting one out of
 //! the middle would mean rewriting the run. Instead the refused datagram is left
 //! in place with its Destination Connection ID *length* byte overwritten by a
-//! value no connection ID may have (RFC 9000 §17.2 caps it at 20 bytes), which
-//! is a header quinn's own decoder rejects before it acts on the version, the
-//! type or anything else. The decoder reads the four version bytes first and
-//! the connection IDs next, so the rejection needs only the first six bytes to
-//! be there. It rejects it by returning, not by answering.
+//! value no connection ID may have (RFC 9000 §17.2 caps it at 20 bytes),
+//! which quinn's decoder rejects without a reply (`blind` says why).
 //!
 //! The obvious alternative, clearing the fixed bit, does not work here: quinn
 //! accepts either value for it unless `EndpointConfig::grease_quic_bit` is
@@ -321,7 +318,8 @@ impl Policy {
 
     /// The names a ClientHello without ECH has to carry, or an empty list for
     /// any name.
-    pub fn names(&self) -> &Names {
+    #[cfg(test)]
+    pub(crate) fn names(&self) -> &Names {
         &self.names
     }
 }
@@ -410,8 +408,7 @@ impl Expected {
     /// flights open again then, so its entries are kept as well. While the key
     /// is not accepted they match nothing, because a flight under it does not
     /// open and never reaches the record. They leave as every entry does,
-    /// oldest first at the bound. One record for all the keys rather than one
-    /// per key, so its bound stays `REPLAY_ENTRIES` in all.
+    /// oldest first at the bound.
     ///
     /// A policy without a key empties the hold, because nothing would judge
     /// what it holds; the clients of those flights send them again and the
@@ -465,17 +462,17 @@ impl Expected {
     }
 
     /// Whether [`Expected::close`] was called.
-    pub fn closed(&self) -> bool {
+    fn closed(&self) -> bool {
         self.0.closed.load(Ordering::Acquire)
     }
 
     /// Whether the policy in force judges anything, without taking the lock.
-    pub fn any(&self) -> bool {
+    fn any(&self) -> bool {
         self.0.any.load(Ordering::Acquire)
     }
 
     /// The policy in force.
-    pub fn current(&self) -> Arc<Policy> {
+    pub(crate) fn current(&self) -> Arc<Policy> {
         Arc::clone(&self.memory().policy)
     }
 
@@ -591,10 +588,8 @@ impl Gate {
 
 /// Logs one refused datagram.
 ///
-/// DEBUG rather than a production level: this fires once per refused datagram,
-/// which is once per packet of a scan, and D97's rule is that a line a peer can
-/// repeat at will is either sampled or expensive. The per-packet debug lines
-/// elsewhere in this server are deliberately neither, and this is one of them.
+/// DEBUG: it fires once per refused datagram, which a peer repeats at will
+/// (D97).
 fn log_refusal(remote: SocketAddr, refusal: &Refusal) {
     match refusal {
         Refusal::Version(version) => debug!(
@@ -806,25 +801,17 @@ fn classify(datagram: &[u8], coalesced: bool) -> Classified {
         return Classified::Pass;
     };
 
-    // Judged on the header alone, ahead of the decryption, because quinn
-    // judges it ahead of its own decryption. `Endpoint::early_validate_first_packet`
-    // runs before `first_decode.finish` and answers a Destination
-    // Connection ID under eight bytes with a CONNECTION_CLOSE carrying
-    // PROTOCOL_VIOLATION, without opening the packet. Its one exemption is
-    // a packet carrying a token whose Destination Connection ID is exactly
-    // the length this endpoint's own generator uses, which is eight, so
-    // nothing under eight bytes is exempt. RFC 9000 §7.2 gives a client's
-    // first Initial a floor of eight bytes, quoted at
-    // `MIN_CLIENT_CONNECTION_ID`, and every later Initial of an admitted
-    // handshake is addressed by the eight bytes this endpoint's own
-    // generator chose, as is the one a Retry supplies. So nothing
-    // legitimate is ever this shape, and the reply quinn would send is one
-    // of the three this gate exists to take away.
-    //
-    // Placed after the decryption, this check would let the shape that costs an
-    // attacker no cryptography at all (a 1200-byte Initial with a four-byte
-    // connection ID and a payload nobody sealed) pass through to that
-    // reply, because a packet that fails decryption is passed.
+    // Judged ahead of the decryption, as quinn judges it:
+    // `Endpoint::early_validate_first_packet` answers a Destination
+    // Connection ID under eight bytes with a CONNECTION_CLOSE before it
+    // opens the packet, and its one exemption needs the length of this
+    // endpoint's own IDs, which is eight. Nothing legitimate is this shape:
+    // a client's first Initial has at least eight bytes (RFC 9000 §7.2,
+    // quoted at `MIN_CLIENT_CONNECTION_ID`), and every later one, a Retry's
+    // included, carries the eight this endpoint chose. After the decryption,
+    // the shape that costs no cryptography (a 1200-byte Initial with a short
+    // ID and a payload nobody sealed) would pass, because a packet that fails
+    // decryption is passed.
     if header.dcid.len() < MIN_CLIENT_CONNECTION_ID {
         return Classified::Refuse(Refusal::ShortConnectionId(header.dcid.len()));
     }
