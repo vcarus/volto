@@ -20,7 +20,7 @@ use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
 use volto::config::{Config, FilterRefusal};
-use volto::quic::Server;
+use volto::quic::{Server, Stopped};
 use volto::shutdown::Trigger;
 
 // mimalloc on the musl targets, `System` elsewhere. `volto::alloc` says why.
@@ -199,9 +199,11 @@ fn start() -> Result<()> {
         .context("failed to build the async runtime")?;
 
     // Only the fallback. `run` returns the grace that was in force when the
-    // server stopped, which a `SIGHUP` may have raised since startup, and it
-    // fails only before the server exists, where the file this process started
-    // on is the right answer.
+    // server stopped, which a `SIGHUP` may have raised since startup. It fails
+    // before the server exists, where the file this process started on is the
+    // right answer, or when the endpoint was lost. No drain ran then, so the
+    // connections were given no grace at all, and the startup value is at least
+    // what the blocking pool is owed.
     let startup_grace = config.server.shutdown_grace();
 
     let served = runtime.block_on(run(path, config));
@@ -526,7 +528,8 @@ fn uname() -> String {
 /// Returns `server.shutdown_grace` as it stood when the server stopped, which is
 /// what bounds the blocking pool once the runtime's own work is over. A reload
 /// can move that key, and `Server::drain` reads the same live value, which is
-/// the invariant [`volto::shutdown::blocking_grace`] states.
+/// the invariant [`volto::shutdown::blocking_grace`] states. Returns an error
+/// when the endpoint stopped without a shutdown; see [`served`].
 async fn run(path: PathBuf, config: Config) -> Result<Duration> {
     // First, and synchronously: a signal stream records a signal from the
     // moment it is created, and until then `SIGHUP` and `SIGTERM` keep their
@@ -569,14 +572,37 @@ async fn run(path: PathBuf, config: Config) -> Result<Duration> {
     #[cfg(not(unix))]
     tokio::spawn(watch_for_signals(server.shutdown_trigger()));
 
-    server.run().await;
+    let stopped = server.run().await;
 
     // After the drain, so a reload that arrived during the process's life is in
     // it.
     let grace = server.shutdown_grace();
 
-    info!(log_id = "fle471bm", "volto stopped");
-    Ok(grace)
+    served(stopped, grace)
+}
+
+/// What [`run`] returns for the way the accept loop ended, with `grace` the
+/// grace in force at that moment.
+///
+/// A shutdown is the clean stop. A lost endpoint is an error, which [`main`]
+/// turns into the non-zero exit status a failed start already has, so that
+/// `Restart=on-failure` starts the service again. With status 0 systemd would
+/// count it as a clean exit and leave the service down (D124).
+fn served(stopped: Stopped, grace: Duration) -> Result<Duration> {
+    match stopped {
+        Stopped::Shutdown => {
+            info!(log_id = "fle471bm", "volto stopped");
+            Ok(grace)
+        }
+        Stopped::EndpointLost => {
+            error!(
+                log_id = "9lq1eh39",
+                "the QUIC endpoint stopped without a shutdown; exiting with an error \
+                 so that the service manager starts volto again"
+            );
+            bail!("the QUIC endpoint stopped without a shutdown, so no connection can be served")
+        }
+    }
 }
 
 /// The variable that makes a debug build wait after its startup warnings.
@@ -1081,6 +1107,30 @@ mod tests {
         assert_eq!(name, Some("SIGTERM"));
 
         assert_eq!(first_termination(None, None).await, None);
+    }
+
+    /// A lost endpoint is an error and a shutdown is not.
+    ///
+    /// The error is what takes the process to a non-zero exit: `start` returns
+    /// it, and `main` maps every error `start` returns to
+    /// `ExitCode::FAILURE`, the path `tests/it_cli.rs` already holds to exit
+    /// status 1 for a failed start. Before D124 the accept loop's end was not
+    /// told apart, `run` returned the grace for both, and the process exited
+    /// with status 0.
+    #[test]
+    fn a_lost_endpoint_is_an_error_and_a_shutdown_is_not() {
+        let grace = Duration::from_secs(7);
+        assert_eq!(
+            served(Stopped::Shutdown, grace).expect("a shutdown is a clean stop"),
+            grace,
+            "a shutdown hands on the grace in force"
+        );
+        let error = served(Stopped::EndpointLost, grace)
+            .expect_err("a lost endpoint must end the process with an error");
+        assert!(
+            format!("{error:#}").contains("without a shutdown"),
+            "the error says what happened: {error:#}"
+        );
     }
 
     /// systemd sets the variable to `device:inode`; nothing else sets it.

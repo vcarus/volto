@@ -501,6 +501,12 @@ new privileges.
 `Type=exec` makes `systemctl start` and `restart` fail at once when the binary
 cannot be executed.
 
+The QUIC endpoint can stop while no shutdown was asked for: quinn ends it when
+the socket's receive call fails with an error other than a connection reset.
+Nothing can be served after that, so the server logs `log_id=9lq1eh39` at
+`err` and exits with status 1, and `Restart=on-failure` starts it again after
+`RestartSec=`.
+
 `RUST_LOG` overrides the configured log level without editing the config:
 
 ```ini

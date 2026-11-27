@@ -41,7 +41,7 @@ use volto::config::Config;
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
 use volto::quic::ReloadHandle;
-use volto::quic::Server;
+use volto::quic::{Server, Stopped};
 use volto::shutdown::Trigger;
 
 /// Upper bound for anything that should complete promptly on loopback.
@@ -155,7 +155,7 @@ pub struct TestServer {
     unserved: Option<Server>,
     /// `None` until the accept loop is started, and again once it has been
     /// awaited by `wait_until_stopped`.
-    task: Option<JoinHandle<()>>,
+    task: Option<JoinHandle<Stopped>>,
 }
 
 impl TestServer {
@@ -341,13 +341,15 @@ impl TestServer {
     /// Waits for the accept loop to return, i.e. for shutdown to complete.
     ///
     /// Panics if it takes longer than `within`, which is how the grace period is
-    /// asserted to be an upper bound rather than a suggestion.
+    /// asserted to be an upper bound rather than a suggestion. The loop has to
+    /// end as a shutdown: an endpoint lost on the way is a failure (D124).
     pub async fn wait_until_stopped(&mut self, within: Duration) {
         let task = self.task.take().expect("the server is only awaited once");
-        tokio::time::timeout(within, task)
+        let stopped = tokio::time::timeout(within, task)
             .await
             .expect("the server stopped within the timeout")
             .expect("the server task did not panic");
+        assert_eq!(stopped, Stopped::Shutdown, "the accept loop's ending");
     }
 }
 
