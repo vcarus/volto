@@ -337,9 +337,6 @@ func TestConcurrentSessionsDoNotCrossTalk(t *testing.T) {
 
 // A refusal has to be a well-formed HTTP response, not a dropped stream: a
 // third-party client must be able to tell "denied" from "broken".
-//
-// The port is the one volto's default policy refuses, so this also proves the
-// policy runs before anything is opened towards the target.
 func TestDeniedTargetIsRefusedWithProxyStatus(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
