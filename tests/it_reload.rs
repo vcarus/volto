@@ -1060,6 +1060,7 @@ async fn reloads_during_a_session_timeout_still_close_the_request_stream() {
     // From here nothing crosses the proxy, so the session's one-second clock is
     // running. Flip the very key it is counting down on, throughout.
     let storm = async {
+        let started = std::time::Instant::now();
         for round in 0..STORM_ROUNDS {
             let timeout = if round % 2 == 0 { 30 } else { 1 };
             server.rewrite_config(&format!(
@@ -1071,10 +1072,19 @@ async fn reloads_during_a_session_timeout_still_close_the_request_stream() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        // The storm ends -- well inside the one second this session has left --
-        // on a value that would keep it alive for another half minute if the
-        // timeout were read live rather than snapshotted when the connection was
-        // accepted. That is what makes the assertion below say something.
+        // The storm ends, well inside the one second this session has left, on
+        // a value that would keep it alive for another half minute if the
+        // timeout were read live rather than snapshotted when the connection
+        // was accepted. That is what makes the assertion below say something,
+        // so a storm too slow to end inside the second fails here instead. It
+        // takes about 0.3 s on the dev host, 0.24 s of it the sleeps; 0.8 s
+        // leaves the round trip before it room inside the second.
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(800),
+            "the storm took {took:?}, so the session may have been reclaimed before \
+             its last reload and the check below would test nothing"
+        );
         server.rewrite_config(&format!(
             "[limits]\nudp_session_timeout = 30\n{ALLOW_PRIVATE}"
         ));
