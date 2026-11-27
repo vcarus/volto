@@ -1409,20 +1409,50 @@ fn a_leaf_webpki_cannot_parse_is_refused_at_build() {
     );
 }
 
-/// A key that is not the certificate's is refused at build, in the wording the
-/// rustls server used.
+/// A key that is not the certificate's is refused at build, in the operator's
+/// wording. A key of the leaf's type is refused by `SSL_CTX_use_PrivateKey`;
+/// a key of another type goes to another certificate slot and is refused by
+/// `SSL_CTX_check_private_key`, so that call is not redundant.
 #[test]
 fn a_key_that_does_not_match_the_certificate_is_refused_by_that_name() {
     let id = identity();
-    let stray = identity();
-    let error = Builder::new(vec![id.cert], Zeroizing::new(stray.key), None)
-        .build()
-        .expect_err("a mismatched pair");
-    assert!(
-        format!("{error:#}")
-            .contains("server.cert and server.key do not form a usable certificate/key pair"),
-        "{error:#}"
-    );
+    let ed25519 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("Ed25519");
+    let rsa = rcgen::KeyPair::generate_rsa_for(&rcgen::PKCS_RSA_SHA256, rcgen::RsaKeySize::_2048)
+        .expect("RSA");
+    for (what, key, (call, reason)) in [
+        (
+            "another P-256 key",
+            identity().key,
+            ("SSL_CTX_use_PrivateKey failed", "KEY_VALUES_MISMATCH"),
+        ),
+        (
+            "an Ed25519 key",
+            ed25519.serialize_der(),
+            (
+                "SSL_CTX_check_private_key failed",
+                "NO_CERTIFICATE_ASSIGNED",
+            ),
+        ),
+        (
+            "an RSA key",
+            rsa.serialize_der(),
+            (
+                "SSL_CTX_check_private_key failed",
+                "NO_CERTIFICATE_ASSIGNED",
+            ),
+        ),
+    ] {
+        let error = Builder::new(vec![id.cert.clone()], Zeroizing::new(key), None)
+            .build()
+            .expect_err(what);
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with(super::UNUSABLE_PAIR)
+                && message.contains(call)
+                && message.contains(reason),
+            "{what}: {message}"
+        );
+    }
 }
 
 /// `Builder::new`'s defaults, which `server_config` and `probe_server_config`

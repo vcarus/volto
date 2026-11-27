@@ -313,7 +313,11 @@ impl<'a> Builder<'a> {
                 )?;
             }
             let key = ffi::private_key_from_der(&self.key).context(UNUSABLE_PAIR)?;
-            // Fails with KEY_VALUES_MISMATCH when the key is not the leaf's.
+            // Refuses a key of the leaf's type that is not the leaf's key
+            // (KEY_VALUES_MISMATCH). A key of another type goes to the
+            // certificate slot of its own type, which holds no certificate, so
+            // it passes here, and `SSL_CTX_check_private_key` below refuses it
+            // (NO_CERTIFICATE_ASSIGNED).
             ffi::check(
                 sys::SSL_CTX_use_PrivateKey(ctx.as_ptr(), key.as_ptr()),
                 "SSL_CTX_use_PrivateKey",
