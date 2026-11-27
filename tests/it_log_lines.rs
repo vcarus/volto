@@ -578,8 +578,14 @@ fn log_id(invocation: &str) -> Option<String> {
         }
         let rest = &invocation[at..];
         if rest.starts_with(FIELD)
-            && !invocation[..at].chars().next_back().is_some_and(is_identifier)
-            && !rest[FIELD.len()..].chars().next().is_some_and(is_identifier)
+            && !invocation[..at]
+                .chars()
+                .next_back()
+                .is_some_and(is_identifier)
+            && !rest[FIELD.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_identifier)
         {
             let value = rest[FIELD.len()..].trim_start().strip_prefix('=')?;
             let value = value.trim_start().strip_prefix('"')?;
@@ -846,7 +852,10 @@ fn read_file(file: &str, code: &str) -> FileScan {
         }
         let rest = &code[offset..];
 
-        if let Some(name) = PRODUCTION_MACROS.iter().find(|name| rest.starts_with(**name)) {
+        if let Some(name) = PRODUCTION_MACROS
+            .iter()
+            .find(|name| rest.starts_with(**name))
+        {
             let mut open = index + name.chars().count();
             while chars.get(open).is_some_and(|(_, ch)| ch.is_whitespace()) {
                 open += 1;
@@ -880,10 +889,9 @@ fn read_file(file: &str, code: &str) -> FileScan {
         }
 
         if let Some(reason) = unreadable(rest) {
-            scanned.refused.push(format!(
-                "src/{file}:{}: {reason}",
-                line_at(code, offset)
-            ));
+            scanned
+                .refused
+                .push(format!("src/{file}:{}: {reason}", line_at(code, offset)));
         }
         index += 1;
     }
@@ -918,7 +926,10 @@ fn unreadable(rest: &str) -> Option<&'static str> {
                 .any(|(at, _)| !body[..at].chars().next_back().is_some_and(is_identifier))
         });
         let calls_a_parameter = body.match_indices('$').any(|(at, _)| {
-            let name: String = body[at + 1..].chars().take_while(|ch| is_identifier(*ch)).collect();
+            let name: String = body[at + 1..]
+                .chars()
+                .take_while(|ch| is_identifier(*ch))
+                .collect();
             !name.is_empty() && body[at + 1 + name.len()..].starts_with('!')
         });
         if calls_a_level || calls_a_parameter {
@@ -933,7 +944,9 @@ fn unreadable(rest: &str) -> Option<&'static str> {
         let attribute = words(&after[..balanced_len(rest) - 2]);
         let writes_an_event = attribute.iter().any(|word| word == "err" || word == "ret");
         if attribute.iter().any(|word| word == "instrument") && writes_an_event {
-            return Some("an `#[instrument]` with `err` or `ret`, which writes an event of its own");
+            return Some(
+                "an `#[instrument]` with `err` or `ret`, which writes an event of its own",
+            );
         }
     }
 
@@ -1239,8 +1252,7 @@ fn a_sampled_entry_lives_beside_a_sampler() {
             records,
             "src/{}: {:?} is marked as sampled, but nothing in that file records \
              into a `logfmt::Sampler` (one of {samplers:?})",
-            entry.file,
-            entry.message
+            entry.file, entry.message
         );
     }
 }
@@ -1259,7 +1271,9 @@ fn sampler_names() -> BTreeSet<String> {
                 .trim_end_matches("crate::logfmt::")
                 .trim_end_matches("logfmt::")
                 .trim_end();
-            let Some(before) = before.strip_suffix(':').or_else(|| before.strip_suffix('='))
+            let Some(before) = before
+                .strip_suffix(':')
+                .or_else(|| before.strip_suffix('='))
             else {
                 continue;
             };

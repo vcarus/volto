@@ -30,9 +30,9 @@ mod common;
 use std::sync::Arc;
 
 use common::{
-    ALLOW_PRIVATE, H3Client, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer, auth_section, authorize,
-    authorized_connect, basic_credentials, close_and_drain, closed_udp_address, connect_request,
-    connect_udp_request, field_text, numeric_field, open_tcp_tunnel, respond_to,
+    ALLOW_PRIVATE, H3Client, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer, auth_section,
+    authorize, authorized_connect, basic_credentials, close_and_drain, closed_udp_address,
+    connect_request, connect_udp_request, field_text, numeric_field, open_tcp_tunnel, respond_to,
     spawn_echo_target,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -127,7 +127,10 @@ async fn a_policy_refusal_storm_is_sampled(buffer: &SharedBuffer) {
     // The line names the target by its own fields, not only through the
     // resolved `addresses` list.
     assert_eq!(
-        (field_text(&reports[0], "host"), numeric_field(&reports[0], "port")),
+        (
+            field_text(&reports[0], "host"),
+            numeric_field(&reports[0], "port")
+        ),
         ("\"127.0.0.1\"", 443),
         "the line must name the authority it is about: {}",
         reports[0]
@@ -343,7 +346,10 @@ async fn a_handshake_close_reason_never_forges_a_line(buffer: &SharedBuffer) {
     let contents = buffer.since(mark);
     for written in contents.lines() {
         assert!(
-            written.as_bytes().get(..4).is_some_and(|year| year.iter().all(u8::is_ascii_digit))
+            written
+                .as_bytes()
+                .get(..4)
+                .is_some_and(|year| year.iter().all(u8::is_ascii_digit))
                 && written.as_bytes().get(10) == Some(&b'T'),
             "a peer forged a journal entry through a handshake close reason: \
              {written:?} in\n{contents}"
