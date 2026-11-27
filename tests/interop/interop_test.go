@@ -174,6 +174,13 @@ func startEchoTarget(t *testing.T, tag byte) string {
 	if err != nil {
 		t.Fatalf("binding a UDP echo target: %v", err)
 	}
+	return serveEcho(t, socket, tag)
+}
+
+// serveEcho echoes each packet socket receives back with tag prepended, until
+// the test ends, and returns the socket's address.
+func serveEcho(t *testing.T, socket net.PacketConn, tag byte) string {
+	t.Helper()
 	t.Cleanup(func() { _ = socket.Close() })
 
 	go func() {
@@ -390,6 +397,36 @@ func TestSessionsPastQuarterStreamID64DoNotCrossTalk(t *testing.T) {
 					i, round, buf[:n], want)
 			}
 		}
+	}
+}
+
+// An IPv6 target goes through the template as masque-go's URI template library
+// expands it, percent-encoding each colon of the address (RFC 9298 §3), and
+// the server has to decode it back to ::1. The test skips where the host has no
+// IPv6 loopback.
+func TestIPv6TargetIsDecodedFromTheTemplate(t *testing.T) {
+	socket, err := net.ListenPacket("udp", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback on this host: %v", err)
+	}
+	target := serveEcho(t, socket, 0xA6)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	client := dialProxy(t, ctx)
+	session, rsp, err := client.Dial(newRequest(t, ctx, proxyTemplate(t), target))
+	if err != nil {
+		t.Fatalf("CONNECT-UDP to %s: %v", target, err)
+	}
+	defer session.Close()
+	if rsp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rsp.StatusCode)
+	}
+
+	payload := []byte("volto-interop-ipv6")
+	if reply, want := exchange(t, session, payload), append([]byte{0xA6}, payload...); string(reply) != string(want) {
+		t.Fatalf("reply = %q, want %q", reply, want)
 	}
 }
 

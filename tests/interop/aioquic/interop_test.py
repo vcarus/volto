@@ -30,11 +30,12 @@ import sys
 from aioquic.asyncio.client import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.buffer import Buffer, encode_uint_var
-from aioquic.h3.connection import H3_ALPN, ErrorCode, H3Connection
+from aioquic.h3.connection import H3_ALPN, ErrorCode, H3Connection, Setting
 from aioquic.h3.events import (
     DataReceived,
     DatagramReceived,
     HeadersReceived,
+    ResetReceived,
     StopReceived,
 )
 from aioquic.quic.configuration import QuicConfiguration
@@ -66,6 +67,37 @@ def basic_credentials():
         return None
     plain = f"{user}:{os.environ.get('VOLTO_PASSWORD', '')}".encode()
     return b"Basic " + base64.b64encode(plain)
+
+
+def tcp_request(authority):
+    """The fields of a plain CONNECT request (RFC 9114 §4.4) to authority."""
+    headers = [(b":method", b"CONNECT"), (b":authority", authority.encode())]
+    credentials = basic_credentials()
+    if credentials:
+        headers.append((b"proxy-authorization", credentials))
+    return headers
+
+
+def udp_request(host, port, credential_header=b"proxy-authorization"):
+    """The fields of a CONNECT-UDP request (RFC 9298) for host and port.
+
+    host goes into the well-known template as given, so a caller may
+    percent-encode it. The credentials go in credential_header, or nowhere
+    when it is None.
+    """
+    authority = f"{env_sni()}:{env_addr()[1]}"
+    path = f"/.well-known/masque/udp/{host}/{port}/"
+    headers = [
+        (b":method", b"CONNECT"),
+        (b":protocol", b"connect-udp"),
+        (b":scheme", b"https"),
+        (b":authority", authority.encode()),
+        (b":path", path.encode()),
+    ]
+    credentials = basic_credentials()
+    if credential_header and credentials:
+        headers.append((credential_header, credentials))
+    return headers
 
 
 class Refused(Exception):
@@ -103,16 +135,54 @@ class ProxyClient(QuicConnectionProtocol):
             self._queue(stream_id).get(), timeout=EXCHANGE_TIMEOUT
         )
 
+    async def settings(self):
+        """Waits for the server's SETTINGS; returns them as a dict."""
+        for _ in range(int(EXCHANGE_TIMEOUT / 0.01)):
+            if self._h3.received_settings is not None:
+                return self._h3.received_settings
+            await asyncio.sleep(0.01)
+        raise AssertionError("no SETTINGS from the server")
+
+    def send_request(self, headers):
+        """Sends request headers on the next request stream; returns its id."""
+        stream_id = self._quic.get_next_available_stream_id()
+        self._h3.send_headers(stream_id, headers, end_stream=False)
+        self.transmit()
+        return stream_id
+
+    async def response(self, stream_id):
+        """Waits for the response on a request stream.
+
+        Returns (fields, stopped, ended): the response fields, the code of a
+        STOP_SENDING that aioquic reported before them or None, and whether
+        the response ended the stream.
+        """
+        event = await self._next_event(stream_id)
+        stopped = None
+        if isinstance(event, StopReceived):
+            stopped = event.error_code
+            event = await self._next_event(stream_id)
+        assert isinstance(event, HeadersReceived), f"expected headers, got {event}"
+        return dict(event.headers), stopped, event.stream_ended
+
+    async def reset_code(self, stream_id):
+        """Waits for the server to reset a request stream; returns the code.
+
+        A STOP_SENDING may come first. A response or data instead fails.
+        """
+        while True:
+            event = await self._next_event(stream_id)
+            if isinstance(event, ResetReceived):
+                return event.error_code
+            assert isinstance(event, StopReceived), f"expected a reset, got {event}"
+
     async def _request(self, headers):
         """Sends a CONNECT-shaped request and waits for the response fields.
 
         Returns the stream id on a 200; raises Refused otherwise.
         """
-        stream_id = self._quic.get_next_available_stream_id()
-        self._h3.send_headers(stream_id, headers, end_stream=False)
-        self.transmit()
-
-        event = await self._next_event(stream_id)
+        stream_id = self.send_request(headers)
+        fields, stopped, _ = await self.response(stream_id)
         # RFC 9114 §4.1: "When the server does not need to receive the
         # remainder of the request, it MAY abort reading the request stream,
         # send a complete response, and cleanly close the sending part of the
@@ -120,11 +190,7 @@ class ProxyClient(QuicConnectionProtocol):
         # that the client stop sending on the request stream." volto does
         # this with a refusal, and aioquic can report the STOP_SENDING before
         # the response it belongs to.
-        if isinstance(event, StopReceived):
-            assert event.error_code == ErrorCode.H3_NO_ERROR, event
-            event = await self._next_event(stream_id)
-        assert isinstance(event, HeadersReceived), f"expected headers, got {event}"
-        fields = dict(event.headers)
+        assert stopped in (None, ErrorCode.H3_NO_ERROR), stopped
         status = int(fields[b":status"])
         if status != 200:
             raise Refused(status, fields)
@@ -132,28 +198,15 @@ class ProxyClient(QuicConnectionProtocol):
 
     async def connect_tcp(self, authority):
         """Opens a plain CONNECT tunnel (RFC 9114 §4.4) to authority."""
-        headers = [(b":method", b"CONNECT"), (b":authority", authority.encode())]
-        credentials = basic_credentials()
-        if credentials:
-            headers.append((b"proxy-authorization", credentials))
-        stream_id, _ = await self._request(headers)
+        stream_id, _ = await self._request(tcp_request(authority))
         return stream_id
 
-    async def connect_udp(self, host, port, with_credentials=True):
-        """Opens a CONNECT-UDP session (RFC 9298) via the well-known template."""
-        authority = f"{env_sni()}:{env_addr()[1]}"
-        path = f"/.well-known/masque/udp/{host}/{port}/"
-        headers = [
-            (b":method", b"CONNECT"),
-            (b":protocol", b"connect-udp"),
-            (b":scheme", b"https"),
-            (b":authority", authority.encode()),
-            (b":path", path.encode()),
-        ]
-        credentials = basic_credentials()
-        if with_credentials and credentials:
-            headers.append((b"proxy-authorization", credentials))
-        stream_id, fields = await self._request(headers)
+    async def connect_udp(self, host, port, credential_header=b"proxy-authorization"):
+        """Opens a CONNECT-UDP session (RFC 9298) via the well-known template.
+
+        The credentials go in credential_header, or nowhere when it is None.
+        """
+        stream_id, fields = await self._request(udp_request(host, port, credential_header))
 
         # RFC 9297 §3.2 and §3.4: the response advertises the capsule protocol
         # and must not frame a body length.
@@ -505,11 +558,7 @@ async def test_datagram_before_its_request_is_delivered():
         async with proxy_connection() as client:
             # RFC 9297 §2.1.1: no DATAGRAM frame before the server's SETTINGS
             # have arrived with SETTINGS_H3_DATAGRAM = 1.
-            for _ in range(int(EXCHANGE_TIMEOUT / 0.01)):
-                if client._h3.received_settings is not None:
-                    break
-                await asyncio.sleep(0.01)
-            assert client._h3.received_settings is not None, "no SETTINGS from the server"
+            await client.settings()
 
             # The stream the next request will open, named before it exists.
             stream_id = client._quic.get_next_available_stream_id()
@@ -545,7 +594,7 @@ async def test_missing_credentials_are_challenged():
     try:
         async with proxy_connection() as client:
             try:
-                await client.connect_udp(host, port, with_credentials=False)
+                await client.connect_udp(host, port, credential_header=None)
             except Refused as refusal:
                 assert refusal.status == 407, f"status {refusal.status}, want 407"
                 challenge = refusal.headers.get(b"proxy-authenticate")
@@ -570,10 +619,207 @@ async def test_denied_target_is_refused_with_proxy_status():
             raise AssertionError(f"CONNECT-UDP to port {DENIED_PORT} succeeded")
 
 
+async def udp_round_trip(client, stream_id, tag, payload):
+    """Sends payload on a session and asserts its tagged echo comes back."""
+    client.send_udp(stream_id, payload)
+    reply = await client.recv_udp(stream_id)
+    want = bytes([tag]) + payload
+    assert reply == want, f"{reply!r} != {want!r}"
+
+
+async def test_datagram_capsule_without_a_context_id_is_a_malformed_message():
+    """A DATAGRAM capsule on the request stream carries a payload, and one
+    whose value ends before its Context ID resets the stream with
+    H3_MESSAGE_ERROR: RFC 9297 §3.3 treats such a capsule "as it if were a
+    malformed or incomplete message", which RFC 9114 §4.1.2 answers with that
+    code."""
+    transport, host, port = await start_tagged_udp_echo(0xC7)
+    try:
+        async with proxy_connection() as client:
+            stream_id = await client.connect_udp(host, port)
+
+            # RFC 9297 §3.5: type 0x00, length, then Context ID 0 and the
+            # payload. The reply comes back as a QUIC datagram.
+            value = encode_uint_var(0) + b"in-a-capsule"
+            client.send_stream(stream_id, encode_uint_var(0) + encode_uint_var(len(value)) + value)
+            reply = await client.recv_udp(stream_id)
+            assert reply == bytes([0xC7]) + b"in-a-capsule", reply
+
+            # Type 0x00 with a length of 0: no room for the Context ID.
+            client.send_stream(stream_id, encode_uint_var(0) + encode_uint_var(0))
+            code = await client.reset_code(stream_id)
+            assert code == ErrorCode.H3_MESSAGE_ERROR, f"reset with {code:#x}"
+    finally:
+        transport.close()
+
+
+async def test_a_percent_sign_without_two_hex_digits_is_refused_on_its_stream():
+    """RFC 3986 §2.1 writes a percent-encoded octet as "%" HEXDIG HEXDIG. A
+    request whose path holds a "%" without two hex digits after it is
+    malformed, and its stream is reset with H3_MESSAGE_ERROR (RFC 9114
+    §4.1.2). The connection carries on: a session whose host is a complete
+    escape, 127.0.0.%31, is decoded to 127.0.0.1 and works."""
+    transport, host, port = await start_tagged_udp_echo(0xC8)
+    try:
+        async with proxy_connection() as client:
+            stream_id = client.send_request(udp_request("a%zz", port))
+            code = await client.reset_code(stream_id)
+            assert code == ErrorCode.H3_MESSAGE_ERROR, f"reset with {code:#x}"
+
+            assert host == "127.0.0.1", host
+            stream_id = await client.connect_udp("127.0.0.%31", port)
+            await udp_round_trip(client, stream_id, 0xC8, b"after-the-refusal")
+    finally:
+        transport.close()
+
+
+async def test_a_blackholed_target_is_accepted_then_closed():
+    """D49: a target whose every address is the unspecified one draws a 200
+    and the end of the stream, with no data, as a target that accepts and
+    hangs up at once would. This is the answer Surge sees for a name its DNS
+    blackholed."""
+    async with proxy_connection() as client:
+        stream_id = client.send_request(tcp_request("0.0.0.0:9"))
+        fields, stopped, ended = await client.response(stream_id)
+        assert fields[b":status"] == b"200", fields
+        assert b"proxy-status" not in fields, fields
+        assert stopped in (None, ErrorCode.H3_NO_ERROR), stopped
+        while not ended:
+            event = await client._next_event(stream_id)
+            if isinstance(event, StopReceived):
+                assert event.error_code == ErrorCode.H3_NO_ERROR, event
+                continue
+            assert isinstance(event, DataReceived) and not event.data, (
+                f"expected the end of the stream and nothing else, got {event}"
+            )
+            ended = event.stream_ended
+
+
+async def test_denied_tcp_target_is_refused_with_proxy_status():
+    """The CONNECT (TCP) mirror of the CONNECT-UDP refusal: 403 with the
+    same Proxy-Status."""
+    async with proxy_connection() as client:
+        try:
+            await client.connect_tcp(f"127.0.0.1:{DENIED_PORT}")
+        except Refused as refusal:
+            assert refusal.status == 403, f"status {refusal.status}, want 403"
+            proxy_status = refusal.headers.get(b"proxy-status")
+            assert proxy_status == b"volto; error=http_request_denied", proxy_status
+        else:
+            raise AssertionError(f"CONNECT to port {DENIED_PORT} succeeded")
+
+
+async def test_credentials_in_authorization_pass_after_a_challenge():
+    """The server reads HTTP Basic from Authorization as well as from
+    Proxy-Authorization, and a 407 costs only its own request: the next one
+    on the same connection, with credentials, opens a session."""
+    if not os.environ.get("VOLTO_USER"):
+        print("  skipped: VOLTO_USER is not set, authentication is disabled")
+        return
+    transport, host, port = await start_tagged_udp_echo(0xC9)
+    try:
+        async with proxy_connection() as client:
+            try:
+                await client.connect_udp(host, port, credential_header=None)
+            except Refused as refusal:
+                assert refusal.status == 407, f"status {refusal.status}, want 407"
+            else:
+                raise AssertionError("an unauthenticated CONNECT-UDP succeeded")
+
+            stream_id = await client.connect_udp(host, port, credential_header=b"authorization")
+            await udp_round_trip(client, stream_id, 0xC9, b"authorized")
+    finally:
+        transport.close()
+
+
+async def test_a_session_the_client_resets_leaves_the_connection_working():
+    """A client that resets a CONNECT-UDP stream (RFC 9000 §19.4) and stops
+    reading it ends that session only: a new session on the same connection
+    carries datagrams."""
+    transport, host, port = await start_tagged_udp_echo(0xCA)
+    try:
+        async with proxy_connection() as client:
+            first = await client.connect_udp(host, port)
+            await udp_round_trip(client, first, 0xCA, b"before-the-reset")
+            client._quic.reset_stream(first, ErrorCode.H3_REQUEST_CANCELLED)
+            client._quic.stop_stream(first, ErrorCode.H3_REQUEST_CANCELLED)
+            client.transmit()
+
+            second = await client.connect_udp(host, port)
+            await udp_round_trip(client, second, 0xCA, b"after-the-reset")
+    finally:
+        transport.close()
+
+
+async def test_unknown_stream_and_frame_types_are_ignored():
+    """RFC 9114 §6.2.3 and §7.2.8 reserve stream and frame types of the form
+    0x1f * N + 0x21, and "Endpoints MUST NOT consider these streams to have
+    any meaning upon receipt", and the same of frames. One of each, the frame
+    on the client's control stream, leaves the connection working."""
+    reserved = 0x1F * 3 + 0x21
+    transport, host, port = await start_tagged_udp_echo(0xCB)
+    try:
+        async with proxy_connection() as client:
+            await client.settings()
+            unknown = client._h3._create_uni_stream(reserved)
+            client._quic.send_stream_data(unknown, b"no meaning")
+            control = client._h3._local_control_stream_id
+            client._quic.send_stream_data(
+                control, encode_uint_var(reserved) + encode_uint_var(10) + b"no meaning"
+            )
+            client.transmit()
+
+            stream_id = await client.connect_udp(host, port)
+            await udp_round_trip(client, stream_id, 0xCB, b"after-unknown-types")
+    finally:
+        transport.close()
+
+
+async def test_settings_carry_what_a_masque_client_needs():
+    """SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 9220 §3) and SETTINGS_H3_DATAGRAM
+    (RFC 9297 §2.1.1) at 1, the zero QPACK dynamic table this server keeps,
+    and its 64 KiB field section limit."""
+    async with proxy_connection() as client:
+        settings = await client.settings()
+    assert settings.get(Setting.ENABLE_CONNECT_PROTOCOL) == 1, settings
+    assert settings.get(Setting.H3_DATAGRAM) == 1, settings
+    assert settings.get(Setting.QPACK_MAX_TABLE_CAPACITY, 0) == 0, settings
+    assert settings.get(Setting.MAX_FIELD_SECTION_SIZE) == 64 * 1024, settings
+
+
+async def test_an_oversized_field_section_costs_only_its_request():
+    """RFC 9114 §4.2.2 sizes a field section as each field's name and value
+    "plus an overhead of 32 bytes for each field", so many one-byte fields
+    pass the advertised limit in a small frame. The server answers 431, stops
+    the rest of the request with H3_EXCESSIVE_LOAD, and the connection
+    carries on."""
+    transport, host, port = await start_tagged_udp_echo(0xCC)
+    try:
+        async with proxy_connection() as client:
+            limit = (await client.settings())[Setting.MAX_FIELD_SECTION_SIZE]
+            padding = [(b"a", b"b")] * (limit // 34 + 1)
+            stream_id = client.send_request(udp_request(host, port) + padding)
+            fields, stopped, _ = await client.response(stream_id)
+            assert fields[b":status"] == b"431", fields
+            while stopped is None:
+                event = await client._next_event(stream_id)
+                if isinstance(event, StopReceived):
+                    stopped = event.error_code
+                else:
+                    assert isinstance(event, DataReceived) and not event.data, (
+                        f"expected a stop, got {event}"
+                    )
+            assert stopped == ErrorCode.H3_EXCESSIVE_LOAD, f"stopped with {stopped:#x}"
+
+            stream_id = await client.connect_udp(host, port)
+            await udp_round_trip(client, stream_id, 0xCC, b"after-the-431")
+    finally:
+        transport.close()
+
+
 # Written out rather than derived, because the order is the reading order: the
-# two tunnel kinds first, then the two isolation checks, then the four edge
-# cases. `check_tests_are_accounted_for` is what makes the hand-written list
-# safe.
+# two tunnel kinds and their isolation checks first, then the edge cases.
+# `check_tests_are_accounted_for` is what makes the hand-written list safe.
 TESTS = [
     test_tcp_tunnel_round_trips,
     test_tcp_tunnels_do_not_cross_talk,
@@ -584,6 +830,15 @@ TESTS = [
     test_datagram_before_its_request_is_delivered,
     test_missing_credentials_are_challenged,
     test_denied_target_is_refused_with_proxy_status,
+    test_datagram_capsule_without_a_context_id_is_a_malformed_message,
+    test_a_percent_sign_without_two_hex_digits_is_refused_on_its_stream,
+    test_a_blackholed_target_is_accepted_then_closed,
+    test_denied_tcp_target_is_refused_with_proxy_status,
+    test_credentials_in_authorization_pass_after_a_challenge,
+    test_a_session_the_client_resets_leaves_the_connection_working,
+    test_unknown_stream_and_frame_types_are_ignored,
+    test_settings_carry_what_a_masque_client_needs,
+    test_an_oversized_field_section_costs_only_its_request,
 ]
 
 
