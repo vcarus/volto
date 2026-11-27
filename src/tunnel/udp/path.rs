@@ -25,14 +25,9 @@ pub(super) struct DatagramPath {
     limit: usize,
     /// How many oversized drops this session has had, on a doubling schedule.
     ///
-    /// The drops themselves are per packet and can arrive at line rate, so a
-    /// line each would be the flood [`crate::logfmt::Sampler`] exists to stop.
-    /// One sampler per session, so a session cannot spend a quiet neighbour's
-    /// allowance.
+    /// Per session, so one session cannot spend another's allowance.
     oversize_drops: crate::logfmt::Sampler,
     /// How many send-buffer evictions this session has had, likewise.
-    ///
-    /// The same shape and the same reason as `oversize_drops`.
     evictions: crate::logfmt::Sampler,
 }
 
@@ -53,8 +48,8 @@ impl DatagramPath {
     /// The two readings are taken only when the cached answer does not cover
     /// the packet. A packet over the last limit read is checked against a
     /// fresh limit, and dropped if it is over that too. A packet for which
-    /// [`super::super::quota::DatagramRoom::claim`] shows no room has the room read and
-    /// graded. A packet under the limit with room goes straight to
+    /// [`crate::tunnel::quota::DatagramRoom::claim`] shows no room has the room
+    /// read and graded. A packet under the limit with room goes straight to
     /// `send_datagram`, and a limit that has fallen since the last reading is
     /// caught there, as `TooLarge`.
     pub(super) fn send(&mut self, ctx: &Context, packets: &mut PacketBlock) {
@@ -96,17 +91,8 @@ impl DatagramPath {
             // would only trade a fresh datagram for a stale one. The reading
             // only decides what is logged.
             //
-            // The reading is taken only here, when the connection's lower bound
-            // of the room ([`super::quota::DatagramRoom::claim`]) does not
-            // cover the packet.
-            //
-            // Exactly-enough space is room, not an eviction:
-            // `datagram_send_buffer_space()` already has one datagram's own
-            // overhead taken off, so `len <= space` is quinn's own "this one
-            // fits" predicate. A larger datagram puts the queue over its limit,
-            // and quinn discards from the front, on this send or the next. The
-            // loss is decided before anything here could react, which is why
-            // only how loudly to say so is graded.
+            // `datagram_send_buffer_space()` already excludes one datagram's
+            // own overhead, so `len <= space` is quinn's own fit test.
             let space = ctx.quic.datagram_send_buffer_space();
             ctx.datagram_room.reset(space, encoded_len);
             if encoded_len > space {
@@ -166,15 +152,10 @@ impl DatagramPath {
     /// rest stay at `debug!`, because these arrive per packet and a flood of
     /// one benign message hides the warnings that matter.
     ///
-    /// The MTU is on the line because the limit is the smaller of two things:
-    /// what the peer's `max_datagram_frame_size` allows and what one packet at
-    /// the current path MTU holds. A Surge that advertises 1300 gives a limit
-    /// of 1291 once the path MTU has reached 1329, and one that advertises 1500
-    /// gives 1398 at an MTU of 1436. Below those MTUs the MTU sets the limit for
-    /// both: 1204 at 1242 (D48 addendum 2026-11-13). Without the MTU
-    /// a low limit cannot be told from a path that shrank (D81). It is read
-    /// from the connection statistics on a reported drop only, never per
-    /// packet.
+    /// The MTU is on the line because the limit is the smaller of the peer's
+    /// `max_datagram_frame_size` bound and what one packet at the current path
+    /// MTU holds, and without it a low limit cannot be told from a path that
+    /// shrank (D48, D81). It is read on a reported drop only, never per packet.
     fn report_oversize(&self, ctx: &Context, drops: Option<u64>, encoded_len: usize) {
         let limit = self.limit;
         match drops {
@@ -357,10 +338,16 @@ mod tests {
         path.send(&ctx, &mut packets);
         let after_first = ctx.datagram_room.get();
 
-        // Long enough for quinn to send the one queued datagram.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Until quinn's driver has sent the one queued datagram, within a
+        // bound.
+        let sent = tokio::time::timeout(Duration::from_secs(5), async {
+            while ctx.quic.datagram_send_buffer_space() <= after_first {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
         assert!(
-            ctx.quic.datagram_send_buffer_space() > after_first,
+            sent.is_ok(),
             "quinn did not send the first datagram, so nothing tells a reading apart"
         );
 
