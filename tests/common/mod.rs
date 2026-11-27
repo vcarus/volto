@@ -1557,8 +1557,6 @@ async fn read_while(
     mut enough: impl FnMut(usize) -> bool,
     caller: &'static Location<'static>,
 ) -> (Vec<u8>, bool) {
-    use bytes::Buf;
-
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     let mut out = Vec::new();
     while !enough(out.len()) {
@@ -1578,7 +1576,7 @@ async fn read_while(
             });
 
         match chunk {
-            Some(mut buf) => out.extend_from_slice(buf.copy_to_bytes(buf.remaining()).as_ref()),
+            Some(chunk) => out.extend_from_slice(&chunk),
             None => return (out, true),
         }
     }
