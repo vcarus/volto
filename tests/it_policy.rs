@@ -1,4 +1,4 @@
-//! M4: authentication, the destination policy, quotas and abuse mitigations.
+//! Authentication, the destination policy, quotas and abuse mitigations.
 //!
 //! Everything here is asserted on the wire — status codes and response header
 //! fields — rather than against internal state, so the tests keep their meaning
@@ -46,19 +46,6 @@ fn authorized_connect_in(authority: &str, field: &str, value: &str) -> Request {
 // ---------------------------------------------------------------------------
 // Authentication
 // ---------------------------------------------------------------------------
-
-/// The default configuration has no users, which disables authentication. That
-/// is the open-proxy case the startup warning is about, and it has to keep
-/// working: it is how the server is run during interop debugging.
-#[tokio::test]
-async fn no_configured_users_means_no_authentication() {
-    let server = TestServer::start().await;
-    let target = spawn_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
-
-    let response = respond_to(&mut client, connect_request(&target.to_string())).await;
-    assert_eq!(response.status, Status::OK);
-}
 
 /// Both header names are accepted (decision D3): Surge's manual does not say
 /// which one it uses, so neither may be the only one that works.
@@ -247,7 +234,7 @@ async fn special_purpose_and_transition_addresses_are_prohibited_by_default() {
 }
 
 /// The IPv4-translated form of RFC 2765 (`::ffff:0:a.b.c.d`) and the rest of
-/// `::/8` are refused by default, at the wire (R6-L5).
+/// `::/8` are refused by default, at the wire.
 ///
 /// `::ffff:0:7f00:1` is 127.0.0.1 in the translated form, which
 /// `to_canonical` does not unwrap. The connect budget is pinned low so that,
@@ -615,6 +602,10 @@ async fn a_tunnel_closed_on_the_spot_stops_the_client_with_no_error() {
 
 /// Private space can be opened up deliberately — the deployments where reaching a
 /// private network is the whole point.
+///
+/// The server has no users, which disables authentication: the open-proxy case
+/// the startup warning is about, and how the server is run during interop
+/// debugging.
 #[tokio::test]
 async fn private_addresses_are_reachable_when_allowed() {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
@@ -783,7 +774,7 @@ async fn packets_to_a_silent_target_are_capped() {
     const SENT: u64 = 20;
 
     let server = TestServer::start_with(&format!(
-        "[security]\nallow_private_networks = true\nunanswered_packet_budget = {BUDGET}\n"
+        "{ALLOW_PRIVATE}unanswered_packet_budget = {BUDGET}\n"
     ))
     .await;
     let (target, received) = spawn_silent_udp_target().await;
@@ -807,10 +798,9 @@ async fn packets_to_a_silent_target_are_capped() {
     );
 }
 
-/// The same cap, against the way around it: a new session used to start with a
-/// budget of its own, so a client could reflect an unbounded number of packets
-/// at one silent victim by opening a session per handful of packets. The
-/// connection carries a total of its own, and it is not restored by anything a
+/// The same cap, against the way around it: a client that opens a session per
+/// handful of packets, each with a budget of its own, against one silent
+/// victim. The connection carries a total of its own, and it is not restored by anything a
 /// client can do on that connection.
 ///
 /// Sessions are opened one after another and each spends its whole session
@@ -824,7 +814,7 @@ async fn a_churn_of_sessions_cannot_restore_the_unanswered_budget() {
     const SESSIONS: u64 = 20;
 
     let server = TestServer::start_with(&format!(
-        "[security]\nallow_private_networks = true\nunanswered_packet_budget = {BUDGET}\n"
+        "{ALLOW_PRIVATE}unanswered_packet_budget = {BUDGET}\n"
     ))
     .await;
     let (target, received) = spawn_silent_udp_target().await;
@@ -865,7 +855,7 @@ async fn a_churn_of_sessions_cannot_restore_the_unanswered_budget() {
     // Both halves of that stream carry one verdict. Left to the `Reader` being
     // dropped, quinn sends STOP_SENDING with code 0, which RFC 9114 §8.1 makes
     // equivalent to H3_NO_ERROR, so the client would read a fault on the half
-    // it reads and "no error" on the half it writes (review L9).
+    // it reads and "no error" on the half it writes.
     let stopped = tokio::time::timeout(TIMEOUT, last.stopped())
         .await
         .expect("the proxy must stop the client's sending side")
@@ -890,7 +880,7 @@ async fn answered_sessions_give_the_connection_total_back() {
     let sessions = connection_total + 4;
 
     let server = TestServer::start_with(&format!(
-        "[security]\nallow_private_networks = true\nunanswered_packet_budget = {BUDGET}\n"
+        "{ALLOW_PRIVATE}unanswered_packet_budget = {BUDGET}\n"
     ))
     .await;
     let target = spawn_udp_echo_target().await;
@@ -915,10 +905,8 @@ async fn answered_sessions_give_the_connection_total_back() {
 /// gone — a budget of one must not throttle a working flow.
 #[tokio::test]
 async fn the_cap_is_lifted_once_the_target_answers() {
-    let server = TestServer::start_with(
-        "[security]\nallow_private_networks = true\nunanswered_packet_budget = 1\n",
-    )
-    .await;
+    let server =
+        TestServer::start_with(&format!("{ALLOW_PRIVATE}unanswered_packet_budget = 1\n")).await;
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
