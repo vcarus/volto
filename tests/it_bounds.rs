@@ -16,12 +16,10 @@
 //!
 //! Each input here is one a *conformant* peer may send, so none of them can be
 //! answered by refusing it: what bounds them is arithmetic, and this is where
-//! that arithmetic is pinned. `docs/configuration.md` quotes the same numbers
-//! for an operator sizing a host, which is the other reason they belong in a
-//! test rather than in a comment. That last sentence is itself checked:
-//! `it_docs` reads every constant those pages quote in the `` `IDENT` = value ``
-//! notation back against the crate, so "the same numbers" is a gate rather than
-//! a claim.
+//! that arithmetic is pinned. `docs/configuration.md` quotes figures from these
+//! measurements for an operator sizing a host. No test compares those figures
+//! with this file, so a change to a measurement or a ceiling here has to be
+//! carried to that page by hand.
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the budget arithmetic is over the constants this file asserts about.
