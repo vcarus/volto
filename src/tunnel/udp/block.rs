@@ -149,7 +149,8 @@ impl PacketBlock {
     ///
     /// The `io::Result` is the socket's own: `WouldBlock` when nothing is
     /// queued, which is what lets tokio's `async_io` and `try_io` drive this,
-    /// and every other error unchanged for [`read_verdict`](super::read_verdict). A failed receive
+    /// and every other error unchanged for
+    /// [`is_per_packet_error`](super::is_per_packet_error). A failed receive
     /// changes nothing about the packet in hand.
     pub(super) fn recv(&mut self, socket: &UdpSocket) -> std::io::Result<usize> {
         if !self.prepared {
