@@ -7,7 +7,8 @@
 //! the rate with a token-bucket policer or a queue, and delays each packet by
 //! a fixed time each way. The sender is a bulk sender that behaves as
 //! quinn-proto 0.11.19 does under this crate's transport settings. It is never
-//! short of data, except in a handshake when a scenario models one. It sends
+//! short of data, except in a handshake or at [`Scenario::client_window`]
+//! when a scenario sets them. It sends
 //! while in-flight data is under [`Controller::window`] and its pacer allows
 //! it. It calls the controller in quinn's order and declares a loss by quinn's
 //! rule.
@@ -530,9 +531,9 @@ struct Report {
 /// The sender is quinn-proto 0.11.19 reduced to what moves the controller.
 /// Left out: the handshake unless [`Scenario::handshake`] models it (the run
 /// starts with the RTT estimator holding one sample of the path's RTT, as
-/// after a handshake), flow control (the peer's
-/// windows and `send_window` never bind), ACK-only packets, persistent
-/// congestion (which [`Bbr`] ignores), ECN, MTU discovery, the peer's ACK
+/// after a handshake), the peer's flow control except
+/// [`Scenario::client_window`], the sender's `send_window`, ACK-only packets,
+/// persistent congestion (which [`Bbr`] ignores), ECN, MTU discovery, the peer's ACK
 /// delay (reported as zero), and loss or reordering of ACKs. Timers fire at
 /// their exact time. The probe timeout is quinn's in its simplest form: when
 /// no loss timer is set, it fires the smoothed RTT plus four RTT variations
@@ -1473,9 +1474,8 @@ fn series() -> bool {
 
 const SEEDS: [u64; 3] = [1, 2, 3];
 
-/// The connection window Surge advertises, 16 MiB. A sender without a rate
-/// limit is held by it, which the simulator does not model, so a run without
-/// a limit ends when the window reaches it.
+/// The connection window Surge advertises, 16 MiB. A run without a rate
+/// limit ends when the window reaches it.
 const CLIENT_WINDOW: u64 = 16 * 1024 * 1024;
 
 /// S1 to S3 (V2): paths that drop a quarter to a third of the packets, with no
