@@ -71,7 +71,7 @@ impl Family {
 /// no address at all. Both carry a private marker type, which is what this
 /// checks for. The [`io::ErrorKind`] alone cannot say it: an `EAI_SYSTEM`
 /// failure carries the `errno` of the call, and that can be `ENOENT`.
-pub fn is_no_data(error: &io::Error) -> bool {
+pub(crate) fn is_no_data(error: &io::Error) -> bool {
     error.get_ref().is_some_and(|inner| inner.is::<NoAddress>())
 }
 
@@ -744,7 +744,7 @@ impl OtherFamily {
 /// does not hold. This probe then answers `true` for every address of that
 /// family, and every tunnel to that family is refused as the proxy's own. The
 /// failure is closed: no target is reached that should have been refused.
-pub fn holds_address(address: SocketAddr) -> bool {
+pub(crate) fn holds_address(address: SocketAddr) -> bool {
     std::net::UdpSocket::bind(address).is_ok()
 }
 
@@ -824,7 +824,7 @@ fn limit_column(column: &str) -> Option<Option<u64>> {
 /// IPv6 socket its packets would leave as IPv4 without the IPv4 "don't
 /// fragment" setting, and a host with `net.ipv6.bindv6only = 1` would refuse
 /// the connect.
-pub async fn connected_udp_socket(target: SocketAddr) -> io::Result<UdpSocket> {
+pub(crate) async fn connected_udp_socket(target: SocketAddr) -> io::Result<UdpSocket> {
     let target = SocketAddr::new(crate::policy::canonical(target.ip()), target.port());
 
     // Bind a wildcard address of the same family as the target.
