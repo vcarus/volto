@@ -454,16 +454,10 @@ mod tests {
         assert!(!text.contains("Timeout"), "{text}");
     }
 
-    /// A peer's *transport* close carries prose the peer wrote, and this type's
-    /// `Display` is what `quic/mod.rs` records with `%error` on the `WARN` that
-    /// ends a connection. `Display` escapes nothing, and systemd splits a
-    /// service's stdout on `\n`, so a reason phrase reaching that line whole
-    /// hands any peer that can complete a handshake a journal entry of its own:
-    /// forged, attributed to this server, and free.
-    ///
-    /// The peer's own words are still worth having, so they are kept: bounded and
-    /// `Debug`-escaped where they enter this type, which is the same division of
-    /// labour `logfmt` states and `auth` already applies to a claimed user-id.
+    /// A peer's transport close carries prose the peer wrote, and this
+    /// `Display` reaches the WARN that ends a connection. A newline in it would
+    /// start a journal line of the peer's choosing, so the phrase is bounded and
+    /// escaped where it enters this type (`logfmt::peer_error`).
     #[test]
     fn a_peer_transport_close_cannot_forge_a_log_line() {
         let forged = "bye\nINFO volto: authentication succeeded for admin";
