@@ -48,7 +48,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, Leg, Offer, Relayed, SharedBuffer, TempDir, TestServer,
+    ALLOW_PRIVATE, GATE_LOCALHOST, Leg, Offer, Relayed, SharedBuffer, TIMEOUT, TempDir, TestServer,
     bulk_alpn, client_endpoint, endpoint_from, is_version_negotiation, nameless_crypto, roots_of,
     rustls_client, udp_answer, udp_answers, udp_relay,
 };
@@ -3935,9 +3935,15 @@ async fn the_port_of_a_finished_probe_is_not_free_for_the_next_one() {
     let mut probe = vec![0u8; 16];
 
     assert!(udp_answers(addr, &[vec![1u8; 8]], brief).await.is_empty());
-    let (_, many) = target.recv_from(&mut probe).await.expect("the probe");
+    let (_, many) = tokio::time::timeout(TIMEOUT, target.recv_from(&mut probe))
+        .await
+        .expect("udp_answers sends its probe")
+        .expect("the probe");
     assert!(udp_answer(addr, &[2u8; 8], brief).await.is_none());
-    let (_, one) = target.recv_from(&mut probe).await.expect("the probe");
+    let (_, one) = tokio::time::timeout(TIMEOUT, target.recv_from(&mut probe))
+        .await
+        .expect("udp_answer sends its probe")
+        .expect("the probe");
 
     for (helper, from) in [("udp_answers", many), ("udp_answer", one)] {
         let again = tokio::net::UdpSocket::bind(from).await;
