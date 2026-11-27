@@ -33,8 +33,9 @@ use std::time::Duration;
 /// Counted per sample interval, by its ACK interval. An interval counts when
 /// no startup was in progress before it and no ACK in it found the sender
 /// app-limited, which leaves out an interval with a probe in it, since a
-/// probe's ACKs count as app-limited. quinn builds a new controller for a new
-/// path, and the counts start again with it.
+/// probe's ACKs count as app-limited. quinn builds a new controller when the
+/// peer's address changes, and the counts start again with it; after a change
+/// of IPv4 port alone it keeps a copy of this one, and the counts go on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Record {
     /// The time in counted intervals: the window, and nothing before it, held
