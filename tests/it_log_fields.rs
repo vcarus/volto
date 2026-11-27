@@ -23,7 +23,8 @@ mod common;
 
 use common::{
     ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, auth_section, authorized_connect,
-    open_tcp_tunnel, open_udp_session, respond_to, spawn_echo_target, spawn_udp_echo_target,
+    numeric_field, open_tcp_tunnel, open_udp_session, respond_to, spawn_echo_target,
+    spawn_udp_echo_target,
 };
 use volto::h3api::Status;
 
@@ -84,16 +85,16 @@ async fn operator_facing_fields_print_values_not_options() {
     // they cannot add up to more than it. Both targets are on loopback, so the
     // values are near zero and only their presence and that order are judged.
     let (resolve, connect, setup) = (
-        millis(tunnel, "resolve_ms"),
-        millis(tunnel, "connect_ms"),
-        millis(tunnel, "setup_ms"),
+        numeric_field(tunnel, "resolve_ms"),
+        numeric_field(tunnel, "connect_ms"),
+        numeric_field(tunnel, "setup_ms"),
     );
     assert!(
         resolve + connect <= setup && setup < 10_000,
         "resolving and connecting are parts of the setup; line was:\n{tunnel}"
     );
     assert!(
-        millis(session, "resolve_ms") <= millis(session, "setup_ms"),
+        numeric_field(session, "resolve_ms") <= numeric_field(session, "setup_ms"),
         "resolving is a part of the setup; line was:\n{session}"
     );
     assert!(
@@ -219,21 +220,4 @@ async fn operator_facing_fields_print_values_not_options() {
         !logged.contains("Some("),
         "no operator-facing field may print Rust's Option spelling; log was:\n{logged}"
     );
-}
-
-/// The value of a field that prints as whole milliseconds, such as
-/// `setup_ms=12`.
-///
-/// The caller is read before the closures: a closure does not inherit
-/// `#[track_caller]`, so a panic inside one would name this function.
-#[track_caller]
-fn millis(line: &str, field: &str) -> u64 {
-    let caller = std::panic::Location::caller();
-    let value = line
-        .split_whitespace()
-        .find_map(|word| word.strip_prefix(field)?.strip_prefix('='))
-        .unwrap_or_else(|| panic!("{caller}: no `{field}` field; line was:\n{line}"));
-    value.parse().unwrap_or_else(|_| {
-        panic!("{caller}: `{field}={value}` is not a whole number; line was:\n{line}")
-    })
 }
