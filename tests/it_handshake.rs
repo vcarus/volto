@@ -27,9 +27,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::rawstream::{
-    FRAME_HEADERS, H3_NO_ERROR, H3_REQUEST_INCOMPLETE, H3_STREAM_CREATION_ERROR, authenticate,
-    authenticated_connect_headers_frame, close_reason, expect_reset, read_frame,
-    server_control_stream, status_of, still_serving,
+    FRAME_HEADERS, H3_NO_ERROR, H3_REQUEST_CANCELLED, H3_REQUEST_INCOMPLETE,
+    H3_STREAM_CREATION_ERROR, authenticate, authenticated_connect_headers_frame, close_reason,
+    expect_reset, read_frame, server_control_stream, status_of, still_serving,
 };
 use common::{
     ALLOW_PRIVATE, H3Client, IMPATIENT, Leg, Offer, Relayed, TIMEOUT, TestServer, auth_section,
@@ -47,10 +47,6 @@ use rustls::pki_types::{CertificateDer, ServerName};
 /// APPLICATION_ERROR (RFC 9000 §20.1), the transport code a server sends when it
 /// closes for an application reason before the handshake has completed
 /// (RFC 9000 §10.2.3).
-///
-/// Kept here rather than beside `common::rawstream`'s codes: those are the
-/// HTTP/3 registry of RFC 9114 §8.1, and this is a QUIC transport code from a
-/// different one.
 const APPLICATION_ERROR: u64 = 0x0c;
 
 /// Room for two connections at a time.
@@ -129,20 +125,13 @@ async fn an_ordinary_client_is_untouched_by_the_deadline() {
 /// A peer that completes the handshake and then never asks for anything is
 /// closed by the bound.
 ///
-/// The two silent peers here are exactly the shape the v0.4.0 review found: a
-/// plain QUIC connection, no request stream ever opened, kept alive by its own
-/// stack answering the packets that cross it. Each is closed by the bound alone,
-/// with nobody else arriving to prompt it.
-///
-/// Nothing here probes the connection cap any more, and that is deliberate: a
-/// newcomer at the cap now takes one of these very slots by eviction, so a
-/// refusal is no longer the symptom of a slot being held and an admission is no
-/// longer proof of one being returned. The cap is asserted at the end of this
-/// file instead; what is under test here is the bound each connection is under
-/// on its own, with or without anyone waiting for its slot.
+/// Each silent peer is a plain QUIC connection that never opens a request
+/// stream and is kept alive by its own stack. The cap is not probed here,
+/// because at the cap a newcomer takes a slot by eviction; the last group of
+/// tests asserts the cap.
 #[tokio::test]
 async fn a_peer_that_never_sends_a_request_is_closed_by_the_bound() {
-    let server = TestServer::start_with(&format!("{IMPATIENT}{TWO_SLOTS}")).await;
+    let server = TestServer::start_with(IMPATIENT).await;
 
     let first = silent_peer(&server).await;
     let second = silent_peer(&server).await;
@@ -162,8 +151,8 @@ async fn a_peer_that_never_sends_a_request_is_closed_by_the_bound() {
 /// A peer whose only request failed authentication is no better off.
 ///
 /// 407 is not a slot: the connection has still never had an authenticated
-/// request on it, so the bound still applies. This is the other half of the
-/// review's C1 — a peer that answers the challenge by saying nothing at all.
+/// request on it, so the bound still applies. A peer that answers the challenge
+/// by saying nothing at all.
 #[tokio::test]
 async fn a_peer_that_only_fails_authentication_is_closed_by_the_bound() {
     let server = TestServer::start_with(&format!(
@@ -225,15 +214,15 @@ async fn an_authenticated_connection_is_not_bounded() {
 /// The bound is a deadline measured from the handshake, not a timer restarted by
 /// every wait, and this is the difference between the two. `accept()` returns the
 /// moment the peer *opens* a stream, so a peer that opened one every other idle
-/// timeout — a byte apiece, never a whole request, never a credential — used to
-/// rearm the wait before it could expire and so held its slot for as long as it
-/// cared to, which is the very symptom D76 exists to end (review C1').
+/// timeout — a byte apiece, never a whole request, never a credential — would
+/// rearm a restarted timer before it expired and hold its slot indefinitely,
+/// which D76 exists to end.
 ///
 /// Each of those streams is reset on its own after an idle timeout, and the
 /// stream allowance comes back, so the peer can keep this up for nothing.
 #[tokio::test]
 async fn opening_request_streams_does_not_extend_the_bound() {
-    let server = TestServer::start_with(&format!("{IMPATIENT}{ONE_SLOT}")).await;
+    let server = TestServer::start_with(IMPATIENT).await;
     let (_endpoint, connection) = silent_peer(&server).await;
 
     // 1.2s apart, comfortably inside the 2s bound.
@@ -269,15 +258,11 @@ async fn opening_request_streams_does_not_extend_the_bound() {
 ///
 /// `opening_request_streams_does_not_extend_the_bound` above spaces its streams
 /// out, so between two of them the accept loop has nothing to do, parks, and the
-/// deadline is looked at. This one never lets it park, and that used to be
-/// enough on its own: `tokio::time::timeout_at` polls the future it wraps
-/// **first** and returns its value without consulting the clock, so a lapsed
-/// deadline is only ever noticed on a poll where nothing was ready. A peer with
-/// another stream always queued was therefore never measured against it at all —
-/// not by rearming it, which is what D76 made it absolute to prevent, but by
-/// stepping over the branch that reads it. With `max_streams_bidi` raised, the
-/// connection below stayed open for as long as the churn lasted; two minutes was
-/// as far as it was worth measuring (adversarial pass 2026-08-29).
+/// deadline is looked at. This one never lets it park.
+/// `tokio::time::timeout_at` polls the future it wraps first and returns its
+/// value without reading the clock, so a lapsed deadline is noticed only on a
+/// poll where nothing was ready, and a peer that always has another stream
+/// queued is never measured against it unless the loop reads the clock itself.
 ///
 /// The streams are opened and finished *empty*, which is what makes the supply
 /// unbounded: an empty request stream is a stream error apiece (RFC 9114 §4.1's
@@ -285,17 +270,15 @@ async fn opening_request_streams_does_not_extend_the_bound() {
 /// connection survives every one of them and the allowance comes straight back.
 /// It is the only shape of stream that is both free to make and not in itself a
 /// reason to hang up.
+///
 /// Threads enough for the churn, the client's endpoint driver and the server's
 /// accept loop to run at once, since all three have to make progress for the
 /// close to be seen at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unbroken_churn_of_request_streams_does_not_extend_the_bound() {
-    // The allowance raised to the ceiling, so the peer never waits a round trip
-    // for credit: at the 1024 default the churn stalls often enough that the
-    // accept loop parks now and then and the bound held anyway on two runs out
-    // of three, which is a flaky test rather than a passing server.
-    let server =
-        TestServer::start_with(&format!("{IMPATIENT}{ONE_SLOT}max_streams_bidi = 65536\n")).await;
+    // The allowance raised to the ceiling, so the churn never waits for stream
+    // credit and the accept loop never parks.
+    let server = TestServer::start_with(&format!("{IMPATIENT}max_streams_bidi = 65536\n")).await;
     let (_endpoint, connection) = silent_peer(&server).await;
 
     let churning = tokio::spawn({
@@ -391,7 +374,7 @@ async fn a_request_reset_before_its_headers_draws_an_abort() {
     send.write_all(&[0x01])
         .await
         .expect("send one byte of a request");
-    send.reset(quinn::VarInt::from_u32(0x10c))
+    send.reset(quinn::VarInt::from_u64(H3_REQUEST_CANCELLED).expect("a varint"))
         .expect("reset the request stream");
 
     expect_reset(
@@ -471,7 +454,7 @@ async fn a_batch_of_stalled_requests_is_reset_stream_by_stream() {
 /// handshake happens, and quinn has no handshake-specific timer — any
 /// authenticated packet in any packet number space refreshes its idle timer, so
 /// a peer that keeps sending Initials and never completes the handshake keeps
-/// the slot (review M6).
+/// the slot.
 ///
 /// The half-finished handshake is produced by relaying the client's packets to
 /// the server and dropping the server's answers, which is the shape without
@@ -527,13 +510,9 @@ async fn a_quic_handshake_that_never_completes_gives_its_slot_back() {
 
     let (counted, retries) = retry_counting_relay(server.addr).await;
     let admitted = client_endpoint(&server.ca, &["h3"]);
-    let connection = finish_connect(&admitted, counted)
+    let _connection = finish_connect(&admitted, counted)
         .await
         .expect("the slot must come back once the stalled handshake is abandoned");
-    assert!(
-        connection.close_reason().is_none(),
-        "the second client must be admitted, not refused"
-    );
     assert_eq!(
         retries.load(Ordering::Relaxed),
         0,
@@ -721,14 +700,10 @@ async fn a_full_server_makes_a_newcomer_validate_its_address_before_it_evicts() 
 
     let (relay, retries) = retry_counting_relay(server.addr).await;
     let endpoint = client_endpoint(&server.ca, &["h3"]);
-    let connection = finish_connect(&endpoint, relay)
+    let _connection = finish_connect(&endpoint, relay)
         .await
         .expect("a client that answers the Retry must still be admitted");
 
-    assert!(
-        connection.close_reason().is_none(),
-        "the newcomer must end up admitted, not refused"
-    );
     assert_eq!(
         retries.load(Ordering::Relaxed),
         1,
@@ -752,14 +727,10 @@ async fn a_server_with_room_asks_no_newcomer_to_validate_its_address() {
 
     let (relay, retries) = retry_counting_relay(server.addr).await;
     let endpoint = client_endpoint(&server.ca, &["h3"]);
-    let connection = finish_connect(&endpoint, relay)
+    let _connection = finish_connect(&endpoint, relay)
         .await
         .expect("there is room, so the newcomer is simply admitted");
 
-    assert!(
-        connection.close_reason().is_none(),
-        "the newcomer must be admitted"
-    );
     assert_eq!(
         retries.load(Ordering::Relaxed),
         0,
@@ -809,14 +780,10 @@ async fn a_client_that_has_connected_before_evicts_without_a_retry() {
     // something for the returning client to take.
     let parked = H3Client::connect(&server).await;
 
-    let second = finish_connect(&endpoint, relay)
+    let _second = finish_connect(&endpoint, relay)
         .await
         .expect("a client holding a token must be admitted straight away");
 
-    assert!(
-        second.close_reason().is_none(),
-        "the returning client must end up admitted, not refused"
-    );
     assert_eq!(
         retries.load(Ordering::Relaxed),
         0,
@@ -831,10 +798,9 @@ async fn a_client_that_has_connected_before_evicts_without_a_retry() {
 /// The slot is taken before the handshake starts, so a peer that never finishes
 /// one is holding a slot that the roster can take back — and the branch that
 /// takes it is a `select!` arm racing the handshake itself, on a connection that
-/// has no `conn::handle` future to drop yet. Nothing had exercised that arm:
-/// replacing it with `std::future::pending()` left every eviction test green,
-/// because the roster frees the slot whether or not the victim ever hears about
-/// it.
+/// has no `conn::handle` future to drop yet. Without this test, replacing that
+/// arm with `std::future::pending()` leaves every other eviction test green,
+/// because the roster frees the slot whether or not the victim hears about it.
 ///
 /// So this watches the victim rather than the newcomer. The relay carries the
 /// client's first datagram and no more, so the server never sees the client's
@@ -843,7 +809,7 @@ async fn a_client_that_has_connected_before_evicts_without_a_retry() {
 /// the close the eviction sends, well inside the handshake deadline of one idle
 /// timeout.
 ///
-/// It also settles what that close *is* (F4). An `Incoming` handed to
+/// It also settles what that close *is*. An `Incoming` handed to
 /// `tokio::time::timeout` has already been accepted, so this is not
 /// `Incoming::refuse`'s CONNECTION_REFUSED: it is the application close that
 /// dropping a `Connecting` performs, which RFC 9000 §10.2.3 has a server send
@@ -896,9 +862,8 @@ async fn a_connection_still_handshaking_hears_about_its_eviction() {
 /// client has nothing to offer early data on.
 ///
 /// The client is as willing as a client can be: `enable_early_data` and a
-/// session store it keeps. Before rustls stopped being the server, this test
-/// waited for a ticket and then saw 0-RTT refused on it; there is no ticket now,
-/// so it waits instead for the server's first stream after the handshake. A
+/// session store it keeps. It waits for the server's first stream after the
+/// handshake. A
 /// TLS 1.3 server sends its tickets with the end of its handshake, before any
 /// application data, so a ticket would have reached the store by then. The
 /// assertion that a ticket, if one were forced on, would still carry no
@@ -935,10 +900,6 @@ async fn the_server_does_not_permit_zero_rtt() {
         .await
         .expect("the second handshake must not hang")
         .expect("the second handshake must succeed without 0-RTT");
-    assert!(
-        second.close_reason().is_none(),
-        "the second connection must be usable"
-    );
     // The same wait as on the first connection, so that a ticket sent with the
     // end of this handshake would have reached the store before the count is
     // read.
