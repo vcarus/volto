@@ -11,7 +11,7 @@ for CONNECT-UDP, but it leaves two holes this suite covers:
   prefix is applied by hand, which is exactly what makes that test possible.
 - masque-go sends datagrams only on a session its Dial has already opened, so
   it cannot send one before the request it belongs to; aioquic can name a
-  stream that does not exist yet.
+  stream that does not exist yet, by writing the QUIC DATAGRAM frame itself.
 
 aioquic shares no code, no QUIC stack and no reading of the RFCs with either
 volto or quic-go, so agreement here is a third independent vote.
@@ -30,8 +30,13 @@ import sys
 from aioquic.asyncio.client import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.buffer import Buffer, encode_uint_var
-from aioquic.h3.connection import H3_ALPN, H3Connection
-from aioquic.h3.events import DataReceived, DatagramReceived, HeadersReceived
+from aioquic.h3.connection import H3_ALPN, ErrorCode, H3Connection
+from aioquic.h3.events import (
+    DataReceived,
+    DatagramReceived,
+    HeadersReceived,
+    StopReceived,
+)
 from aioquic.quic.configuration import QuicConfiguration
 
 # Bound on any single exchange. Everything is loopback; this fires only when
@@ -108,6 +113,16 @@ class ProxyClient(QuicConnectionProtocol):
         self.transmit()
 
         event = await self._next_event(stream_id)
+        # RFC 9114 §4.1: "When the server does not need to receive the
+        # remainder of the request, it MAY abort reading the request stream,
+        # send a complete response, and cleanly close the sending part of the
+        # stream. The error code H3_NO_ERROR SHOULD be used when requesting
+        # that the client stop sending on the request stream." volto does
+        # this with a refusal, and aioquic can report the STOP_SENDING before
+        # the response it belongs to.
+        if isinstance(event, StopReceived):
+            assert event.error_code == ErrorCode.H3_NO_ERROR, event
+            event = await self._next_event(stream_id)
         assert isinstance(event, HeadersReceived), f"expected headers, got {event}"
         fields = dict(event.headers)
         status = int(fields[b":status"])
@@ -165,6 +180,18 @@ class ProxyClient(QuicConnectionProtocol):
         allowed to send one.
         """
         self._h3.send_datagram(stream_id, encode_uint_var(context_id) + payload)
+        self.transmit()
+
+    def send_udp_before_request(self, stream_id, payload):
+        """Sends one HTTP Datagram for a request stream not yet opened.
+
+        aioquic's HTTP/3 layer refuses a datagram for a stream that has sent
+        no HEADERS, so this writes the QUIC DATAGRAM frame itself: the
+        Quarter Stream ID, then Context ID 0, then the payload (RFC 9297
+        §2.1, RFC 9298 §5).
+        """
+        quarter_stream_id = encode_uint_var(stream_id // 4)
+        self._quic.send_datagram_frame(quarter_stream_id + encode_uint_var(0) + payload)
         self.transmit()
 
     async def recv_udp(self, stream_id):
@@ -419,7 +446,7 @@ async def test_datagram_before_its_request_is_delivered():
 
             # The stream the next request will open, named before it exists.
             stream_id = client._quic.get_next_available_stream_id()
-            client.send_udp(stream_id, b"sent-before-the-request")
+            client.send_udp_before_request(stream_id, b"sent-before-the-request")
             # What puts the datagram before the stream: a bounded wait, since
             # the client cannot see when the server routes it. Well inside
             # volto's hold time of 333 ms.
