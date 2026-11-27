@@ -43,6 +43,10 @@ const UNCAPPED: &str =
 /// chunk worth of them covers it several times over.
 const BURST: usize = 8192;
 
+/// The line `Session::forward_to_target` writes when it drops one packet the
+/// target socket refused.
+const DROPPED: &str = "target socket refused this packet, dropping it";
+
 #[tokio::test]
 async fn a_socket_the_os_reported_broken_is_not_logged_as_a_dropped_packet() {
     let buffer = SharedBuffer::shared("volto=debug");
@@ -82,14 +86,13 @@ async fn a_socket_the_os_reported_broken_is_not_logged_as_a_dropped_packet() {
     // into one: a socket the operating system has given up on is not a packet
     // that did not fit.
     //
-    // The needle is a negative, so unlike the positive above it does not turn
-    // red when the message moves: a reworded line is a needle that can never
-    // match, and the assertion is then permanently satisfied. `it_log_lines`
-    // does not catch that either, being keyed by `log_id` rather than by the
-    // message. `Session::forward_to_target` in `src/tunnel/udp.rs` is the one
-    // site in the tree that writes this string, on the `is_per_packet_error`
-    // arm, so this is the reason a rename there has to reach here (review L11).
-    let dropped = buffer.lines_since(mark, &["target socket refused this packet, dropping it"]);
+    // The needle is a negative, so a reworded line would satisfy it for ever;
+    // the first assertion holds it to a line the server still writes.
+    assert!(
+        include_str!("../src/tunnel/udp.rs").contains(DROPPED),
+        "the needle must name a line the server still writes"
+    );
+    let dropped = buffer.lines_since(mark, &[DROPPED]);
     assert!(
         dropped.is_empty(),
         "ECONNREFUSED is a verdict on the socket, not on one packet, got:\n{}",
