@@ -42,7 +42,7 @@ use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-use crate::capsule::{Capsule, CapsuleDecoder};
+use crate::capsule::{self, Capsule, CapsuleDecoder};
 use crate::datagram::{self, MAX_UDP_PAYLOAD};
 use crate::h3api::{
     self, DatagramReceiver, FieldValue, Fields, Reader, Request, Status, Stream, Writer,
@@ -856,10 +856,23 @@ impl Session<'_> {
                         // More bytes needed.
                         Ok(None) => return Step::Continue,
                         Err(error) => {
-                            // RFC 9297 §5.2 registers 0x33 as exactly this: a
-                            // "Datagram or Capsule Protocol parse error".
                             debug!(stream_id, %error, "malformed capsule");
-                            return self.abort(h3api::Code::H3_DATAGRAM_ERROR);
+                            return self.abort(match error {
+                                // RFC 9297 §3.3: "a Capsule payload that
+                                // terminates before the end of the identified
+                                // fields MUST be treated as it if were a
+                                // malformed or incomplete message", and RFC
+                                // 9114 §4.1.2 answers one with H3_MESSAGE_ERROR.
+                                capsule::Error::MalformedDatagram => {
+                                    h3api::Code::H3_MESSAGE_ERROR
+                                }
+                                // Our own bound, for which RFC 9298 §5 names no
+                                // code. RFC 9297 §5.2 registers 0x33 for a
+                                // "Datagram or Capsule Protocol parse error".
+                                capsule::Error::DatagramTooLarge { .. } => {
+                                    h3api::Code::H3_DATAGRAM_ERROR
+                                }
+                            });
                         }
                     }
                 }

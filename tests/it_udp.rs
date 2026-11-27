@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::h3client::ends_cleanly;
-use common::rawstream::{H3_DATAGRAM_ERROR, H3_NO_ERROR, H3_REQUEST_CANCELLED};
+use common::rawstream::{H3_DATAGRAM_ERROR, H3_MESSAGE_ERROR, H3_NO_ERROR, H3_REQUEST_CANCELLED};
 use common::{
     ALLOW_PRIVATE, DELIBERATE, H3Client, TIMEOUT, TestServer, assert_peer_reset,
     closed_udp_address, connect_udp_request, open_udp_session, open_udp_session_to, respond_to,
@@ -777,16 +777,15 @@ async fn a_truncated_capsule_is_rejected() {
     assert_peer_reset(&error, 0x010e);
 }
 
-/// A DATAGRAM capsule declaring more bytes than a UDP payload can hold is a
-/// *parse* error, and gets the code registered for one.
+/// A DATAGRAM capsule declaring more bytes than a UDP payload can hold breaks
+/// this server's own bound, and gets H3_DATAGRAM_ERROR (0x33), which RFC 9297
+/// §5.2 registers for a "Datagram or Capsule Protocol parse error".
 ///
-/// The pair to [`a_truncated_capsule_is_rejected`], and the reason both exist:
-/// RFC 9297 §5.2 registers 0x33 as a "Datagram or Capsule Protocol parse error",
-/// while RFC 9114 §4.1.2 wants H3_MESSAGE_ERROR (0x10e) for a message that is
-/// merely malformed. This capsule failed to parse — its declared length can
-/// never be a UDP datagram — whereas the truncated one parsed perfectly and just
-/// stopped early. Asserting the two side by side is what keeps the distinction
-/// from collapsing back into one code the next time this path is touched.
+/// The pair to [`a_truncated_capsule_is_rejected`] and
+/// [`a_datagram_capsule_without_a_context_id_is_a_malformed_message`], which
+/// RFC 9297 §3.3 makes malformed messages and which get H3_MESSAGE_ERROR
+/// (0x10e). Asserting them side by side keeps the codes from collapsing into
+/// one the next time this path is touched.
 #[tokio::test]
 async fn an_oversized_datagram_capsule_is_reset_as_a_parse_error() {
     use volto::capsule;
@@ -820,6 +819,46 @@ async fn an_oversized_datagram_capsule_is_reset_as_a_parse_error() {
     };
 
     assert_peer_reset(&error, H3_DATAGRAM_ERROR);
+}
+
+/// A DATAGRAM capsule whose value ends before its Context ID is a malformed
+/// message, and the stream is reset with H3_MESSAGE_ERROR.
+///
+/// RFC 9297 §3.3: "a Capsule payload that terminates before the end of the
+/// identified fields MUST be treated as it if were a malformed or incomplete
+/// message", and RFC 9114 §4.1.2: "Malformed requests or responses that are
+/// detected MUST be treated as a stream error of type H3_MESSAGE_ERROR."
+#[tokio::test]
+async fn a_datagram_capsule_without_a_context_id_is_a_malformed_message() {
+    use volto::capsule;
+
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (_, mut stream) = open_udp_session(&mut client, &server, target).await;
+
+    // Type DATAGRAM, length 0: the value holds no Context ID.
+    let mut wire = bytes::BytesMut::new();
+    datagram::put_varint(&mut wire, capsule::CAPSULE_TYPE_DATAGRAM);
+    datagram::put_varint(&mut wire, 0);
+    stream
+        .send_data(wire.freeze())
+        .await
+        .expect("send an empty DATAGRAM capsule");
+
+    let error = loop {
+        match tokio::time::timeout(TIMEOUT, stream.recv_data())
+            .await
+            .expect("the server responded")
+        {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("a malformed capsule must not read as a clean end of stream"),
+            Err(error) => break error,
+        }
+    };
+
+    assert_peer_reset(&error, H3_MESSAGE_ERROR);
 }
 
 /// The boundary of the size rule the session applies to what a client sends.

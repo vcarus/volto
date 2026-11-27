@@ -52,12 +52,16 @@ pub const MAX_DATAGRAM_CAPSULE_VALUE: u64 = 8 + varint::len_u64(MAX_UDP_PAYLOAD)
 
 /// Why a capsule sequence could not be decoded.
 ///
-/// The CONNECT-UDP tunnel answers each of these by resetting the stream with
+/// The CONNECT-UDP tunnel answers each of these by resetting the stream, and
+/// the variant decides the code. [`Error::MalformedDatagram`] draws
+/// `H3_MESSAGE_ERROR`: RFC 9297 §3.3 says "a Capsule payload that terminates
+/// before the end of the identified fields MUST be treated as it if were a
+/// malformed or incomplete message", and RFC 9114 §4.1.2 answers one with that
+/// code. [`Error::DatagramTooLarge`] is this crate's own bound and draws
 /// `H3_DATAGRAM_ERROR` (0x33), which RFC 9297 §5.2 registers for a "Datagram or
 /// Capsule Protocol parse error". A stream that ends part-way through a capsule
-/// is not one of these: every capsule on it parsed, and the tunnel learns of it
-/// from [`CapsuleDecoder::at_capsule_boundary`] and answers with
-/// `H3_MESSAGE_ERROR`.
+/// is not one of these: the tunnel learns of it from
+/// [`CapsuleDecoder::at_capsule_boundary`] and answers with `H3_MESSAGE_ERROR`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// A DATAGRAM capsule declared more bytes than a UDP payload can hold.
