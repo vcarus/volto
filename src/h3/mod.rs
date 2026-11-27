@@ -82,15 +82,9 @@ use error::Code;
 /// The unit is the size formula of RFC 9114 §4.2.2: name plus value plus 32
 /// bytes for each field.
 ///
-/// # What a section costs once it is decoded, and for how long
-///
-/// A section at this limit costs about 65 KiB once decoded, whichever way the
-/// peer spends the limit
-/// (`tests/it_bounds.rs::a_tunnel_holds_its_requests_field_section_for_its_whole_life`),
-/// and `crate::conn::handle_request` keeps it for the whole life of the tunnel
-/// it opened: about 16 MiB per connection and 4.1 GiB across a server at the
-/// shipped `max_targets_per_conn` and `max_connections`. D99 holds the ledger,
-/// with the refusal case, where the multiplier is `max_streams_bidi`.
+/// What a decoded section costs and how long a tunnel keeps it is in D99
+/// (`tests/it_bounds.rs::a_tunnel_holds_its_requests_field_section_for_its_whole_life`
+/// weighs it).
 pub const MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 
 /// Most encoded frame payload one connection may hold buffered at once, in
@@ -101,12 +95,8 @@ pub const MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 /// still open every request stream its transport parameters allow, announce a
 /// 64 KiB HEADERS frame on each and stop one byte short of finishing any of
 /// them. That breaks no rule on any single stream, and the frames must be held
-/// because they cannot be acted on piecewise. At the default `max_streams_bidi`
-/// of 1024 that would be 64 MiB of a connection's memory without this bound.
-/// D76 bounds how long one stream may wait; this bounds how much waiting costs.
-/// A CONNECT request carrying Basic credentials is under 300 bytes, so all 1024
-/// request streams could be mid-HEADERS at once and still use under 300 KiB,
-/// 29 percent of this.
+/// because they cannot be acted on piecewise. D76 bounds how long one stream
+/// may wait; this bounds how much waiting costs.
 ///
 /// What is counted is the announced length of the frames being buffered *at
 /// one moment*: sixteen concurrent field sections of the largest advertised
