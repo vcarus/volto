@@ -20,11 +20,11 @@ use std::time::Duration;
 /// The descriptors this process holds, if the platform will say.
 ///
 /// `/dev/fd` on macOS and `/proc/self/fd` on Linux are the same directory under
-/// two names: one entry per open descriptor of the calling process. Both CI
-/// platforms have one, so the assertion built on this is never skipped where it
-/// matters; anywhere else it returns `None` and the caller says so rather than
-/// passing quietly. Reading it needs a descriptor of its own, so it is only ever
-/// called with the budget intact.
+/// two names: one entry per open descriptor of the calling process. Linux CI
+/// and the macOS dev host both have one, so the assertion is never skipped
+/// where it is judged; anywhere else it returns `None` and the caller says so
+/// rather than passing quietly. Reading it needs a descriptor of its own, so it
+/// is only ever called with the budget intact.
 pub fn open_fds() -> Option<usize> {
     let listing = if cfg!(target_os = "macos") {
         "/dev/fd"
