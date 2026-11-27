@@ -29,7 +29,7 @@ use std::borrow::Cow;
 
 use volto::h3::error::Code;
 use volto::h3::qpack::{self, Field};
-use volto::h3::{MAX_FIELD_SECTION_SIZE, huffman, stream};
+use volto::h3::{MAX_FIELD_SECTION_SIZE, huffman, request};
 
 /// A field section: the `0x00 0x00` prefix of RFC 9204 §4.5.1, then `body`.
 fn section(body: &[u8]) -> Vec<u8> {
@@ -131,7 +131,7 @@ fn an_empty_field_section_decodes_to_no_fields() {
 //# CONNECT request; see Section 4.4.
 #[test]
 fn an_empty_field_section_is_a_malformed_request() {
-    let error = stream::build_request(Vec::new()).expect_err("malformed");
+    let error = request::build_request(Vec::new()).expect_err("malformed");
     assert_eq!(error.code(), Code::H3_MESSAGE_ERROR);
     assert!(!error.is_connection_error(), "{error}");
 }
@@ -170,7 +170,7 @@ fn a_field_line_with_an_empty_name_is_refused_as_a_request() {
     assert_eq!(fields.len(), 3, "the decoder reads all three field lines");
     assert_eq!(fields[2], field(b"", b"abc"));
 
-    let error = stream::build_request(fields).expect_err("malformed");
+    let error = request::build_request(fields).expect_err("malformed");
     assert_eq!(error.code(), Code::H3_MESSAGE_ERROR);
     assert!(!error.is_connection_error(), "{error}");
 
@@ -179,7 +179,7 @@ fn a_field_line_with_an_empty_name_is_refused_as_a_request() {
     one_character.extend_from_slice(&[0x21, b'x', 0x03, b'a', b'b', b'c']);
     let fields = decode(&section(&one_character));
     assert_eq!(fields[2], field(b"x", b"abc"));
-    stream::build_request(fields).expect("a one-character name is a token");
+    request::build_request(fields).expect("a one-character name is a token");
 }
 
 /// The same integer spelled at length decodes to the same value.

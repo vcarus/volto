@@ -39,7 +39,7 @@ use super::error::{Code, StreamError, Violation};
 use super::frame::{self, Frame, FrameReader, Item};
 use super::message::{Fields, Request, Status};
 use super::qpack;
-pub use super::request::build_request;
+use super::request::build_request;
 use super::{MAX_FIELD_SECTION_SIZE, varint};
 use crate::varint::VARINT_MAX_LEN;
 

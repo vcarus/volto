@@ -22,7 +22,7 @@
 //!   frame properties below therefore write the same bytes twice -- once whole,
 //!   once split at generated points -- and compare.
 //! * **The pure functions, called directly.** `frame::FrameDecoder` and
-//!   `stream::build_request` are `pub` so that the properties can feed the
+//!   `request::build_request` are `pub` so that the properties can feed the
 //!   decoder a chosen chunk sequence on a chosen `StreamKind`, and hand the
 //!   request validator a field section built pseudo-header by pseudo-header.
 //!   Reaching either through a live connection costs exactly what a property
@@ -69,7 +69,7 @@ use volto::h3::error::Code;
 use volto::h3::frame::{self, BufferBudget, Frame, FrameDecoder, FrameReader, Item, StreamKind};
 use volto::h3::message::{self, FieldValue, Fields, Method, Request, Status};
 use volto::h3::qpack::{self, Field};
-use volto::h3::stream::build_request;
+use volto::h3::request::build_request;
 use volto::h3::{MAX_FIELD_SECTION_SIZE, huffman};
 use volto::varint::{self, VARINT_MAX};
 
@@ -2202,7 +2202,7 @@ proptest! {
 // Request validation
 // ---------------------------------------------------------------------------
 //
-// `stream::build_request` turns a decoded field section into a `Request` or says
+// `request::build_request` turns a decoded field section into a `Request` or says
 // why it cannot, and it is where RFC 9114 §4.1.2's "malformed" verdict is
 // reached. It takes a `Vec<qpack::Field>` and returns, so a property can put an
 // arbitrary *combination* of pseudo-headers through it -- which is what the

@@ -24,7 +24,7 @@
 //!   serves what the peer sends outside its request streams.
 //! * `control`: the peer's unidirectional streams: the control stream's rules
 //!   and the QPACK stream checks.
-//! * [`router`]: inbound HTTP Datagram routing (RFC 9297), and the hold for
+//! * `router`: inbound HTTP Datagram routing (RFC 9297), and the hold for
 //!   datagrams that arrive before their session.
 //! * [`request`]: a decoded field section checked and turned into a request.
 //! * [`stream`]: one request stream, from its HEADERS to its last byte.
@@ -57,7 +57,7 @@ pub mod huffman;
 pub mod message;
 pub mod qpack;
 pub mod request;
-pub mod router;
+mod router;
 pub mod settings;
 pub mod stream;
 

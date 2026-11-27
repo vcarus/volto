@@ -13,7 +13,7 @@ Each target does more than "does not crash": where an encoder exists, odd-number
 | `huffman` | `h3::huffman` — RFC 7541 Appendix B decoding | a Huffman-coded QPACK string literal |
 | `capsule` | `capsule` — the RFC 9297 §3 incremental capsule stream | the body of a CONNECT-UDP stream |
 | `datagram` | `datagram` — Quarter Stream ID and Context ID varints (RFC 9297 §2.1) | a QUIC datagram |
-| `request` | `h3::stream::build_request` and the `h3::message` syntax rules under it — RFC 9114 §4.1.2's malformed verdict | a decoded field section |
+| `request` | `h3::request::build_request` and the `h3::message` syntax rules under it — RFC 9114 §4.1.2's malformed verdict | a decoded field section |
 | `authority` | `tunnel::tcp::split_authority` and `tunnel::udp::parse_target` — the two routes a client names a target by | `:authority`, or the RFC 9298 §2 URI template in `:path` |
 | `auth` | `auth` — the RFC 7617 scheme split, the base64 decoder it owns, the user-id/password split, and the `logfmt` bound on what reaches the journal | `Proxy-Authorization` / `Authorization`, from a peer that has not authenticated |
 | `gate` | `gate` — the D106 SNI gate: the QUIC v1 long header, the Initial packet protection under the keys the datagram's own Destination Connection ID derives, the frame walk that assembles the offset-0 CRYPTO stream, and the ClientHello reader that pulls `server_name` out of it | any UDP datagram that arrives at the port, judged before quinn sees it and before a handshake has begun |

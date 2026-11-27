@@ -35,7 +35,7 @@ use std::borrow::Cow;
 use libfuzzer_sys::fuzz_target;
 use volto::h3::message::{field_name, token, FieldValue, Method, Request};
 use volto::h3::qpack::{self, Field};
-use volto::h3::stream::build_request;
+use volto::h3::request::build_request;
 use volto::h3::MAX_FIELD_SECTION_SIZE;
 
 /// Names worth spelling exactly: the five pseudo-headers of RFC 9114 §4.3, the
