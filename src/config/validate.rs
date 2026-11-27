@@ -775,32 +775,6 @@ mod tests {
         assert_valid_apart_from_certs(&cfg, "a user-id exactly at the log bound");
     }
 
-    #[test]
-    fn a_zero_or_oversized_target_quota_is_rejected() {
-        for value in ["0", "70000"] {
-            rejected(
-                &format!("[limits]\nmax_targets_per_conn = {value}"),
-                "max_targets_per_conn",
-            );
-        }
-
-        // The ceiling is a sanity limit rather than a protocol one, so the value
-        // at it is still a quota the operator meant: only what is past it is
-        // read as a typo.
-        let cfg = parse(&format!(
-            "[limits]\nmax_targets_per_conn = {MAX_TARGETS_PER_CONN_CEILING}"
-        ));
-        assert_valid_apart_from_certs(&cfg, "a quota of exactly the ceiling");
-
-        rejected(
-            &format!(
-                "[limits]\nmax_targets_per_conn = {}",
-                MAX_TARGETS_PER_CONN_CEILING + 1
-            ),
-            "max_targets_per_conn",
-        );
-    }
-
     /// Zero disables the connect budget rather than meaning "give up at once",
     /// which is the same shape `keep_alive_interval = 0` has.
     #[test]
@@ -857,43 +831,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_initial_mtu_below_the_quic_floor_is_rejected() {
-        for value in [0, 1, 576, 1199] {
-            let msg = rejected(&format!("[limits]\ninitial_mtu = {value}"), "initial_mtu");
-            assert!(msg.contains("1200"), "the floor must be named: {msg}");
-        }
-
-        // The floor itself, and the range above it up to the ceiling.
-        for value in [1200, 1350, MAX_INITIAL_MTU] {
-            let cfg = parse(&format!("[limits]\ninitial_mtu = {value}"));
-            assert_valid_apart_from_certs(&cfg, &format!("initial_mtu = {value}"));
-        }
-    }
-
-    /// The other end of the same range, and the dangerous one.
-    ///
-    /// Below the floor quinn silently clamps up, so the worst a missing check
-    /// costs is a value that is not the one configured. Above the ceiling there
-    /// is no clamp at all: the handshake goes out in packets no path delivers,
-    /// the black-hole detector never runs because no connection is ever
-    /// established, and a reload makes that the state of a server that was
-    /// working a moment ago.
-    ///
-    /// 1453 is the first rejected value and 1500 is in the list because it is
-    /// the number the mistake reaches for: `initial_mtu` is a UDP payload size,
-    /// so an Ethernet frame's 1500 bytes is an IP packet, not a payload.
-    #[test]
-    fn an_initial_mtu_above_the_ethernet_ceiling_is_rejected() {
-        for value in [MAX_INITIAL_MTU + 1, 1500, 9000, u16::MAX] {
-            let msg = rejected(&format!("[limits]\ninitial_mtu = {value}"), "initial_mtu");
-            assert!(
-                msg.contains(&MAX_INITIAL_MTU.to_string()),
-                "the ceiling must be named: {msg}"
-            );
-        }
-    }
-
     /// A ceiling below the start describes a search that cannot happen, and the
     /// operator meant *something*, so the mistake is reported rather than
     /// silently reduced to "no discovery". Equal is fine: it pins the search's
@@ -943,122 +880,6 @@ mod tests {
             "mtu_upper_bound",
         );
         assert!(msg.contains("initial_mtu"), "{msg}");
-    }
-
-    /// 1500 is in the list for the same reason as in the `initial_mtu` test:
-    /// the value is a UDP payload size, and an Ethernet frame's 1500 bytes is
-    /// an IP packet, not a payload.
-    #[test]
-    fn an_mtu_upper_bound_above_the_ipv4_ethernet_ceiling_is_rejected() {
-        for value in [MAX_MTU_UPPER_BOUND + 1, 1500, 9000, u16::MAX] {
-            let msg = rejected(
-                &format!("[limits]\nmtu_upper_bound = {value}"),
-                "mtu_upper_bound",
-            );
-            assert!(
-                msg.contains(&MAX_MTU_UPPER_BOUND.to_string()),
-                "the ceiling must be named: {msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_initial_rtt_outside_the_sane_range_is_rejected() {
-        for value in [0, 9, 10_001] {
-            rejected(
-                &format!("[limits]\ninitial_rtt_ms = {value}"),
-                "initial_rtt_ms",
-            );
-        }
-
-        // Both ends of the range, the default, and a tuned long-haul value.
-        for value in [10, 150, 333, 10_000] {
-            let cfg = parse(&format!("[limits]\ninitial_rtt_ms = {value}"));
-            assert_valid_apart_from_certs(&cfg, &format!("initial_rtt_ms = {value}"));
-        }
-    }
-
-    #[test]
-    fn a_zero_stream_limit_or_idle_timeout_is_rejected() {
-        for (body, field) in [
-            ("[limits]\nmax_streams_bidi = 0", "max_streams_bidi"),
-            ("[limits]\nmax_idle_timeout = 0", "max_idle_timeout"),
-            ("[limits]\nmax_idle_timeout = 4000", "max_idle_timeout"),
-        ] {
-            rejected(body, field);
-        }
-
-        // The ceiling is a legal idle timeout, and the default keep-alive stays
-        // well under half of it, so nothing else in the config objects to it.
-        let cfg = parse(&format!(
-            "[limits]\nmax_idle_timeout = {MAX_IDLE_TIMEOUT_CEILING}"
-        ));
-        assert_valid_apart_from_certs(&cfg, "an idle timeout of exactly the ceiling");
-
-        rejected(
-            &format!(
-                "[limits]\nmax_idle_timeout = {}",
-                MAX_IDLE_TIMEOUT_CEILING + 1
-            ),
-            "max_idle_timeout",
-        );
-    }
-
-    /// The stream credit is work per handshake, so it has a ceiling (D86).
-    ///
-    /// An operator writing a large number here is not raising a limit but
-    /// adding work to every connection; `MAX_STREAMS_BIDI_CEILING` gives the
-    /// cost.
-    #[test]
-    fn a_stream_limit_past_the_ceiling_is_rejected() {
-        for streams in [u32::MAX, MAX_STREAMS_BIDI_CEILING + 1] {
-            rejected(
-                &format!("[limits]\nmax_streams_bidi = {streams}"),
-                "max_streams_bidi",
-            );
-        }
-
-        let cfg = parse(&format!(
-            "[limits]\nmax_streams_bidi = {MAX_STREAMS_BIDI_CEILING}"
-        ));
-        assert_valid_apart_from_certs(&cfg, "a stream limit of exactly the ceiling");
-    }
-
-    /// The two application timers share the transport timeout's ceiling: both
-    /// are added to `Instant::now()` to make deadlines, so an unbounded `u64`
-    /// of seconds would panic that arithmetic instead of meaning anything.
-    #[test]
-    fn the_session_and_connect_timers_share_the_ceiling() {
-        for (body, field) in [
-            (
-                format!(
-                    "[limits]\nudp_session_timeout = {}",
-                    MAX_IDLE_TIMEOUT_CEILING + 1
-                ),
-                "udp_session_timeout",
-            ),
-            (
-                format!(
-                    "[limits]\nconnect_timeout = {}",
-                    MAX_IDLE_TIMEOUT_CEILING + 1
-                ),
-                "connect_timeout",
-            ),
-            // The panic the ceiling exists to keep unreachable.
-            (
-                "[limits]\nudp_session_timeout = 9300000000000000000".to_string(),
-                "udp_session_timeout",
-            ),
-        ] {
-            rejected(&body, field);
-        }
-
-        // The ceiling itself is legal for both.
-        let cfg = parse(&format!(
-            "[limits]\nudp_session_timeout = {MAX_IDLE_TIMEOUT_CEILING}\n\
-             connect_timeout = {MAX_IDLE_TIMEOUT_CEILING}"
-        ));
-        assert_valid_apart_from_certs(&cfg, "both timers at exactly the ceiling");
     }
 
     /// The positive half of D86: the largest legal configuration is one every
@@ -1124,21 +945,12 @@ mod tests {
         );
     }
 
-    /// The drain period is a bound, so it has to stay one (D86).
-    ///
-    /// Unlike the timers above, an absurd grace period does not panic anything;
-    /// it removes the bound silently, as `MAX_SHUTDOWN_GRACE` describes.
+    /// Both ends of the grace range are read as that many seconds: zero closes
+    /// everything at once, and the ceiling is a legal drain.
     #[test]
-    fn an_unbounded_shutdown_grace_is_rejected() {
-        for grace in [u64::MAX, MAX_SHUTDOWN_GRACE + 1] {
-            rejected(&format!("shutdown_grace = {grace}"), "shutdown_grace");
-        }
-
-        // Both ends of the accepted range stay accepted: zero closes everything
-        // at once, and the ceiling itself is a legal drain.
+    fn the_shutdown_grace_is_read_as_seconds() {
         for grace in [0, MAX_SHUTDOWN_GRACE] {
             let cfg = parse(&format!("shutdown_grace = {grace}"));
-            assert_valid_apart_from_certs(&cfg, &format!("shutdown_grace = {grace}"));
             assert_eq!(
                 cfg.server.shutdown_grace(),
                 std::time::Duration::from_secs(grace)
@@ -1270,103 +1082,162 @@ mod tests {
         );
     }
 
-    /// A socket buffer above the socket API's limit is refused, and the
-    /// boundary is accepted.
-    ///
-    /// See `MAX_SOCKET_BUFFER`.
-    #[test]
-    fn socket_buffer_sizes_above_the_32_bit_api_limit_are_rejected() {
-        for key in ["socket_recv_buffer", "socket_send_buffer"] {
-            let message = rejected(&format!("[limits]\n{key} = 2147483648"), key);
-            assert!(message.contains("2147483648"), "{message}");
-            assert!(
-                message.contains("2147483647"),
-                "the refusal must name the API limit: {message}"
-            );
-        }
-
-        // The largest value the API accepts is legal.
-        for key in ["socket_recv_buffer", "socket_send_buffer"] {
-            let cfg = parse(&format!("[limits]\n{key} = 2147483647"));
-            assert_valid_apart_from_certs(&cfg, key);
-        }
-    }
-
     /// Every range in the configuration, end by end: each end is accepted, the
     /// integer past it is refused in the one shared wording, naming the key and
-    /// both ends.
+    /// both ends. Each row also names values inside the range that must load,
+    /// and values far outside it that must be refused the same way.
     ///
     /// The ranges are written out here rather than read from the table in
     /// `validate_limits`, so a row that moved is caught rather than followed.
     #[test]
     fn every_range_accepts_its_ends_and_refuses_one_past_each() {
+        /// One range, as the file sees it.
+        struct Range {
+            table: &'static str,
+            key: &'static str,
+            low: u64,
+            high: u64,
+            /// Values inside the range, besides its ends.
+            inside: &'static [u64],
+            /// Values outside the range, besides one past each end.
+            outside: &'static [u64],
+            /// A line the lower end needs.
+            companion: &'static str,
+        }
+
         let ceiling = MAX_IDLE_TIMEOUT_CEILING;
         let buffer = u64::try_from(MAX_SOCKET_BUFFER).expect("fits");
-        // (table, key, lower end, upper end, a line the lower end needs)
-        let ranges: [(&str, &str, u64, u64, &str); 11] = [
-            ("[server]", "shutdown_grace", 0, MAX_SHUTDOWN_GRACE, ""),
-            ("[limits]", "udp_session_timeout", 1, ceiling, ""),
-            ("[limits]", "connect_timeout", 0, ceiling, ""),
-            (
-                "[limits]",
-                "max_targets_per_conn",
-                1,
-                MAX_TARGETS_PER_CONN_CEILING.into(),
-                "",
-            ),
-            (
-                "[limits]",
-                "max_streams_bidi",
-                1,
-                MAX_STREAMS_BIDI_CEILING.into(),
-                "",
-            ),
+        let ranges = [
+            Range {
+                table: "[server]",
+                key: "shutdown_grace",
+                low: 0,
+                high: MAX_SHUTDOWN_GRACE,
+                inside: &[],
+                // An absurd grace removes the bound on the drain without a panic.
+                outside: &[u64::MAX],
+                companion: "",
+            },
+            Range {
+                table: "[limits]",
+                key: "udp_session_timeout",
+                low: 1,
+                high: ceiling,
+                inside: &[],
+                // The `Instant` addition the ceiling keeps from panicking.
+                outside: &[9_300_000_000_000_000_000],
+                companion: "",
+            },
+            Range {
+                table: "[limits]",
+                key: "connect_timeout",
+                low: 0,
+                high: ceiling,
+                inside: &[],
+                outside: &[],
+                companion: "",
+            },
+            Range {
+                table: "[limits]",
+                key: "max_targets_per_conn",
+                low: 1,
+                high: MAX_TARGETS_PER_CONN_CEILING.into(),
+                inside: &[],
+                outside: &[70_000],
+                companion: "",
+            },
+            // The credit is paid in one go by a connection's first
+            // authenticated request (D86).
+            Range {
+                table: "[limits]",
+                key: "max_streams_bidi",
+                low: 1,
+                high: MAX_STREAMS_BIDI_CEILING.into(),
+                inside: &[],
+                outside: &[4_294_967_295],
+                companion: "",
+            },
             // An idle timeout of 1 leaves room for no keep-alive but none.
-            (
-                "[limits]",
-                "max_idle_timeout",
-                1,
-                ceiling,
-                "keep_alive_interval = 0",
-            ),
-            (
-                "[limits]",
-                "initial_mtu",
-                MIN_INITIAL_MTU.into(),
-                MAX_INITIAL_MTU.into(),
-                "",
-            ),
+            Range {
+                table: "[limits]",
+                key: "max_idle_timeout",
+                low: 1,
+                high: ceiling,
+                inside: &[],
+                outside: &[4000],
+                companion: "keep_alive_interval = 0",
+            },
+            // 1500 is the number the mistake reaches for: an Ethernet frame's
+            // 1500 bytes is an IP packet, and this is a UDP payload size.
+            Range {
+                table: "[limits]",
+                key: "initial_mtu",
+                low: MIN_INITIAL_MTU.into(),
+                high: MAX_INITIAL_MTU.into(),
+                inside: &[1350],
+                outside: &[0, 1, 576, 1500, 9000, 65_535],
+                companion: "",
+            },
             // The lower end is the default `initial_mtu`.
-            (
-                "[limits]",
-                "mtu_upper_bound",
-                crate::config::DEFAULT_INITIAL_MTU.into(),
-                MAX_MTU_UPPER_BOUND.into(),
-                "",
-            ),
-            (
-                "[limits]",
-                "initial_rtt_ms",
-                *INITIAL_RTT_RANGE_MS.start(),
-                *INITIAL_RTT_RANGE_MS.end(),
-                "",
-            ),
-            ("[limits]", "socket_recv_buffer", 0, buffer, ""),
-            ("[limits]", "socket_send_buffer", 0, buffer, ""),
+            Range {
+                table: "[limits]",
+                key: "mtu_upper_bound",
+                low: crate::config::DEFAULT_INITIAL_MTU.into(),
+                high: MAX_MTU_UPPER_BOUND.into(),
+                inside: &[],
+                outside: &[1500, 9000, 65_535],
+                companion: "",
+            },
+            // The default and a tuned long-haul value load.
+            Range {
+                table: "[limits]",
+                key: "initial_rtt_ms",
+                low: *INITIAL_RTT_RANGE_MS.start(),
+                high: *INITIAL_RTT_RANGE_MS.end(),
+                inside: &[150, 333],
+                outside: &[0],
+                companion: "",
+            },
+            Range {
+                table: "[limits]",
+                key: "socket_recv_buffer",
+                low: 0,
+                high: buffer,
+                inside: &[],
+                outside: &[],
+                companion: "",
+            },
+            Range {
+                table: "[limits]",
+                key: "socket_send_buffer",
+                low: 0,
+                high: buffer,
+                inside: &[],
+                outside: &[],
+                companion: "",
+            },
         ];
 
-        for (table, key, low, high, companion) in ranges {
+        for range in ranges {
+            let Range {
+                table,
+                key,
+                low,
+                high,
+                ..
+            } = range;
             // `parse` opens the body inside `[server]`, so a `[server]` key
-            // goes in bare.
+            // goes in bare. The companion goes with the lower end and below.
             let body = |value: u64| {
                 let header = if table == "[server]" { "" } else { table };
+                let companion = if value <= low { range.companion } else { "" };
                 format!("{header}\n{key} = {value}\n{companion}")
             };
-            for value in [low, high] {
+            for &value in [low, high].iter().chain(range.inside) {
                 assert_valid_apart_from_certs(&parse(&body(value)), &body(value));
             }
             let past = low.checked_sub(1).into_iter().chain([high + 1]);
-            for value in past {
+            for value in past.chain(range.outside.iter().copied()) {
                 let message = rejected(&body(value), key);
                 let section = &table[1..table.len() - 1];
                 assert!(

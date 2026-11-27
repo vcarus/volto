@@ -1400,7 +1400,7 @@ pub(crate) mod tests {
     /// so it has to survive parsing untouched; every other value is judged by the
     /// kernel at bind time and reported as a startup warning if it was capped.
     /// The one range check, the 32-bit ceiling of the socket API, is tested by
-    /// `socket_buffer_sizes_above_the_32_bit_api_limit_are_rejected` in
+    /// `every_range_accepts_its_ends_and_refuses_one_past_each` in
     /// `validate.rs`.
     #[test]
     fn socket_buffer_sizes_parse_and_zero_is_accepted() {
