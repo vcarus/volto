@@ -203,6 +203,21 @@ class ProxyClient(QuicConnectionProtocol):
         assert context_id == 0, f"context id {context_id} on a proxied payload"
         return event.data[buffer.tell() :]
 
+    async def datagrams_after(self, stream_id, wait=0.3):
+        """Waits, then takes the datagrams queued for a session meanwhile.
+
+        For a check that something did not arrive: wait bounds how long it
+        could still take on loopback.
+        """
+        await asyncio.sleep(wait)
+        queued = self._queue(stream_id)
+        datagrams = []
+        while not queued.empty():
+            event = queued.get_nowait()
+            if isinstance(event, DatagramReceived):
+                datagrams.append(event.data)
+        return datagrams
+
 
 def proxy_connection():
     """An async context manager holding one connection to the server under test."""
@@ -424,6 +439,10 @@ async def test_unknown_context_id_is_dropped_silently():
                 f"{reply!r} != {want!r} (the context-7 datagram must be "
                 "dropped, not forwarded or answered)"
             )
+            # The context-7 payload is not merely ordered after the other one:
+            # nothing else comes back at all.
+            later = await client.datagrams_after(stream_id)
+            assert not later, f"the context-7 datagram was answered: {later!r}"
     finally:
         transport.close()
 
@@ -463,13 +482,7 @@ async def test_datagram_before_its_request_is_delivered():
             )
 
             # Delivered once: no second copy arrives for the session.
-            await asyncio.sleep(0.3)
-            queued = client._queue(stream_id)
-            repeats = []
-            while not queued.empty():
-                event = queued.get_nowait()
-                if isinstance(event, DatagramReceived):
-                    repeats.append(event.data)
+            repeats = await client.datagrams_after(stream_id)
             assert not repeats, f"the held datagram was delivered again: {repeats!r}"
     finally:
         transport.close()
