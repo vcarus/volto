@@ -17,52 +17,31 @@
 //!
 //! * `section <hex>` — decode `<hex>` as a QPACK encoded field section
 //!   (RFC 9204 §4.5), prefix included.
-//! * `huffman <hex>` — decode `<hex>` as a Huffman-coded string literal
-//!   (RFC 7541 §5.2). Reached through [`volto::h3::huffman`] directly, so a
-//!   padding rule can be exercised without a field section around it.
 //! * `encode <namehex>=<valuehex>[,<namehex>=<valuehex>]...` — encode those
 //!   fields as a field section. `encode` alone is the empty section.
 //!
 //! Verdicts, one per line:
 //!
 //! * `ok <namehex>=<valuehex> ...` for an accepted field section (an empty
-//!   section is a bare `ok`), `ok <hex>` for `huffman` and `encode`.
+//!   section is a bare `ok`), `ok <hex>` for `encode`.
 //! * `err <connection|stream> <CODE> <detail>` for a rejected input, where
 //!   `CODE` is the RFC 9114 §8.1 name this server answers with.
 //! * `bad <detail>` for a malformed request line, which is the driver's fault
 //!   rather than a verdict about the input.
 //!
-//! The first argument, if given, is the `SETTINGS_MAX_FIELD_SECTION_SIZE` to
-//! decode against. It defaults to `u64::MAX` rather than this server's
-//! advertised limit, because that limit is a local policy rather than a rule of
-//! RFC 9204: leaving it out of the way keeps every disagreement the driver sees
-//! a disagreement about the encoding. An argument that does not parse is named
-//! on standard error and exits 2, since it is not the same thing as no argument
-//! at all.
+//! A section is decoded with no `SETTINGS_MAX_FIELD_SECTION_SIZE`, not against
+//! this server's advertised limit, because that limit is a local policy rather
+//! than a rule of RFC 9204: leaving it out of the way keeps every disagreement
+//! the driver sees a disagreement about the encoding.
 
 use std::fmt::Write as _;
 use std::io::{self, BufRead, BufWriter, Write as _};
 
 use bytes::BytesMut;
 use volto::h3::error::Violation;
-use volto::h3::{huffman, qpack};
+use volto::h3::qpack;
 
 fn main() -> io::Result<()> {
-    let max_section_size = match std::env::args().nth(1) {
-        // A mistyped limit used to become `u64::MAX`, which is the same as
-        // leaving the argument out: a campaign meant to run against a small
-        // budget would have run against no budget, and every size-limit
-        // disagreement would have vanished without a word.
-        Some(arg) => match arg.parse() {
-            Ok(size) => size,
-            Err(error) => {
-                eprintln!("{arg:?} is not a SETTINGS_MAX_FIELD_SECTION_SIZE: {error}");
-                std::process::exit(2);
-            }
-        },
-        None => u64::MAX,
-    };
-
     let input = io::stdin().lock();
     let mut output = BufWriter::new(io::stdout().lock());
 
@@ -76,7 +55,7 @@ fn main() -> io::Result<()> {
         let (verb, rest) = line.split_once(' ').unwrap_or((line, ""));
         let verdict = match verb {
             "section" => match unhex(rest) {
-                Some(block) => match qpack::decode(&block, max_section_size) {
+                Some(block) => match qpack::decode(&block, u64::MAX) {
                     Ok(fields) => {
                         let mut line = String::from("ok");
                         for field in fields {
@@ -87,13 +66,6 @@ fn main() -> io::Result<()> {
                     Err(violation) => rejected(&violation),
                 },
                 None => "bad the section is not hexadecimal".to_owned(),
-            },
-            "huffman" => match unhex(rest) {
-                Some(literal) => match huffman::decode(&literal) {
-                    Ok(decoded) => format!("ok {}", hex(&decoded)),
-                    Err(violation) => rejected(&violation),
-                },
-                None => "bad the literal is not hexadecimal".to_owned(),
             },
             "encode" => match fields(rest) {
                 Some(fields) => {
