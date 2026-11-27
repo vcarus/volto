@@ -2054,3 +2054,22 @@ pub fn connect_until_accepted<'a>(
         }
     }
 }
+
+/// The names of the fields on a formatted log line, in the order they appear.
+///
+/// A field is `name=` at the start of the line or after whitespace, the rule
+/// [`field_text`] finds one by, with a name of lowercase letters, digits and
+/// underscores. A value written with `%` is not quoted, so a `word=` inside
+/// such a value is read as a field too, and a comparison of two lines reports
+/// it as a difference.
+pub fn field_names(line: &str) -> Vec<&str> {
+    line.split_whitespace()
+        .filter_map(|word| word.split_once('=').map(|(name, _)| name))
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        })
+        .collect()
+}

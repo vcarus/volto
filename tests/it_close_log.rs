@@ -17,7 +17,7 @@ mod common;
 use common::rawstream::{STREAM_PUSH, open_uni_stream};
 use common::{
     ALLOW_PRIVATE, H3Client, IMPATIENT, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer,
-    closed_address, connect_quic, connect_request, echoes, field_text, numeric_field,
+    closed_address, connect_quic, connect_request, echoes, field_names, field_text, numeric_field,
     open_tcp_tunnel, open_udp_session, recv_datagram, respond_to, send_udp_payload,
     spawn_echo_target, spawn_udp_echo_target,
 };
@@ -419,6 +419,7 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         // values depend on what the scenario did — scenario 2 is where they are
         // checked against real traffic — but every close line owes them.
         for field in [
+            "remote=",
             "tunnels=",
             "dropped_datagrams=",
             "tx_bytes=",
@@ -462,6 +463,23 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         assert!(
             !line.contains("Timeout"),
             "an idle timeout must never reach a warning; line was:\n{line}"
+        );
+    }
+
+    // The two statements of `log_connection_closed` each spell their fields
+    // out, so this is what holds them equal: the WARN line carries the INFO
+    // line's fields in the same order, with `error` where the INFO line has
+    // `reason`.
+    let reference: Vec<&str> = field_names(closes[0])
+        .into_iter()
+        .map(|name| if name == "reason" { "error" } else { name })
+        .collect();
+    for line in &warnings {
+        assert_eq!(
+            field_names(line),
+            reference,
+            "a WARN close line must carry the INFO line's fields; lines were:\n{}\n{line}",
+            closes[0]
         );
     }
 }

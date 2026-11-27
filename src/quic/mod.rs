@@ -973,7 +973,7 @@ impl CloseReason {
 /// Each statement spells its field list out, because `it_log_lines` reads log
 /// statements out of the source text and does not see through a wrapper. So a
 /// field added to one list has to be added to the other by hand. `it_close_log`
-/// requires every field on the INFO line.
+/// fails unless the WARN line carries the INFO line's fields in the same order.
 ///
 /// `closed` is graded from the error *value* rather than from
 /// `Connection::close_reason()`, for the reason [`graded`] gives.
