@@ -244,12 +244,6 @@ impl AuthGate {
 /// tests open a connection with the transport parameters and downcast the
 /// controller it runs.
 ///
-/// BBR by default. A loss-based controller (CUBIC, NewReno) reads the
-/// non-congestive packet loss of a long international path as congestion and
-/// keeps the window from opening. BBR models bandwidth and RTT instead. See
-/// `config::CongestionControl` for why this is the default and stays
-/// configurable.
-///
 /// `bbr` builds volto's own controller of [`crate::congestion`] (D108).
 fn congestion_factory(
     cc: CongestionControl,
@@ -288,7 +282,7 @@ fn congestion_factory(
 pub const CONNECTION_RECEIVE_WINDOW: VarInt = VarInt::from_u32(16 * 1024 * 1024);
 
 /// Aggregate flow-control window a connection is accepted with, in bytes,
-/// until a request on it authenticates (R6-M1, D99).
+/// until a request on it authenticates (D99).
 ///
 /// What it bounds. quinn counts against this window the highest offset
 /// received on each stream, minus what has been read, so bytes past a
@@ -298,8 +292,7 @@ pub const CONNECTION_RECEIVE_WINDOW: VarInt = VarInt::from_u32(16 * 1024 * 1024)
 /// ([`MAX_PEER_UNI_STREAMS`]) of the 2 MiB [`STREAM_RECEIVE_WINDOW`], 64 MiB
 /// of per-stream credit, so this window is what binds. Across the server it is
 /// 1 MiB times `max_connections`, 256 MiB at the default 256, beside the
-/// 320 MB of `DATAGRAM_RECEIVE_BUFFER`; with the full window from the
-/// handshake it was 4 GiB. DATAGRAM frames do not count against it, and
+/// 320 MB of `DATAGRAM_RECEIVE_BUFFER`. DATAGRAM frames do not count against it, and
 /// neither do CRYPTO frames: quinn holds those in their own buffers, the two
 /// pinned below.
 ///
@@ -354,8 +347,8 @@ pub const STREAM_RECEIVE_WINDOW: VarInt = VarInt::from_u32(2 * 1024 * 1024);
 
 /// quinn's own default per-stream receive window, in bytes.
 ///
-/// Not a value this server uses — [`STREAM_RECEIVE_WINDOW`] is what reaches the
-/// wire — but the number the reasoning there is written against, so it is stated
+/// Not a value this server uses, [`STREAM_RECEIVE_WINDOW`] is what reaches the
+/// wire, but the number the reasoning there is written against, so it is stated
 /// once and checked by `quinn_has_not_moved_the_defaults_we_quote` rather than
 /// left as a claim in prose that a dependency bump could quietly falsify.
 #[cfg(test)]
@@ -374,17 +367,10 @@ const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 /// `tunnel/tcp.rs` is shaped to hold at 1.33x for reads of 16 KiB or more, and
 /// within the bounds by read size listed on `RELAY_BLOCK_SIZE` below that; see
 /// D47.
-/// 10 MB over the ~90 ms path RTT is about 889 Mbps against a measured peak of
-/// 177 Mbps, so it is nowhere near a throughput constraint.
 ///
 /// Set to exactly what quinn already defaults to, so it changes nothing on the
-/// wire. It is pinned rather than inherited because upstream derives that
-/// default from `STREAM_RWND`, a private constant inside quinn's
-/// `TransportConfig::default` with no stability guarantee, while the arithmetic
-/// above is quoted against it. Dependabot proposes cargo bumps weekly; a patch
-/// release that moved that constant would leave the documented numbers quietly
-/// false. Setting the value here makes them true by construction instead of by
-/// inheritance.
+/// wire. Pinned rather than inherited: quinn derives the default from a private
+/// constant, and the arithmetic above is quoted against it.
 ///
 /// Note the asymmetry it leaves: 16 MiB of inbound credit granted against a
 /// 10 MB outbound cap, on a proxy whose traffic is mostly outbound. That is an
@@ -425,7 +411,7 @@ const _: () = assert!(
 /// buffers whatever the peer sends, `serve_peer` drains the queue, and before
 /// authentication every datagram in it is routed to the `Unroutable` drop
 /// because the session table is empty, apart from the few the connection holds
-/// for a session about to claim them (`h3::connection::EARLY_DATAGRAMS`, about
+/// for a session about to claim them (`h3::router::EARLY_DATAGRAMS`, about
 /// 11.5 KiB). It is larger than the 1 MiB
 /// [`INITIAL_CONNECTION_RECEIVE_WINDOW`] beside it, and is still pinned rather
 /// than lowered: the HTTP/3 router drains it as it fills, so it holds what
@@ -458,19 +444,9 @@ const CRYPTO_BUFFER_SIZE: usize = 16 * 1024;
 /// declared lost. It is sent again although it arrived, and the congestion
 /// controller is told of a loss that did not happen.
 ///
-/// Measured on one production path in November 2026, with a capture at the
-/// client beside the server's counters: 2 to 3.5 percent of the packets of a
-/// bulk download arrived after a packet with a higher number, 4 to 6 ms late
-/// at the median, and 98 to 99 percent of them were 3 or more numbers behind. With
-/// quinn's defaults the server declared 94 to 98 percent of those packets
-/// lost, which was between a quarter and seven tenths of everything it counted
-/// as lost.
-/// The packets left the server in order; the path reordered them. With the
-/// two constants here the server declared 13 to 28 percent of them lost, the
-/// share of packets that really did not arrive was unchanged, and of two
-/// connections sharing that path at the same time the one with these values
-/// carried 16 percent more than the one with quinn's defaults, in five pairs
-/// of five.
+/// D116 has the measurement: on a production path that reorders, quinn's
+/// defaults declared most of the late packets lost, and these two constants
+/// declared 13 to 28 percent of them lost with no change in real loss.
 ///
 /// The count is switched off rather than raised because a count is a time
 /// that depends on the sending rate: 1000 packets are 70 ms at 14 000 packets
@@ -747,7 +723,7 @@ mod tests {
     /// and the first authentication raises it to 16 MiB.
     ///
     /// The receiving side never reads, which is what a peer achieves on a live
-    /// server by withholding the first byte of a stream (R6-M1): everything
+    /// server by withholding the first byte of a stream: everything
     /// past the gap is held and cannot be read. The numbers are spelled out
     /// rather than taken from the constants, so the test pins what reaches the
     /// wire.
@@ -905,7 +881,7 @@ mod tests {
                 "max_concurrent_uni_streams: {MAX_PEER_UNI_STREAMS}"
             )),
             "the peer's unidirectional stream limit is ours to state, not quinn's \
-             to default (review L3): {rendered}"
+             to default: {rendered}"
         );
         assert!(
             rendered.contains("1350"),
@@ -925,7 +901,7 @@ mod tests {
         /// Property 2: whatever validation accepts, this can be built from (D86).
         ///
         /// The other half of the invariant `crate::config`'s properties state:
-        /// a value that passes validation must not be able to fail — or panic —
+        /// a value that passes validation must not be able to fail, or panic,
         /// on its way into a `quinn::TransportConfig`, which is where every
         /// `[limits]` key that reaches the transport ends up. The generator
         /// clamps into the accepted space rather than filtering, so it stacks
