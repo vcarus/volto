@@ -98,9 +98,8 @@ const REFUSAL_BOUND: Duration = Duration::from_secs(2);
 /// A loop retrying the allocation would write one line per attempt and reach
 /// thousands in the window below; the observed figure is zero, and one refused
 /// request costs three lines. So the bound is set under that: a window that
-/// caught even a single refusal's worth of work would already fail, which is
-/// what the injected-regression check was run against. The slack that is left
-/// is for a timer that happens to fire, not for a retry.
+/// caught even a single refusal's worth of work would already fail. The slack
+/// that is left is for a timer that happens to fire, not for a retry.
 const QUIET_LINES: usize = 2;
 
 /// How much the descriptor count may drift across the whole run.
@@ -135,7 +134,9 @@ struct FdClamp {
 impl FdClamp {
     /// Clamps the budget, proving on the way out that it took effect.
     fn tighten() -> Self {
-        let saved = read_limit();
+        // `getrlimit` cannot fail for a resource the kernel always knows about,
+        // which is why rustix hands back the limits rather than a `Result`.
+        let saved = rustix::process::getrlimit(Resource::Nofile);
 
         // Binding and dropping a socket names a descriptor number that is free:
         // the lowest one, since that is what the kernel hands out.
@@ -175,14 +176,6 @@ impl Drop for FdClamp {
         // What is restored is exactly what this guard read.
         rustix::process::setrlimit(Resource::Nofile, self.saved).expect("restore RLIMIT_NOFILE");
     }
-}
-
-/// The process's current `RLIMIT_NOFILE`.
-///
-/// `getrlimit` cannot fail for a resource the kernel always knows about, which
-/// is why rustix's wrapper hands back the limits rather than a `Result`.
-fn read_limit() -> Rlimit {
-    rustix::process::getrlimit(Resource::Nofile)
 }
 
 /// How long to leave between the descriptor samples [`fds::settled_fds`] takes.
