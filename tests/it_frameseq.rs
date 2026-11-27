@@ -19,10 +19,12 @@
 //! asking the server -- and every case *ends the connection deliberately*, so
 //! the assertion is an exact CONNECTION_CLOSE code rather than "nothing
 //! happened within a window". A sequence with no offence gets a sentinel
-//! offence appended; the close code then proves two things at once: every
-//! frame before the sentinel was accepted (a misjudged one would have closed
-//! with a different code first), and the connection was still serving when the
-//! sentinel arrived.
+//! offence appended; the close code then proves that every frame before the
+//! sentinel was accepted (a misjudged one would have closed with a different
+//! code first). Before the offence or the sentinel, a request is answered on
+//! the same connection, which proves it was still serving. A sequence with an
+//! offence is cut right after it and finished cleanly, so a later frame cannot
+//! draw the expected code in its place.
 //!
 //! Where two of RFC 9114's MUST-close rules apply to the same frame -- a
 //! reserved HTTP/2 type as the control stream's first frame is both §7.2.8's
@@ -75,7 +77,7 @@ use common::rawstream::{
     H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR, RESERVED_HTTP2_TYPES, SETTINGS_H3_DATAGRAM,
     SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER,
     STREAM_QPACK_ENCODER, application_close, connect_headers_frame, frame, grease_type, read_frame,
-    settings_frame, status_of, varint_frame,
+    settings_frame, status_of, still_serving, varint_frame,
 };
 use common::{TIMEOUT, TestServer, connect_quic, spawn_echo_target};
 use volto::varint;
@@ -281,6 +283,12 @@ impl ControlEvent {
 
 /// The close code the first offence in `events` draws, or `None` if every
 /// event is legal.
+fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
+    first_offence(events).map(|(_, code)| code)
+}
+
+/// The index of the first offence in `events` and the close code it draws, or
+/// `None` if every event is legal.
 ///
 /// Written against the RFC rather than against the server's tables. Where two
 /// MUST-close rules apply to one frame, the model follows the layering the
@@ -296,18 +304,18 @@ impl ControlEvent {
 /// GOAWAY, CANCEL_PUSH or MAX_PUSH_ID after SETTINGS, can raise; then the
 /// stateful rules (§5.2, §7.2.3, §7.2.7). Each arm below says which rule it is
 /// applying.
-fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
+fn first_offence(events: &[ControlEvent]) -> Option<(usize, u64)> {
     let mut settings_seen = false;
     let mut goaway: Option<u64> = None;
     let mut max_push_id: Option<u64> = None;
 
-    for event in events {
+    for (index, event) in events.iter().enumerate() {
         match event {
             // RFC 9114 §11.2.1 / §7.2.8: reserved HTTP/2 types are
             // H3_FRAME_UNEXPECTED wherever and *whenever* they arrive -- the
             // frame layer judges the type before the first-frame rule can ask
             // whether it was SETTINGS.
-            ControlEvent::ReservedH2(_) => return Some(H3_FRAME_UNEXPECTED),
+            ControlEvent::ReservedH2(_) => return Some((index, H3_FRAME_UNEXPECTED)),
 
             // Every SETTINGS payload is a SETTINGS frame on the wire, so once
             // one has been accepted the type alone is the offence: RFC 9114
@@ -325,17 +333,17 @@ fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
             | ControlEvent::SettingsTruncatedPair
                 if settings_seen =>
             {
-                return Some(H3_FRAME_UNEXPECTED);
+                return Some((index, H3_FRAME_UNEXPECTED));
             }
 
             // A first SETTINGS is the frame the control stream is waiting for,
             // so it is buffered and parsed: RFC 9114 §7.1's shape rule and
             // §7.2.4/§7.2.4.1's identifier rules decide before it can be
             // accepted.
-            ControlEvent::SettingsTruncatedPair => return Some(H3_FRAME_ERROR),
+            ControlEvent::SettingsTruncatedPair => return Some((index, H3_FRAME_ERROR)),
             ControlEvent::SettingsDuplicatePair
             | ControlEvent::SettingsReservedId
-            | ControlEvent::SettingsBadDatagramValue => return Some(H3_SETTINGS_ERROR),
+            | ControlEvent::SettingsBadDatagramValue => return Some((index, H3_SETTINGS_ERROR)),
 
             // The two odd-but-legal payloads are SETTINGS frames like any
             // other: RFC 9114 §7.2.4 ignores an unknown identifier and
@@ -355,11 +363,14 @@ fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
             // frame, §6.2.1 has already decided the frame from its type, and
             // the payload is never parsed.
             ControlEvent::GoawayMalformed | ControlEvent::MaxPushIdTrailingBytes => {
-                return Some(if settings_seen {
-                    H3_FRAME_ERROR
-                } else {
-                    H3_MISSING_SETTINGS
-                });
+                return Some((
+                    index,
+                    if settings_seen {
+                        H3_FRAME_ERROR
+                    } else {
+                        H3_MISSING_SETTINGS
+                    },
+                ));
             }
 
             // RFC 9114 §9 says to ignore an unknown type, but §6.2.1's rule
@@ -368,7 +379,7 @@ fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
             // H3_MISSING_SETTINGS, and after SETTINGS the frame is ignored.
             ControlEvent::Grease { .. } => {
                 if !settings_seen {
-                    return Some(H3_MISSING_SETTINGS);
+                    return Some((index, H3_MISSING_SETTINGS));
                 }
             }
 
@@ -376,33 +387,36 @@ fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
             // control stream (H3_FRAME_UNEXPECTED) -- unless it is the first
             // frame, where §6.2.1 answers H3_MISSING_SETTINGS instead.
             ControlEvent::Headers | ControlEvent::Data(_) | ControlEvent::PushPromise => {
-                return Some(if settings_seen {
-                    H3_FRAME_UNEXPECTED
-                } else {
-                    H3_MISSING_SETTINGS
-                });
+                return Some((
+                    index,
+                    if settings_seen {
+                        H3_FRAME_UNEXPECTED
+                    } else {
+                        H3_MISSING_SETTINGS
+                    },
+                ));
             }
 
             ControlEvent::Goaway(id) => {
                 if !settings_seen {
-                    return Some(H3_MISSING_SETTINGS);
+                    return Some((index, H3_MISSING_SETTINGS));
                 }
                 // RFC 9114 §5.2: an identifier larger than one previously
                 // received is H3_ID_ERROR; equal or smaller is legal.
                 if goaway.is_some_and(|previous| *id > previous) {
-                    return Some(H3_ID_ERROR);
+                    return Some((index, H3_ID_ERROR));
                 }
                 goaway = Some(*id);
             }
 
             ControlEvent::MaxPushId(id) => {
                 if !settings_seen {
-                    return Some(H3_MISSING_SETTINGS);
+                    return Some((index, H3_MISSING_SETTINGS));
                 }
                 // RFC 9114 §7.2.7: a value smaller than one previously
                 // received is H3_ID_ERROR; repeating or growing is legal.
                 if max_push_id.is_some_and(|previous| *id < previous) {
-                    return Some(H3_ID_ERROR);
+                    return Some((index, H3_ID_ERROR));
                 }
                 max_push_id = Some(*id);
             }
@@ -410,11 +424,14 @@ fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
             // RFC 9114 §7.2.3: a CANCEL_PUSH for a push ID never mentioned by
             // a PUSH_PROMISE is H3_ID_ERROR, and this server never promises.
             ControlEvent::CancelPush(_) => {
-                return Some(if settings_seen {
-                    H3_ID_ERROR
-                } else {
-                    H3_MISSING_SETTINGS
-                });
+                return Some((
+                    index,
+                    if settings_seen {
+                        H3_ID_ERROR
+                    } else {
+                        H3_MISSING_SETTINGS
+                    },
+                ));
             }
         }
     }
@@ -423,7 +440,8 @@ fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
 }
 
 /// The verdict for a whole script: the first offence among the events, or the
-/// ending's own.
+/// ending's own when there is none. [`drive_control_script`] ends a script that
+/// has an offence with a clean finish, whatever `end` says.
 fn script_verdict(events: &[ControlEvent], end: ControlEnd) -> u64 {
     if let Some(code) = control_verdict(events) {
         return code;
@@ -455,27 +473,40 @@ fn script_verdict(events: &[ControlEvent], end: ControlEnd) -> u64 {
 
 /// Drives one control-stream script and returns the close code and reason the
 /// server answered with.
+///
+/// The events before the first offence go first, and then a request must be
+/// answered: a server that has closed the connection on one of those legal
+/// events by then fails here, even when its code is the one the offence draws. A script with
+/// an offence is cut right after it and finished cleanly, so a server that
+/// accepted the offence closes with H3_CLOSED_CRITICAL_STREAM, which no offence
+/// draws, instead of with the code of a later event. `end` applies only to a
+/// script with no offence.
 async fn drive_control_script(events: &[ControlEvent], end: ControlEnd) -> (u64, String) {
     let (_endpoint, connection) = connect_quic(&lab().server).await;
 
-    let mut script = Vec::new();
-    for event in events {
-        script.extend_from_slice(&event.bytes());
-    }
-    if matches!(end, ControlEnd::Sentinel) {
-        script.extend_from_slice(&ControlEvent::CancelPush(7).bytes());
-    }
+    let (legal, offence) = match first_offence(events) {
+        Some((index, _)) => (&events[..index], Some(&events[index])),
+        None => (events, None),
+    };
+    let prefix: Vec<u8> = legal.iter().flat_map(ControlEvent::bytes).collect();
 
     // Held for the whole case: dropping a `quinn::SendStream` finishes it,
     // which is `FinishCleanly` whether the case asked for it or not.
-    let stream = open_uni_tolerant(&connection, STREAM_CONTROL, &script).await;
+    let stream = open_uni_tolerant(&connection, STREAM_CONTROL, &prefix).await;
     if let Some(mut stream) = stream {
-        match end {
-            ControlEnd::Sentinel => {}
-            ControlEnd::FinishCleanly => {
+        still_serving(&connection).await;
+        match (offence, end) {
+            (Some(offence), _) => {
+                let _ = stream.write_all(&offence.bytes()).await;
                 let _ = stream.finish();
             }
-            ControlEnd::FinishMidFrame => {
+            (None, ControlEnd::Sentinel) => {
+                let _ = stream.write_all(&ControlEvent::CancelPush(7).bytes()).await;
+            }
+            (None, ControlEnd::FinishCleanly) => {
+                let _ = stream.finish();
+            }
+            (None, ControlEnd::FinishMidFrame) => {
                 // A grease frame announcing five bytes, of which two arrive
                 // before the FIN.
                 let mut partial = BytesMut::new();
@@ -576,10 +607,8 @@ proptest! {
 /// wrong model arm should fail the suite deterministically, not one run in
 /// five.
 ///
-/// An offence whose code is H3_ID_ERROR is not followed by the sentinel, whose
-/// CANCEL_PUSH draws the same code: a server that wrongly accepted the offence
-/// would then close on the sentinel and pass. Those rows end with a clean
-/// finish instead, whose H3_CLOSED_CRITICAL_STREAM differs.
+/// Each offence is followed by a clean finish ([`drive_control_script`]), so a
+/// server that wrongly accepted it closes with H3_CLOSED_CRITICAL_STREAM.
 #[test]
 fn every_control_offence_draws_its_modelled_code() {
     let legal_prefix = vec![
@@ -626,18 +655,8 @@ fn every_control_offence_draws_its_modelled_code() {
             Some(expected),
             "the model must agree with this table for {offence:?}"
         );
-        let end = if expected == H3_ID_ERROR {
-            ControlEnd::FinishCleanly
-        } else {
-            ControlEnd::Sentinel
-        };
-        assert_eq!(
-            script_verdict(&events, end),
-            expected,
-            "the model must agree with this table for {offence:?} ending {end:?}"
-        );
         run_case(async {
-            let (code, reason) = drive_control_script(&events, end).await;
+            let (code, reason) = drive_control_script(&events, ControlEnd::FinishCleanly).await;
             assert_eq!(code, expected, "{offence:?}: the reason was {reason:?}");
         });
     }
@@ -887,6 +906,10 @@ proptest! {
                 held.extend(stream);
             }
 
+            // Four offences share H3_STREAM_CREATION_ERROR, so a server that
+            // closed the connection on one of the legal openings with that
+            // code would pass the assertion below without this answer.
+            still_serving(&connection).await;
             match offence {
                 UniOffence::Push => {
                     held.extend(open_uni_tolerant(&connection, STREAM_PUSH, &[]).await);
@@ -1458,6 +1481,10 @@ proptest! {
                 live.extend(run_plan(&connection, plan, tag).await);
             }
 
+            // A plan that ends in a reset reads nothing back, so without this
+            // answer a server that closed the connection on that reset with
+            // the fatal's code would pass.
+            still_serving(&connection).await;
             let expected = commit_fatal(&connection, fatal, &mut live, &mut control).await;
             let (code, reason) = application_close(&connection, TIMEOUT).await;
             assert_eq!(
