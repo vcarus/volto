@@ -16,7 +16,7 @@ standing example is a protocol-violation investigation that was closed as "not
 reproducible in the lab" — where the lab was never shaped like the thing it was
 trying to reproduce, and no amount of re-running it would have been.
 
-These three pieces make the shape itself the artefact: extract it from the log,
+These pieces make the shape itself the artefact: extract it from the log,
 replay it, and compare the two profiles field by field.
 
 ## The pieces
@@ -74,10 +74,11 @@ VOLTO_REPLAY_SECONDS=60 VOLTO_REPLAY_COMPRESSION=2000 \
 
 The run prints where it wrote the lab server's own log. Putting that file back
 through the extractor gives a profile in the same schema, which is what makes
-the last step a comparison rather than two lists of numbers:
+the last step a comparison rather than two lists of numbers. With `LOG` set to
+the path the run printed:
 
 ```sh
-python3 tests/replay/shape_extract.py --name lab --out /tmp/lab.json /tmp/volto-replay-*.log
+python3 tests/replay/shape_extract.py --name lab --out /tmp/lab.json "$LOG"
 python3 tests/replay/shape_compare.py tests/replay/profiles/host-b.json /tmp/lab.json
 ```
 
