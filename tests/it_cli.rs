@@ -953,9 +953,10 @@ fn base64_decode(text: &str) -> Vec<u8> {
 /// `uint16 version; uint16 length;` and the contents, whose `HpkeKeyConfig`
 /// is `uint8 config_id; HpkeKemId kem_id; HpkePublicKey public_key;
 /// HpkeSymmetricCipherSuite cipher_suites<4..2^16-4>;`, followed by
-/// `uint8 maximum_name_length; opaque public_name<1..255>;`.
+/// `uint8 maximum_name_length; opaque public_name<1..255>;`. Returns the
+/// `maximum_name_length`.
 #[track_caller]
-fn assert_echconfig_list(list: &[u8], config_id: u8, public_name: &str) {
+fn assert_echconfig_list(list: &[u8], config_id: u8, public_name: &str) -> u8 {
     let u16_at = |at: usize| usize::from(u16::from_be_bytes([list[at], list[at + 1]]));
     assert_eq!(u16_at(0), list.len() - 2, "the list's length: {list:02x?}");
     assert_eq!(list[2..4], [0xfe, 0x0d], "the version: {list:02x?}");
@@ -970,6 +971,7 @@ fn assert_echconfig_list(list: &[u8], config_id: u8, public_name: &str) {
         public_name.as_bytes(),
         "the public name: {list:02x?}"
     );
+    list[name - 1]
 }
 
 /// `ech-keygen` writes a key file and prints its ECHConfigList, `ech-config`
@@ -1071,14 +1073,6 @@ fn config_id_of(key: &Path) -> u8 {
     base64_decode(stdout_of(&printed).trim())[6]
 }
 
-/// The `maximum_name_length` of the one ECHConfig in `list`, by the layout
-/// [`assert_echconfig_list`] reads.
-fn max_name_length_of(list: &[u8]) -> u8 {
-    let u16_at = |at: usize| usize::from(u16::from_be_bytes([list[at], list[at + 1]]));
-    let suites = 9 + 2 + u16_at(9);
-    list[suites + 2 + u16_at(suites)]
-}
-
 /// `ech-keygen --replaces` gives the new key a config_id other than the
 /// replaced key's and, without `--public-name` and `--max-name-length`, that
 /// key's public name and `maximum_name_length`. An
@@ -1086,8 +1080,8 @@ fn max_name_length_of(list: &[u8]) -> u8 {
 /// nothing.
 ///
 /// A random config_id equals the replaced key's once in 256 runs without the
-/// rule, so the loop below cannot be relied on to fail when the rule is
-/// removed. The explicit `--config-id` case fails every time.
+/// rule, so the inherited case below cannot be relied on to fail when the rule
+/// is removed. The explicit `--config-id` case fails every time.
 #[test]
 fn a_replacing_ech_key_takes_another_config_id_and_the_same_public_name() {
     let dir = config_dir("ech-replaces");
@@ -1106,21 +1100,22 @@ fn a_replacing_ech_key_takes_another_config_id_and_the_same_public_name() {
     assert_eq!(written.status.code(), Some(0), "{}", stderr_of(&written));
     let before = fs::read_to_string(&current).expect("the current key");
 
-    for round in 0..16 {
-        let new = dir.join(format!("ech-{round}.pem"));
-        let made = run(&[
-            "ech-keygen",
-            "--replaces",
-            current.to_str().unwrap(),
-            "--out",
-            new.to_str().unwrap(),
-        ]);
-        assert_eq!(made.status.code(), Some(0), "{}", stderr_of(&made));
-        let list = base64_decode(stdout_of(&made).trim());
-        assert_ne!(list[6], 200, "round {round}: the replaced key's config_id");
-        assert_echconfig_list(&list, list[6], "front.example");
-        assert_eq!(max_name_length_of(&list), 64, "the replaced key's value");
-    }
+    let inherited = dir.join("inherited.pem");
+    let made = run(&[
+        "ech-keygen",
+        "--replaces",
+        current.to_str().unwrap(),
+        "--out",
+        inherited.to_str().unwrap(),
+    ]);
+    assert_eq!(made.status.code(), Some(0), "{}", stderr_of(&made));
+    let list = base64_decode(stdout_of(&made).trim());
+    assert_ne!(list[6], 200, "the replaced key's config_id");
+    assert_eq!(
+        assert_echconfig_list(&list, list[6], "front.example"),
+        64,
+        "the replaced key's maximum_name_length"
+    );
 
     let named = dir.join("named.pem");
     let made = run(&[
@@ -1138,8 +1133,11 @@ fn a_replacing_ech_key_takes_another_config_id_and_the_same_public_name() {
     ]);
     assert_eq!(made.status.code(), Some(0), "{}", stderr_of(&made));
     let list = base64_decode(stdout_of(&made).trim());
-    assert_echconfig_list(&list, 201, "other.example");
-    assert_eq!(max_name_length_of(&list), 7, "the value the flag gave");
+    assert_eq!(
+        assert_echconfig_list(&list, 201, "other.example"),
+        7,
+        "the value the flag gave"
+    );
 
     let same = dir.join("same.pem");
     let refused = run(&[
