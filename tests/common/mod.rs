@@ -1477,14 +1477,6 @@ pub async fn spawn_pushing_udp_target(period: Duration, count: usize) -> SocketA
     addr
 }
 
-/// A UDP target that always answers with `size` bytes, whatever it receives.
-///
-/// Used to produce a packet too large for a QUIC datagram.
-pub async fn spawn_large_reply_udp_target(size: usize) -> SocketAddr {
-    let reply = vec![0x5au8; size];
-    spawn_udp_target(move |_| Some(reply.clone())).await
-}
-
 /// A UDP target that answers the first packet with `count` replies of `size`.
 ///
 /// Enough of them to fill a client's stream flow-control window, so a proxy

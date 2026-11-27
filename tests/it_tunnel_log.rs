@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use common::{
     ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, connect_request, open_udp_session,
-    respond_to, send_udp_payload, spawn_large_reply_udp_target,
+    respond_to, send_udp_payload, spawn_udp_target,
 };
 use volto::h3api::Status;
 
@@ -143,7 +143,7 @@ async fn policy_refusal_is_information(buffer: &SharedBuffer) {
 async fn the_oversize_sentinel_reports_on_a_doubling_schedule(buffer: &SharedBuffer) {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     // Comfortably above any QUIC datagram limit on a 1200-1500 byte path.
-    let target = spawn_large_reply_udp_target(8000).await;
+    let target = spawn_udp_target(|_| Some(vec![0x5a; 8000])).await;
     let mut client = H3Client::connect(&server).await;
     let mark = buffer.mark();
 
