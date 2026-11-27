@@ -422,6 +422,54 @@ async def test_udp_sessions_do_not_cross_talk():
             transport.close()
 
 
+async def test_udp_sessions_past_quarter_stream_id_64_do_not_cross_talk():
+    """The baseline's check on Quarter Stream IDs that take two bytes.
+
+    RFC 9000 §16 encodes a variable-length integer of 64 or more in two bytes,
+    so a session on stream 256 or later carries a two-byte Quarter Stream ID,
+    as most sessions on a busy production connection do. Sixty-four refused
+    requests use up streams 0 to 252 first. Each refusal ends its stream, so
+    the connection never holds more than one tunnel while they run.
+    """
+    tags = [0xF1, 0xF2, 0xF3]
+    transports = []
+    try:
+        async with proxy_connection() as client:
+            for _ in range(64):
+                try:
+                    await client.connect_udp("127.0.0.1", DENIED_PORT)
+                except Refused as refusal:
+                    assert refusal.status == 403, f"status {refusal.status}, want 403"
+                else:
+                    raise AssertionError(f"CONNECT-UDP to port {DENIED_PORT} succeeded")
+
+            streams = []
+            for tag in tags:
+                transport, host, port = await start_tagged_udp_echo(tag)
+                transports.append(transport)
+                stream_id = await client.connect_udp(host, port)
+                assert stream_id // 4 >= 64, f"stream {stream_id} has a one-byte quarter"
+                streams.append(stream_id)
+
+            for round_number in range(4):
+                payloads = []
+                for stream_id in streams:
+                    payload = f"session-{stream_id}-round-{round_number}".encode()
+                    payloads.append(payload)
+                    client.send_udp(stream_id, payload)
+
+                for stream_id, payload, tag in zip(streams, payloads, tags):
+                    reply = await client.recv_udp(stream_id)
+                    want = bytes([tag]) + payload
+                    assert reply == want, (
+                        f"{reply!r} != {want!r} (a reply tagged for another "
+                        "session means datagrams are misrouted)"
+                    )
+    finally:
+        for transport in transports:
+            transport.close()
+
+
 async def test_unknown_context_id_is_dropped_silently():
     """RFC 9298 §5: an unknown Context ID is dropped, never answered and
     never fatal — the session must keep working afterwards."""
@@ -531,6 +579,7 @@ TESTS = [
     test_tcp_tunnels_do_not_cross_talk,
     test_udp_session_round_trips,
     test_udp_sessions_do_not_cross_talk,
+    test_udp_sessions_past_quarter_stream_id_64_do_not_cross_talk,
     test_unknown_context_id_is_dropped_silently,
     test_datagram_before_its_request_is_delivered,
     test_missing_credentials_are_challenged,

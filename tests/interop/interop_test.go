@@ -323,6 +323,76 @@ func TestConcurrentSessionsDoNotCrossTalk(t *testing.T) {
 	}
 }
 
+// The baseline's check on Quarter Stream IDs that take two bytes.
+//
+// RFC 9000 §16 encodes a variable-length integer of 64 or more in two bytes, so
+// a session on stream 256 or later carries a two-byte Quarter Stream ID, as most
+// sessions on a busy production connection do. quic-go numbers a connection's
+// request streams in order from 0, so 64 refused requests use up streams 0 to
+// 252 and the three sessions open on 256, 260 and 264. masque-go cancels a
+// refused request's stream, so the connection never holds more than one tunnel
+// while they run.
+func TestSessionsPastQuarterStreamID64DoNotCrossTalk(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	client := dialProxy(t, ctx)
+	tmpl := proxyTemplate(t)
+
+	denied := net.JoinHostPort("127.0.0.1", fmt.Sprint(deniedPort))
+	for i := 0; i < 64; i++ {
+		session, rsp, err := client.Dial(newRequest(t, ctx, tmpl, denied))
+		if err == nil {
+			session.Close()
+			t.Fatalf("refusal %d: CONNECT-UDP to %s succeeded", i, denied)
+		}
+		if rsp == nil || rsp.StatusCode != http.StatusForbidden {
+			t.Fatalf("refusal %d: want a 403, got %v (%v)", i, rsp, err)
+		}
+	}
+
+	tags := []byte{0xF1, 0xF2, 0xF3}
+	sessions := make([]*masque.Conn, len(tags))
+	for i, tag := range tags {
+		target := startEchoTarget(t, tag)
+		session, rsp, err := client.Dial(newRequest(t, ctx, tmpl, target))
+		if err != nil {
+			t.Fatalf("session %d: CONNECT-UDP to %s: %v", i, target, err)
+		}
+		defer session.Close()
+		if rsp.StatusCode != http.StatusOK {
+			t.Fatalf("session %d: status = %d, want 200", i, rsp.StatusCode)
+		}
+		sessions[i] = session
+	}
+
+	for round := 0; round < 4; round++ {
+		payloads := make([][]byte, len(sessions))
+		for i, session := range sessions {
+			payloads[i] = []byte(fmt.Sprintf("session-%d-round-%d", i, round))
+			if err := session.SetReadDeadline(time.Now().Add(exchangeTimeout)); err != nil {
+				t.Fatalf("session %d: setting a read deadline: %v", i, err)
+			}
+			if _, err := session.WriteTo(payloads[i], nil); err != nil {
+				t.Fatalf("session %d: sending: %v", i, err)
+			}
+		}
+
+		for i, session := range sessions {
+			buf := make([]byte, 65535)
+			n, _, err := session.ReadFrom(buf)
+			if err != nil {
+				t.Fatalf("session %d round %d: reading the reply: %v", i, round, err)
+			}
+			want := append([]byte{tags[i]}, payloads[i]...)
+			if string(buf[:n]) != string(want) {
+				t.Fatalf("session %d round %d: reply = %q, want %q (a reply tagged for another session means datagrams are misrouted)",
+					i, round, buf[:n], want)
+			}
+		}
+	}
+}
+
 // A refusal has to be a well-formed HTTP response, not a dropped stream: a
 // third-party client must be able to tell "denied" from "broken".
 func TestDeniedTargetIsRefusedWithProxyStatus(t *testing.T) {
