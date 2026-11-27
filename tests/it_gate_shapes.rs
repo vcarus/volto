@@ -2527,10 +2527,17 @@ fn the_hold_stays_inside_its_bounds_under_a_flood() {
             break;
         }
     }
-    let outgrown = outgrown.expect("the flight outgrew HOLD_FLIGHT_BYTES");
-    assert!(
-        (outgrown + 2) * 1500 > HOLD_FLIGHT_BYTES - HOLD_HELLO_BYTES,
-        "not before its datagrams and stream filled the budget"
+    // Round `r` would make the flight count its opening datagram, `r + 1`
+    // runs and the stream up to the end of the run, which counts its length
+    // and a bitmap of one bit per byte in 64-bit words. The drop comes at the
+    // first round past the budget.
+    let end = header.len() + body.len();
+    let stream = end + end.div_ceil(64) * 8;
+    let expected = (HOLD_FLIGHT_BYTES - stream) / again.len() - 1;
+    assert_eq!(
+        outgrown.expect("the flight outgrew HOLD_FLIGHT_BYTES"),
+        expected,
+        "dropped at the first datagram past the budget"
     );
 
     // Twice as many flights as the table holds, each sending runs of its body.
