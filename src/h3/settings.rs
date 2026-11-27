@@ -175,9 +175,7 @@ pub(super) fn settings_payload() -> BytesMut {
     /// §7.2.4.1 says endpoints SHOULD send so that peers keep exercising the
     /// rule that unknown identifiers are ignored.
     ///
-    /// N is arbitrary: every value of it names a reserved identifier, and the
-    /// test client and `it_settings` pick different ones only so that the three
-    /// greases can be told apart in a packet capture.
+    /// N is arbitrary.
     const GREASE: u64 = 0x1f * 8 + 0x21;
 
     let mut payload = BytesMut::new();
