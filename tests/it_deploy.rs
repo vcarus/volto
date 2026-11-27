@@ -306,7 +306,9 @@ fn a_missing_unit_at_the_matching_version_is_an_update() {
     );
 }
 
-/// The everyday path of a timered host: a newer release exists.
+/// The everyday path of a timered host: a newer release exists. The whole
+/// output is the decision, with no downgrade advisory, since a warning printed
+/// on every timer tick is a warning nobody reads.
 #[test]
 fn an_older_installed_version_becomes_an_update() {
     let root = install_root("older");
@@ -365,40 +367,6 @@ fn a_downgrade_says_what_bites_on_the_way_back() {
         stdout.ends_with("dry-run: would update 0.5.1 -> v0.4.4\n"),
         "the decision must still be the last thing printed: {stdout}"
     );
-}
-
-/// The everyday direction must stay quiet: an upgrade has neither hazard, and a
-/// warning printed on every timer tick is a warning nobody reads.
-#[test]
-fn an_upgrade_and_a_reinstall_say_nothing_about_downgrades() {
-    for (name, installed, tag, decision) in [
-        (
-            "upgrade",
-            "0.4.4",
-            "v0.5.1",
-            "dry-run: would update 0.4.4 -> v0.5.1\n",
-        ),
-        (
-            "same-version",
-            "0.5.1",
-            "v0.5.1",
-            "dry-run: already deployed and intact (v0.5.1)\n",
-        ),
-    ] {
-        let root = install_root(name);
-        plant_binary(&root, installed);
-        plant_config(&root);
-        plant_unit(&root);
-
-        let output = run_deploy(&root, &["--dry-run", "--tag", tag]);
-
-        assert!(output.status.success(), "{}", stderr_of(&output));
-        assert_eq!(
-            stdout_of(&output),
-            decision,
-            "{name} must print only its decision"
-        );
-    }
 }
 
 /// The advisory's successor: a downgrade the candidate binary cannot survive is
