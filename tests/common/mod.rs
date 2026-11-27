@@ -1767,11 +1767,12 @@ pub async fn spawn_reset_after_read_target() -> SocketAddr {
     addr
 }
 
-/// A TCP target that floods `flood` bytes, never reads, and then sends a RST.
+/// A TCP target that floods `flood` bytes, never reads, and sends a RST once
+/// the client's upload has stalled behind it.
 ///
 /// The sibling of [`spawn_reset_after_read_target`] for the other order of
 /// events: the reset has to be noticed by the proxy's *write* pump rather than
-/// its read pump, and the two used to disagree about what the client is told.
+/// its read pump.
 ///
 /// Both halves of the proxy have to be pinned for that to be deterministic,
 /// because an RST makes the socket fail in both directions at once:
@@ -1783,8 +1784,8 @@ pub async fn spawn_reset_after_read_target() -> SocketAddr {
 /// * never reading parks the write pump inside `write_all`, once the client's
 ///   upload has filled every buffer in between.
 ///
-/// The flood is bounded by time as well as size because the target's own writes
-/// block as soon as that pipeline is full, and it still has to reach the reset.
+/// The reset waits for that state rather than for a timer: see
+/// [`until_stalled`].
 pub async fn spawn_flood_then_reset_target(flood: usize) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
     let addr = listener.local_addr().expect("target address");
@@ -1792,20 +1793,25 @@ pub async fn spawn_flood_then_reset_target(flood: usize) -> SocketAddr {
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
             tokio::spawn(async move {
-                let payload = vec![0x5au8; 64 * 1024];
-                let _ = tokio::time::timeout(Duration::from_millis(500), async {
-                    let mut written = 0usize;
-                    while written < flood {
-                        if socket.write_all(&payload).await.is_err() {
-                            return;
+                let written = AtomicU64::new(0);
+                {
+                    let (mut reader, mut writer) = socket.split();
+                    let flooding = async {
+                        let payload = vec![0x5au8; 64 * 1024];
+                        while written.load(Ordering::Relaxed) < flood as u64 {
+                            if writer.write_all(&payload).await.is_err() {
+                                return;
+                            }
+                            written.fetch_add(payload.len() as u64, Ordering::Relaxed);
                         }
-                        written += payload.len();
+                        // Written out, and still not reading.
+                        std::future::pending::<()>().await;
+                    };
+                    tokio::select! {
+                        () = flooding => {}
+                        () = until_stalled(&mut reader, &written) => {}
                     }
-                    // Written out, and still not reading: let the proxy's write
-                    // pump block until the timeout above ends this.
-                    std::future::pending::<()>().await;
-                })
-                .await;
+                }
 
                 // A zero linger turns the close into a reset.
                 let _ = socket.set_zero_linger();
@@ -1815,6 +1821,38 @@ pub async fn spawn_flood_then_reset_target(flood: usize) -> SocketAddr {
     });
 
     addr
+}
+
+/// Resolves once neither direction of the target's socket has moved for
+/// 250 ms: the bytes waiting unread in its receive buffer, and `written`.
+///
+/// Bytes that wait unread and stop growing mean the target's receive window is
+/// shut, so the proxy's writes to it queue in its send buffer and then park.
+/// `written` standing still means the flood is blocked, so the proxy has
+/// stopped reading the target. The unread bytes are counted with `peek`, which
+/// reads without consuming and so keeps the window shut. The buffer is larger
+/// than any receive buffer either host grants, so the count is never capped by
+/// it.
+async fn until_stalled(reader: &mut tokio::net::tcp::ReadHalf<'_>, written: &AtomicU64) {
+    const QUIET: Duration = Duration::from_millis(250);
+    const SAMPLE: Duration = Duration::from_millis(50);
+
+    let mut unread = vec![0u8; 16 * 1024 * 1024];
+    let mut last = (0, 0);
+    let mut since = Instant::now();
+    loop {
+        tokio::time::sleep(SAMPLE).await;
+        let Ok(waiting) = reader.peek(&mut unread).await else {
+            return;
+        };
+        let now = (waiting, written.load(Ordering::Relaxed));
+        if waiting == 0 || now != last {
+            last = now;
+            since = Instant::now();
+        } else if since.elapsed() >= QUIET {
+            return;
+        }
+    }
 }
 
 /// How a target connection ended, as seen by the target.
