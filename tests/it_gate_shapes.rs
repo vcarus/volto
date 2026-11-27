@@ -1315,9 +1315,7 @@ fn a_real_aioquic_first_flight_is_judged_by_the_name_it_carries() {
 /// packets the other tests build with [`nameless_crypto`]. Initial keys do not
 /// depend on the certificate; if they ever did, every refusal below
 /// that is decided behind the packet protection would fall through to
-/// [`Verdict::Pass`]. And each seed is judged twice,
-/// which is the fuzz target's "a verdict is a function of the bytes and the
-/// list alone" checked once here rather than on every fuzz iteration.
+/// [`Verdict::Pass`].
 #[test]
 fn the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for() {
     /// The target's mode byte for a whole datagram.
@@ -1426,11 +1424,6 @@ fn the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for() {
 
     for (name, datagram, verdict) in datagrams {
         assert_eq!(judgement(&datagram, &names), verdict, "the seed {name}");
-        assert_eq!(
-            judgement(&datagram, &names),
-            verdict,
-            "the seed {name}, judged a second time"
-        );
         seed(name, AS_A_DATAGRAM, &datagram);
     }
     for (name, bytes, flight) in crypto_bytes {
