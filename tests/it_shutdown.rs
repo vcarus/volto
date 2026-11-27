@@ -559,14 +559,26 @@ async fn a_peer_that_will_not_take_a_goaway_does_not_hold_up_shutdown() {
         .await
         .expect("write the client control preface");
 
-    // Long enough for the server's own preface to have been written and to sit
-    // unread, which is what leaves its control stream with no window at all.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The server's control stream arriving means its preface has been sent.
+    // It is accepted and never read, so the window stays shut; dropping it
+    // would stop the stream and fail the GOAWAY write at once.
+    let _server_control = tokio::time::timeout(TIMEOUT, quic.accept_uni())
+        .await
+        .expect("the server opens its control stream")
+        .expect("accept the server's control stream");
 
+    let started = std::time::Instant::now();
     server.shutdown();
-    // Far below the 300 s grace period, and far above the one idle timeout the
-    // GOAWAY is allowed.
-    server.wait_until_stopped(Duration::from_secs(15)).await;
+    server.wait_until_stopped(STOP_TIMEOUT).await;
+
+    // One idle timeout for the GOAWAY write and the endpoint's close flush come
+    // to about two seconds. Five is above that and far below the 300 s grace.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a GOAWAY the peer will not take is bounded by one idle timeout; \
+         stopping took {elapsed:?}"
+    );
 }
 
 /// A name lookup parked on the blocking pool does not hold the process past the
