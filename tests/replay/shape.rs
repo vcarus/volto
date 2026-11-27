@@ -554,8 +554,13 @@ impl FanOut {
         }
         // Past the measured range, hold the last slope rather than flatten: a
         // connection that keeps going keeps finding new targets, just slowly.
-        let (x0, y0) = self.curve[self.curve.len() - 2];
+        // A curve of one point has only the slope from the origin to it.
         let (x1, y1) = self.curve[self.curve.len() - 1];
+        let (x0, y0) = self
+            .curve
+            .len()
+            .checked_sub(2)
+            .map_or((0.0, 0.0), |before| self.curve[before]);
         let slope = (y1 - y0) / (x1 - x0);
         y1 + slope * (n - x1)
     }
@@ -1125,5 +1130,14 @@ mod tests {
     fn an_absent_joint_table_is_not_an_error() {
         let table = JointTable::read(&Json::parse(r#"{"connections": {}}"#).expect("json"));
         assert!(table.draw(&mut Rng::new(3)).is_none());
+    }
+
+    /// A small capture can leave a fan-out curve of one point, and past that
+    /// point the slope is the one from the origin to it.
+    #[test]
+    fn a_fan_out_curve_of_one_point_extrapolates_from_the_origin() {
+        let profile = Json::parse(r#"{"tunnels": {"fanout": {"curve": [[4, 2]]}, "popularity": {"share_of_tunnels": {}}}}"#).expect("json");
+        let fanout = FanOut::read(&profile);
+        assert_eq!(fanout.distinct(8.0), 4.0);
     }
 }
