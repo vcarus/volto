@@ -843,9 +843,8 @@ anyway: the rest of the configuration is there in full, host names and listen
 address included.
 
 **The descriptor limits are this command's, not the service's.** Run from an SSH
-shell the two `RLIMIT_NOFILE` lines are that shell's, which is how 1024 and
-1048576 came to be recorded for two hosts running the service at 131072. The
-line under them says so, and on Linux the section then prints the running
+shell the two `RLIMIT_NOFILE` lines are that shell's. The line under them says
+so, and on Linux the section then prints the running
 service's own figures, read from `/proc/<pid>/limits`:
 
 ```text
