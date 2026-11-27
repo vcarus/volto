@@ -1,11 +1,8 @@
 //! The hostile-peer matrix: what a peer that has proved nothing can make this
 //! server do, and which bound answers each attempt.
 //!
-//! Every other binary in this suite is organised around a feature -- tunnels,
-//! settings, the policy. This one is organised around the attacker, so that the
-//! next reviewer reads the threat model once instead of deriving it again from
-//! nine files. Most rows below are already pinned elsewhere and are *referenced*
-//! rather than copied; the tests in this file are the rows that had no pin.
+//! Most rows below are pinned elsewhere and only cited; the tests in this file
+//! are the rows that had no pin.
 //!
 //! # The matrix
 //!
@@ -126,17 +123,11 @@ const GREASE: u64 = grease_type(7);
 
 /// The most unidirectional streams this server lets a peer have at once.
 ///
-/// `MAX_PEER_UNI_STREAMS` in `src/quic/transport.rs`, written out here because
-/// it is a transport parameter: what it means is what the peer is granted, and
-/// that is what the test measures.
+/// `MAX_PEER_UNI_STREAMS` in `src/quic/transport.rs`.
 const PEER_UNI_STREAMS: usize = 16;
 
 /// The most reserved or unknown frames one request stream may make the server
 /// skip before its HEADERS (`frame::MAX_SKIPPED_FRAMES` in `src/h3/frame.rs`).
-///
-/// Spelled out here rather than imported, like the other bounds in this file:
-/// what it means is the count of grease frames the server will skip, and that is
-/// what the test drives one past.
 const SKIPPED_FRAME_LIMIT: u32 = 4096;
 
 /// The credentials the tests that configure authentication use.
@@ -936,7 +927,7 @@ async fn the_bidirectional_stream_limit_caps_what_one_peer_can_open() {
 /// sixteen were read and charged before they died. Without it the resets win
 /// the race every time -- a `RESET_STREAM` that overtakes three bytes of
 /// announcement is read by nobody -- and the storm would pass through the
-/// charge path not once (mutation check, 2026-08-23).
+/// charge path not once.
 ///
 /// The storm runs on an authenticated connection, because seventeen streams at
 /// once is one past what an unauthenticated one may hold
@@ -1290,10 +1281,8 @@ async fn a_goaway_from_the_peer_leaves_a_live_tunnel_running() {
 
 /// Two requests arriving a byte at a time, interleaved, must both be served.
 ///
-/// The frame decoder is fed a byte at a time by its own unit tests and by
-/// `it_fuzz`, but both drive the decoder (or a QUIC pair of their own) rather
-/// than this server, so nothing until now put a *fragmented* request in front of
-/// the real accept path. Two of them alternating is what makes it an ordering
+/// Unit tests and `it_fuzz` feed the decoder a byte at a time; this puts a
+/// fragmented request in front of the real accept path. Two of them alternating is what makes it an ordering
 /// test rather than a slow one: each stream's decoder holds a half-assembled
 /// frame header and a half-charged budget while the other stream's bytes go past
 /// it, so any state that leaked between streams -- a shared header buffer, a
@@ -1364,11 +1353,8 @@ async fn interleaved_requests_delivered_a_byte_at_a_time_are_both_served() {
 /// by the `Registration` guard when the connection task ends, so the case worth
 /// pinning is the one where that task ends without ever having served anything.
 ///
-/// Watching the newcomer is not enough to pin it, and this test used to. Since
-/// a full server evicts rather than refuses, a newcomer gets in either way: a
-/// slot that was never given back is just a connection nobody is behind, and the
-/// next arrival takes it as readily as it would take a real one. With the guard's
-/// `Drop` gutted the test stayed green.
+/// Watching the newcomer cannot pin it: a full server evicts rather than
+/// refuses, so a newcomer gets in whether or not the closer's slot came back.
 ///
 /// So what is watched is somebody else. The parked peer below is registered
 /// before the closer, which makes it the oldest connection that has never
@@ -1411,22 +1397,9 @@ async fn a_peer_that_closes_before_it_says_anything_frees_its_slot() {
 
 /// How long a round watches the parked peer before calling it a survivor.
 ///
-/// The round turns on telling "the newcomer found room" from "the newcomer made
-/// room", and the second of those is only visible as the parked peer's
-/// CONNECTION_CLOSE arriving. Too short a window reports an eviction that is
-/// merely in flight as a survival — and, under the failure this test hunts,
-/// that is a green run: every round evicts, and one round whose close is slow
-/// ends the retry loop with a pass.
-///
-/// So the window is generous rather than tight: it is two orders of magnitude
-/// over a loopback CONNECTION_CLOSE, so a peer still open at the end of it was
-/// not evicted at all.
-///
-/// It is not free, and the cost falls on the passing run rather than the failing
-/// one: a round the newcomer *survives* is a round that waits this out in full,
-/// because expiry is what "no close arrived" is spelled as. A round that loses
-/// returns as soon as the close lands. So the whole of this is on the wall clock
-/// of the first round of a green run, once.
+/// Two orders of magnitude over a loopback CONNECTION_CLOSE, so an eviction
+/// still in flight is not read as a survival. A passing round waits it out in
+/// full, once.
 const EVICTION_VISIBLE: Duration = Duration::from_secs(2);
 
 /// One round of it: with a peer parked in front of a connection that closed at
@@ -1477,13 +1450,6 @@ async fn a_newcomer_finds_room(settling: Duration) -> bool {
 // ---------------------------------------------------------------------------
 // The shipped numbers
 // ---------------------------------------------------------------------------
-//
-// Everything above tightens `max_idle_timeout` so a deadline can be waited out
-// in a test run. These three are the same rows on the configuration production
-// actually ships -- 60s idle, 20s keep-alive -- so an operator can prove the real
-// numbers once. They take about two minutes each and are `#[ignore]`d for it:
-//
-//     cargo test --test it_hostile -- --ignored
 
 /// The shipped bound on a silent, unauthenticated peer: two 60s idle timeouts.
 ///
