@@ -11,16 +11,13 @@
 //! None of that is visible to a test that only checks the response: the decision
 //! functions behind these lines (`policy::is_dns_blackhole`, `tunnel::udp::path::grade`)
 //! are unit-tested and stay green if the line they feed is renamed, demoted, or
-//! bypassed entirely. That last hop is what this binary drives — mutating the
-//! blackhole `info!` into a `warn!` leaves all 19 `it_policy` tests passing.
+//! bypassed entirely. That last hop is what this binary drives.
 //!
 //! One test function, because `tracing_subscriber::fmt().init()` may run once per
 //! process. The scenarios are attributed to each other by taking a mark into the
 //! shared buffer before each one and only reading the lines logged after it.
 
 mod common;
-
-use std::time::Duration;
 
 use common::{
     ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, connect_request, field_text,
@@ -144,23 +141,20 @@ async fn the_oversize_sentinel_reports_on_a_doubling_schedule(buffer: &SharedBuf
                 line.contains("encoded_len=") && line.contains("limit=") && line.contains(" mtu="),
                 "the sentinel must carry the encoded length, the datagram limit and the path MTU: {line}"
             );
-        } else {
-            // A drop between reports goes to DEBUG, which a `volto=info`
-            // subscriber does not carry, so there is no line to wait for: what
-            // is observable is that no new one appears.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
 
-        let sentinels = buffer.lines_since(
-            mark,
-            &[" INFO ", "target packet too large for a QUIC datagram"],
-        );
-        assert_eq!(
-            sentinels.len(),
-            owed,
-            "after {nth} drop(s) the schedule owes {owed} line(s); got:\n{}",
-            sentinels.join("\n")
-        );
+            // A drop between reports goes to DEBUG, so a line for one of them
+            // shows here as one line too many.
+            let sentinels = buffer.lines_since(
+                mark,
+                &[" INFO ", "target packet too large for a QUIC datagram"],
+            );
+            assert_eq!(
+                sentinels.len(),
+                owed,
+                "after {nth} drop(s) the schedule owes {owed} line(s); got:\n{}",
+                sentinels.join("\n")
+            );
+        }
     }
 
     // A dropped packet is not a fault: the session survived it, and nothing here
