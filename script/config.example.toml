@@ -117,25 +117,17 @@ users = [
 #connect_timeout = 10
 
 # Which address family a resolved target name is tried on first:
-# "ipv4", "ipv6" or "system".
+# "ipv4", "ipv6" or "system" (the resolver's own RFC 6724 order).
 #
-# Not a resolver detail but an operator policy. getaddrinfo, glibc and musl
-# alike, orders its answers by RFC 6724, which puts a global IPv6 address ahead
-# of every IPv4 one whenever the host has a usable IPv6 route. On a VPS whose
-# IPv6 egress is tunnelled, or simply worse peered than its native IPv4, that
-# sends every dual-stack target down the weaker path first: a TCP tunnel waits
-# out the whole IPv6 connect before IPv4 is tried, and a CONNECT-UDP session
-# never recovers at all, because its socket is connected to the first address
-# with a route and nothing revisits that choice.
-#
-# So the default is "ipv4". Set "ipv6" when this host's IPv6 path is the better
-# one, and "system" to hand the ordering back to the resolver (which on glibc
-# can then be shaped through /etc/gai.conf). The reordering is a stable
-# partition, so RFC 6724 still decides the order within a family, and a target
-# that resolves to a single family (an IP literal above all) is unaffected.
-# With "ipv4" or "ipv6" the preferred family is looked up first and a tunnel
-# does not wait for the other family's answer; the other family is asked at
-# the same time when a lookup slot is spare, and otherwise only when needed.
+# The default is "ipv4": RFC 6724 puts IPv6 first on any host with an IPv6
+# route, which on a VPS with a tunnelled or worse peered IPv6 egress sends every
+# dual-stack target down the weaker path first. Set "ipv6" when this host's
+# IPv6 path is the better one, and "system" to hand the ordering back to the
+# resolver (which on glibc can then be shaped through /etc/gai.conf).
+# With "ipv4" or "ipv6" the preferred family's addresses are tried first, then
+# the other family's, each in the resolver's RFC 6724 order; a target that
+# resolves to a single family (an IP literal above all) is unaffected.
+# docs/configuration.md#notes-that-matter-in-practice
 # Like connect_timeout above, this is snapshotted per connection: a reload
 # applies it to connections accepted after it.
 # Default: "ipv4"

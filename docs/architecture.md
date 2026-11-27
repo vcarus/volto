@@ -313,28 +313,9 @@ Below the cap no Retry is sent at all and the handshake is what it always was.
 
 ### Target address selection
 
-Both tunnel kinds resolve their target through one function in `tunnel/mod.rs`,
-which is also where the resolved list is ordered by
-`limits.ip_family_preference` — before the destination policy filters it and
-before either tunnel dials anything, so the two cannot disagree about which
-family goes first. The default is IPv4-first, deliberately unlike `getaddrinfo`, which
-orders by RFC 6724 and so puts global IPv6 ahead of IPv4 on any host with an
-IPv6 route. That ordering is an operator policy on a proxy rather than a
-resolver detail: the TCP path walks the list in order, so the non-preferred
-family costs a full connect attempt, and the CONNECT-UDP path has no failover at
-all — connecting a UDP socket only asks the kernel for a route, so the first
-address with one wins outright. The reorder is a stable partition, leaving
-RFC 6724's ordering within each family intact; `system` opts out of it entirely.
+Both tunnel kinds resolve their target through one function in `tunnel/mod.rs`, `resolve_within`, which is also where `limits.ip_family_preference` takes effect: before the destination policy filters the addresses and before either tunnel dials anything, so the two cannot disagree about which family goes first. Why the default is IPv4 is under [`ip_family_preference`](configuration.md#notes-that-matter-in-practice).
 
-With `ipv4` or `ipv6` the preference also decides what is asked of the resolver.
-The preferred family is looked up alone, and a tunnel goes on as soon as that
-answer has an address; it does not wait for the other family. The other family's
-lookup starts at the same moment when the connection has a lookup slot to spare,
-and otherwise only when it is needed: when the preferred family gave no usable
-address, or when every preferred address failed to connect. The order in which
-addresses are tried is the same as with one lookup of both families, and so is
-the share of `connect_timeout` each attempt gets once the other family's answer
-is known. With `system` a name is one lookup of both families.
+With `ipv4` or `ipv6` the preferred family is looked up alone, and a tunnel goes on as soon as that answer has an address; it does not wait for the other family. The other family's lookup starts at the same moment when the connection has a lookup slot to spare, and otherwise only when it is needed: when the preferred family gave no usable address, or when every preferred address failed to connect. The preferred family's addresses are tried first and the other family's after them, each in the resolver's own RFC 6724 order. Once the other family's answer is known, each attempt gets the share of `connect_timeout` it would get over one list of both families (`tunnel::first_reachable_then`). With `system` a name is one lookup of both families, tried in the resolver's order.
 
 ### The name lookup budget
 

@@ -649,15 +649,9 @@ session would not recover at all: its socket is connected to the first address
 that has a route, and nothing later revisits that choice. Set `ipv6` when the
 host's IPv6 path is the better one — native IPv6 with tunnelled or NATed IPv4 —
 and `system` to hand the ordering back to the resolver, which on glibc can then
-be shaped through `gai.conf`. The ordering is a stable partition, so whatever
-RFC 6724 decided *within* a family still stands; a target that resolves to one
-family, an IP literal above all, is unaffected by any of the three.
+be shaped through `gai.conf`.
 
-With `ipv4` or `ipv6`, volto looks a name up in the preferred family first. It
-looks the other family up at the same time when the server has a lookup slot to
-spare, and otherwise only when that family is needed. A tunnel does not wait for
-the other family's answer while it still has a preferred address to try. With
-`system`, both families come from one lookup.
+With `ipv4` or `ipv6`, volto looks a name up in the preferred family first, and the other family in a lookup of its own. That lookup starts at the same time when the connection has a lookup slot to spare, and otherwise only when that family is needed. The preferred family's addresses are tried first and the other family's after them, each family in the order the resolver returned it, so RFC 6724 still decides the order within a family. A tunnel does not wait for the other family's answer while it still has a preferred address to try. With `system`, both families come from one lookup, in the resolver's order. A target that resolves to one family, an IP literal above all, is unaffected by any of the three.
 
 ## `[security]`
 
