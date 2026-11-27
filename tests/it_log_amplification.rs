@@ -28,10 +28,9 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use common::{
-    ALLOW_PRIVATE, H3Client, STOP_TIMEOUT, SharedBuffer, TestServer, auth_section, authorize,
+    ALLOW_PRIVATE, H3Client, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer, auth_section, authorize,
     authorized_connect, basic_credentials, close_and_drain, closed_udp_address, connect_request,
     connect_udp_request, open_tcp_tunnel, respond_to, spawn_echo_target,
 };
@@ -200,25 +199,33 @@ async fn an_authentication_storm_is_bounded_by_the_failure_budget(buffer: &Share
     let mut client = H3Client::connect(&server).await;
     let mark = buffer.mark();
 
-    // Every one of these is a wrong guess; the connection is closed part-way
-    // through, so the later ones fail to send rather than being answered.
+    // Every one of these is a wrong guess, sent once the one before it has been
+    // answered, so no two are in flight. The guess that spends the budget is
+    // answered by closing the connection instead of a 407.
+    let mut answered = 0;
     for _ in 0..STORM {
         let request = authorized_connect(PROHIBITED, USER, "wrong-password");
-        if client.send.send_request(request).await.is_err() {
+        let Ok(mut stream) = client.send.send_request(request).await else {
             break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let Ok(Ok(response)) = tokio::time::timeout(TIMEOUT, stream.recv_response()).await else {
+            break;
+        };
+        assert_eq!(response.status, Status::PROXY_AUTHENTICATION_REQUIRED);
+        answered += 1;
     }
+    assert_eq!(
+        answered,
+        BUDGET - 1,
+        "every guess before the one that spends the budget is answered with a 407"
+    );
 
     let failures = buffer.lines_since(mark, &[" WARN ", "authentication failed"]);
-    assert!(
-        !failures.is_empty(),
-        "the line a fail2ban rule reads must still be audible at WARN"
-    );
-    assert!(
-        failures.len() <= BUDGET,
-        "the failure budget is {BUDGET}, so a connection may not write more than \
-         {BUDGET} warnings about it; got {}:\n{}",
+    assert_eq!(
+        failures.len(),
+        BUDGET,
+        "the failure budget is {BUDGET}, so a connection writes {BUDGET} warnings \
+         about it; got {}:\n{}",
         failures.len(),
         failures.join("\n")
     );
