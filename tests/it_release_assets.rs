@@ -872,6 +872,45 @@ fn every_push_to_main_keys_its_concurrency_group_on_the_commit() {
     }
 }
 
+/// The floor of ci.yml's shellcheck step is the number of shell scripts the
+/// tree tracks (S9-L3).
+///
+/// The floor is there so that a `git ls-files` that comes back short fails the
+/// step instead of linting what it found. One below the tree, it let a listing
+/// that lost a script pass. A new script raises the count, and the floor has
+/// to follow. Skipped when git cannot list the tree.
+#[test]
+fn the_shellcheck_floor_is_the_number_of_tracked_scripts() {
+    let listed = Command::new("git")
+        .args(["ls-files", "*.sh"])
+        .current_dir(repo_root())
+        .output();
+    let scripts = match listed {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count(),
+        _ => {
+            eprintln!("skipping: git ls-files did not answer");
+            return;
+        }
+    };
+
+    let ci = read_text(&repo_root().join(".github/workflows/ci.yml"));
+    let floor: usize = ci
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("[ \"$count\" -ge "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("ci.yml's shellcheck step carries a `[ \"$count\" -ge N ]` floor")
+        .parse()
+        .expect("the floor is a number");
+    assert_eq!(
+        floor, scripts,
+        "ci.yml's shellcheck floor is {floor} and the tree tracks {scripts} scripts: \
+         the floor must be the count, so a listing one short fails"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // quinn-proto comes from the registry
 // ---------------------------------------------------------------------------
