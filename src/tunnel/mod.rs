@@ -284,16 +284,15 @@ const _: () = assert!(
 /// Everything a request handler needs from the connection it arrived on.
 ///
 /// Built once per connection and held in an `Arc`, so sharing it with a request
-/// costs one refcount bump rather than a copy of every field. Deliberately
-/// not [`Clone`]: a second whole `Context` would be a second view of the same
-/// connection and nothing else. That one `Arc` is also the only sharing the
-/// members need, so they are stored inline. The three that share state of
-/// their own, `peer_settings`, `tunnels` and `authenticated`, do so because
-/// something outside this connection's request handling holds them as well.
+/// costs one refcount bump rather than a copy of every field. Not [`Clone`]:
+/// one `Arc` is the only sharing a connection's requests need.
 ///
-/// The UDP-specific members are here rather than in [`udp`] because a connection
-/// owns them regardless of which tunnel type ends up using them: both are
-/// settled at the handshake, before the first request arrives.
+/// Not every member is settled when the first request arrives. The peer's
+/// SETTINGS, which `peer_settings` shows, are read on the control stream by a
+/// task of its own, so a request can be routed before they have been read.
+/// [`udp::run`] waits for them, within a bound, before it sets up a session
+/// (D119). `unanswered`, `unanswered_closures` and `datagram_room` change for
+/// the life of the connection.
 pub struct Context {
     /// The QUIC connection this request arrived on.
     ///
