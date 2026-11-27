@@ -4,7 +4,7 @@ description: Install cmake and libclang-dev on an Ubuntu runner, from the Action
 # AWS-LC's libssl, which runs the server's TLS (D115), builds through cmake,
 # and its Rust bindings are generated at build time by bindgen, which loads
 # libclang. The runner image carries neither, so every job that builds the
-# crate installs both: six packages, 47 MB.
+# crate installs both.
 #
 # The Ubuntu mirror is slow at times, by minutes, so the packages are kept in
 # the Actions cache, which restores from GitHub's own storage, and the mirror is
