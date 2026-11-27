@@ -984,9 +984,9 @@ mod tests {
         parse_target(path, None)
     }
 
-    /// Row 5 of D123: CONNECT-UDP opens its socket on the first address with
-    /// a route, as before. The other family is read only once every
-    /// preferred address has failed, and its address is then used.
+    /// Ruling 4 of D123: CONNECT-UDP opens its socket on the first address
+    /// with a route, and goes on to the other family when every preferred
+    /// address has failed to connect, and only then.
     ///
     /// No slot is spare, so the stand-in shows whether the other family was
     /// asked for at all, and the wait for it is lookup time.
