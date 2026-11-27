@@ -76,7 +76,8 @@ The provider is the one module of the crate that uses
 so it sees every datagram before the QUIC layer does, and it is off unless
 `[security] expected_sni` names at least one host or `server.ech_key` names an
 ECH key. With neither, the shipped default, it passes everything through
-untouched.
+untouched until a shutdown begins. From then on it drops every datagram that
+starts with an Initial packet, on or off (see [The SNI gate](configuration.md#the-sni-gate)).
 
 It exists because quinn's endpoint is conservative but not silent. A long-header
 packet naming a version it does not speak draws a Version Negotiation packet; an
