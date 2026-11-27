@@ -26,7 +26,7 @@ pub(super) fn warn_if_fd_budget_is_tight(limits: &crate::config::Limits) {
     // `None` is `RLIM_INFINITY` rather than a failed read (the call cannot
     // fail): no ceiling means no budget to be tight against, so the check has
     // passed rather than been skipped.
-    let Some(limit) = crate::net::fd_soft_limit() else {
+    let Some(limit) = crate::net::fd_limits().0 else {
         debug!("RLIMIT_NOFILE is unlimited; the fd budget cannot be exceeded");
         return;
     };

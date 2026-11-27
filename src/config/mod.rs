@@ -284,7 +284,7 @@ pub const MAX_SOCKET_BUFFER: usize = i32::MAX as usize;
 /// Default number of concurrent tunnels allowed on one QUIC connection.
 ///
 /// Every tunnel costs one file descriptor, so this is also the per-connection
-/// share of the process fd budget (see [`crate::net::fd_soft_limit`]).
+/// share of the process fd budget (see [`crate::net::fd_limits`]).
 pub const DEFAULT_MAX_TARGETS_PER_CONN: u32 = 256;
 
 /// Ports no target may be reached on unless the operator says otherwise.

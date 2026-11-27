@@ -763,31 +763,18 @@ pub fn holds_address(address: SocketAddr) -> bool {
     std::net::UdpSocket::bind(address).is_ok()
 }
 
-/// The process's soft limit on open file descriptors, or `None` if it has none.
-///
-/// Every tunnel holds one, so this is the ceiling the tunnel quota has to fit
-/// under: exhausting it does not degrade the proxy gracefully, it makes every
-/// `accept`, `connect` and `socket` call fail at once, including the ones the
-/// QUIC endpoint needs. Checked at startup against `limits.max_targets_per_conn`
-/// rather than discovered in production.
-///
-/// `getrlimit` needs no `cfg` split: it is POSIX and present on both the Linux
-/// production host and the macOS dev host. It also cannot fail for a resource
-/// the kernel always knows about, which is why rustix's wrapper returns no
-/// `Result`. So `None` here is `RLIM_INFINITY` rather than a failed read: the
-/// process has no ceiling at all, and there is nothing for the startup check to
-/// compare a budget against. See [`crate::quic`]'s `warn_if_fd_budget_is_tight`,
-/// which treats that as room to spare.
-pub fn fd_soft_limit() -> Option<u64> {
-    fd_limits().0
-}
-
 /// The process's `RLIMIT_NOFILE`, soft limit first and hard limit second.
 ///
-/// `None` in either place is `RLIM_INFINITY`, exactly as [`fd_soft_limit`]
-/// describes for the soft one. The pair is what `volto --diagnostics` prints,
-/// because the hard limit is what says whether a soft limit that is too low can
-/// be raised on this host at all or needs the service manager changed.
+/// Every tunnel holds a descriptor, so the soft limit is the ceiling the
+/// tunnel quota has to fit under, and the startup check in [`crate::quic`]
+/// compares it with `limits.max_targets_per_conn`. The pair is what
+/// `volto --diagnostics` prints, because the hard limit is what says whether a
+/// soft limit that is too low can be raised on this host at all or needs the
+/// service manager changed.
+///
+/// `getrlimit` is POSIX, so this needs no `cfg` split, and it cannot fail for
+/// this resource, which is why rustix's wrapper returns no `Result`. So `None`
+/// in either place is `RLIM_INFINITY`, not a failed read.
 pub fn fd_limits() -> (Option<u64>, Option<u64>) {
     let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile);
     (nofile.current, nofile.maximum)
@@ -1704,7 +1691,7 @@ mod tests {
     #[test]
     fn the_fd_soft_limit_is_readable() {
         assert!(
-            fd_soft_limit().is_none_or(|limit| limit > 0),
+            fd_limits().0.is_none_or(|limit| limit > 0),
             "a process with no descriptors could not run this"
         );
     }
