@@ -461,15 +461,6 @@ impl Server {
     /// Below the cap this is a configuration read and a length read and
     /// nothing else: every branch past the first belongs to a full server.
     fn admit(&self, mut incoming: quinn::Incoming) -> Option<quinn::Incoming> {
-        /// `limits.max_connections` as the roster counts, which is a `usize`.
-        ///
-        /// Saturating rather than truncating, though neither is reachable: a
-        /// `u32` is always a `usize` on both supported targets, and a cap that
-        /// did not fit would be a cap no roster could ever reach.
-        fn live_ceiling(max_connections: u32) -> usize {
-            usize::try_from(max_connections).unwrap_or(usize::MAX)
-        }
-
         // Read per accepted connection rather than snapshotted before the
         // loop: `docs/deployment.md#reloading` promises a reload applies to
         // connections accepted from then on, and lowering this cap during an
@@ -483,7 +474,9 @@ impl Server {
         if max_connections == 0 {
             return Some(incoming);
         }
-        let ceiling = live_ceiling(max_connections);
+        // The roster counts in `usize`. A `u32` always fits on the supported
+        // targets, so the saturation is never reached.
+        let ceiling = usize::try_from(max_connections).unwrap_or(usize::MAX);
 
         // The roster rather than the `JoinSet`: a slot is entered before the
         // QUIC handshake starts and given up by a guard, so the roster counts
