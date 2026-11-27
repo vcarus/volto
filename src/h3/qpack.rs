@@ -35,7 +35,7 @@ const FIELD_OVERHEAD: u64 = 32;
 /// neither a field name nor a field value: `:method` is not a token, and
 /// RFC 9114 §4.3's rule that the pseudo-headers come first can only be checked
 /// while the two kinds are still one sequence. Sorting them out is
-/// [`super::stream`]'s job, and it is the same pass that validates them.
+/// [`super::request`]'s job, and it is the same pass that validates them.
 ///
 /// `Cow` rather than `Vec` so that a static-table hit costs a pointer instead
 /// of a copy. Every pseudo-header of a CONNECT request is one.

@@ -65,7 +65,7 @@ use error::Code;
 
 // This rule has no single owner, so it is quoted here once. `frame` skips a
 // frame type it does not know and ignores a SETTINGS identifier it has never
-// seen. `stream` and `connection` pass over the resulting `Item::Skipped`.
+// seen. `stream` and `control` pass over the resulting `Item::Skipped`.
 //
 //= https://www.rfc-editor.org/rfc/rfc9114#section-9
 //# Implementations MUST ignore unknown or unsupported values in all

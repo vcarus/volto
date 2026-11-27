@@ -209,7 +209,7 @@ impl Violation {
     /// error, so [`Self::is_field_section_too_large`] is false for the result.
     ///
     /// Not public: only the reader of a critical stream escalates, and all of
-    /// those are in [`super::connection`].
+    /// those are in [`super::control`].
     pub(super) fn into_fatal(self) -> Self {
         Self {
             class: Class::Connection,

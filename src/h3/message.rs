@@ -9,7 +9,7 @@
 //! # What belongs here
 //!
 //! Syntax: which octets a name, a value or a status may be made of. The rules
-//! about a *message* belong to [`super::stream`]: which pseudo-headers a CONNECT
+//! about a *message* belong to [`super::request`]: which pseudo-headers a CONNECT
 //! request carries and what makes one malformed. That is where a decoded field
 //! section becomes a [`Request`] and where RFC 9114 §4.1.2 is applied.
 
@@ -165,7 +165,7 @@ impl FieldValue {
     /// Reads a value that arrived from a peer, or one built at runtime.
     ///
     /// `None` for an octet that may not appear in a field value; RFC 9114 §10.3
-    /// makes that a malformed message, and [`super::stream`] is where it becomes
+    /// makes that a malformed message, and [`super::request`] is where it becomes
     /// one.
     ///
     /// The accepted set is `VCHAR` (%x21-7E), `obs-text` (%x80-FF), SP and
@@ -229,7 +229,7 @@ impl fmt::Debug for FieldValue {
 ///
 /// Names are compared without regard to case. On the wire they are lowercase
 /// already, because RFC 9114 §4.2 makes an uppercase one malformed and
-/// [`super::stream`] enforces it. The case folding keeps a lookup correct
+/// [`super::request`] enforces it. The case folding keeps a lookup correct
 /// without depending on that rule being enforced elsewhere.
 #[derive(Debug, Clone, Default)]
 pub struct Fields(Vec<(Box<str>, FieldValue)>);
@@ -308,7 +308,7 @@ impl<N: Into<Box<str>>> FromIterator<(N, FieldValue)> for Fields {
 /// A request: the pseudo-headers of RFC 9114 §4.3, then the fields that followed
 /// them.
 ///
-/// [`super::stream`] builds one out of a decoded field section, which is where
+/// [`super::request`] builds one out of a decoded field section, which is where
 /// every rule that makes a request malformed is applied: by the time one of
 /// these exists, all of them have been passed. The suite's client builds them
 /// too, with [`Request::new`], because the pseudo-headers a client sends are the
