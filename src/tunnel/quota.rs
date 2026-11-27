@@ -1,12 +1,9 @@
-//! The per-connection budgets: the tunnel budget and the two guards that spend
-//! it, the unanswered-packet allowance of the UDP sessions, the bound on the
-//! room in quinn's datagram queue, and the authentication failure buckets.
+//! The per-connection budgets: the tunnel budget and its two guards, the
+//! unanswered-packet allowance of the UDP sessions, the bound on the room in
+//! quinn's datagram queue, and the authentication failure buckets.
 //!
-//! One QUIC connection multiplexes as many tunnels as its client asks for, and
-//! every one of them costs a file descriptor on the target side, so this is the
-//! bound that keeps one client from exhausting the process limit. [`Slot`] is a
-//! rationed tunnel and [`Pending`] an accepted request that has not reached the
-//! ration yet; the graceful-shutdown drain has to watch both.
+//! [`Slot`] is a rationed tunnel and [`Pending`] an accepted request that has
+//! not reached the ration yet; the graceful-shutdown drain has to watch both.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -84,12 +81,8 @@ impl Drop for Slot {
 
 /// One accepted request that has not finished, released when dropped.
 ///
-/// The companion to [`Slot`], and deliberately not the same thing: a slot is
-/// rationed and is taken only once a request has proved it deserves one, while
-/// this is taken the moment the request stream is accepted and rations nothing.
-/// It lets the drain see a request that is *between* those two points (headers
-/// still arriving, credentials being checked), for the reason `Quota`'s
-/// `pending` field gives.
+/// Taken when the request stream is accepted and rationing nothing, so the
+/// drain sees a request that holds no slot yet (see `Quota`'s `pending` field).
 ///
 /// Dropping is the only way it is given back, for the reason [`Slot`] gives.
 pub struct Pending {
@@ -136,13 +129,7 @@ impl Quota {
 
     /// Records that a request has been accepted and is being served.
     ///
-    /// Held by the task from the moment the request stream is accepted until
-    /// that task ends, which is the span [`Self::acquire`] cannot cover: a
-    /// request only reaches the semaphore once its headers have arrived and its
-    /// credentials have been checked, and the ones that never get that far (the
-    /// 400s, the 407s) never reach it at all. Nothing is rationed here;
-    /// the count exists so the drain can tell "no work left" from "no work that
-    /// has a slot yet".
+    /// Held from the moment the request stream is accepted until its task ends.
     pub fn enter(&self) -> Pending {
         self.pending.fetch_add(1, Ordering::Relaxed);
         Pending {
@@ -161,11 +148,8 @@ impl Quota {
 
     /// Whether anything on this connection is still being served.
     ///
-    /// Both halves count, and the second is the one a tunnel count alone
-    /// misses: a request accepted before the GOAWAY whose headers are still
-    /// arriving holds no slot (see `Quota`'s `pending` field). Closing the
-    /// connection on it would also send no REQUEST_REJECTED that would let the
-    /// client retry.
+    /// A request accepted before the GOAWAY may hold no slot yet, so both
+    /// counts are read.
     pub fn is_busy(&self) -> bool {
         self.live() > 0 || self.pending.load(Ordering::Relaxed) > 0
     }
@@ -193,14 +177,9 @@ impl Quota {
 ///
 /// Two halves from one number, `[security] unanswered_packet_budget`. The
 /// per-session half ([`Self::per_session`]) is what RFC 9298 §7 asks for, and
-/// it is recreated by opening a session, which is free: a client that spends
-/// one session's allowance closes the stream and opens another, and the
-/// mitigation becomes a constant factor rather than a bound. Stream turnover
-/// is not bounded by anything (`max_streams_bidi` bounds how many are open at
-/// once and quinn issues fresh credit as streams complete), so the
-/// connection's half is the counter an attacker cannot recreate: it is created
-/// with the connection, [`super::CONNECTION_UNANSWERED_MULTIPLIER`] session
-/// budgets, and it is only ever spent.
+/// it is recreated by opening a session; the connection's half,
+/// [`super::CONNECTION_UNANSWERED_MULTIPLIER`] session budgets created with the
+/// connection, is the bound.
 ///
 /// **A session whose target answers repays what that session spent**, and
 /// nothing else does (D84, the 2026-09-05 addendum). The repayment is that
@@ -286,13 +265,11 @@ impl Unanswered {
     ///
     /// The total bounds packets sent to targets that never answer. A session
     /// whose target did answer was not one of those, so what it spent on the
-    /// way there is returned, and only that: `charged` is the session's own
-    /// count, so a client keeping a consenting target on the side can recover
-    /// no more than that side session's own packets, never what another
-    /// session spent into silence. Without the refund every session's first
-    /// packet is a charge that nothing repays, and a long-lived connection
-    /// opening short answered sessions one after another, which is what DNS
-    /// through the tunnel is, spends the total by session count alone.
+    /// way there is returned, and only that. Without the refund every
+    /// session's first packet is a charge that nothing repays, and a
+    /// long-lived connection opening short answered sessions one after
+    /// another, which is what DNS through the tunnel is, spends the total by
+    /// session count alone.
     ///
     /// Capped at the connection's total so a refund can never exceed what was
     /// created with the connection, whatever the caller's count.
@@ -607,7 +584,7 @@ mod tests {
     /// moment the peer opens it, and does not reach [`Quota::acquire`] until its
     /// headers have arrived and its credentials have been checked. Between those
     /// two points `live()` is zero while the connection has committed to serving
-    /// something -- and after a GOAWAY that something is a request the peer was
+    /// something, and after a GOAWAY that something is a request the peer was
     /// told "might have been processed" (RFC 9114 §5.2). A drain reading
     /// `live()` alone would close the connection on it.
     #[tokio::test]
@@ -643,7 +620,7 @@ mod tests {
 
     /// Entering costs no slot, so the tunnel budget is unchanged by it.
     ///
-    /// `Pending` rations nothing -- it only records that a request exists -- and
+    /// `Pending` rations nothing (it only records that a request exists), and
     /// a version of it that spent a permit would refuse tunnels a connection is
     /// entitled to, the same shape as the wait [`Quota`]'s doc rules out.
     #[test]
