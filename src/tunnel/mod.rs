@@ -889,7 +889,7 @@ where
     F: std::future::Future<Output = std::io::Result<T>>,
 {
     first_reachable_then(
-        addresses,
+        addresses.to_vec(),
         None::<Later<std::future::Ready<Vec<std::net::SocketAddr>>>>,
         budget,
         dial,
@@ -938,7 +938,7 @@ pub(crate) struct Walk<T> {
 /// lookup alone, inside the same budget. A lookup that fails or runs out of
 /// time adds no address, and the walk reports its last connect failure.
 pub(crate) async fn first_reachable_then<T, D, F, L>(
-    first: &[std::net::SocketAddr],
+    first: Vec<std::net::SocketAddr>,
     later: Option<Later<L>>,
     budget: Option<Duration>,
     dial: D,
@@ -952,7 +952,7 @@ where
     // Taken once, before the first attempt: every address draws on the same
     // budget.
     let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
-    let mut addresses = first.to_vec();
+    let mut addresses = first;
     let (mut started, mut lookup) = match later {
         Some(later) => (later.started, Some(Box::pin(later.addresses))),
         None => (false, None),
@@ -2124,7 +2124,7 @@ mod tests {
                     .as_mut()
                     .map(|other| later_addresses(other, &self.resolver, <[SocketAddr]>::to_vec));
                 let walk =
-                    first_reachable_then(&addresses, later, budget, self.dialler(&plan), "test")
+                    first_reachable_then(addresses, later, budget, self.dialler(&plan), "test")
                         .await;
                 (walk, resolve)
             }

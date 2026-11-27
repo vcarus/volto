@@ -324,7 +324,7 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
         })
     });
 
-    let (walk, walked) = tunnel::timed(connect_any(&first, later, ctx.connect_timeout)).await;
+    let (walk, walked) = tunnel::timed(connect_any(first, later, ctx.connect_timeout)).await;
     // A wait for the other family's lookup with no attempt in flight is lookup
     // time, so it moves from `connect_ms` to `resolve_ms`.
     let resolve = resolve + walk.waited;
@@ -432,7 +432,7 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
 /// request stream reset mid-connect leaves the attempt running until it finishes
 /// or the budget expires. Bounding it is what makes that acceptable.
 async fn connect_any<L>(
-    first: &[SocketAddr],
+    first: Vec<SocketAddr>,
     later: Option<tunnel::Later<L>>,
     budget: Option<Duration>,
 ) -> tunnel::Walk<TcpStream>
