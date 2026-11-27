@@ -71,6 +71,7 @@ impl Suite {
         }
     }
 
+    /// The AEAD and header protection key length, at most [`MAX_KEY_LEN`].
     fn key_len(self) -> usize {
         match self {
             Self::Aes128GcmSha256 => 16,
@@ -99,6 +100,10 @@ impl Suite {
         }
     }
 }
+
+/// The longest key [`Suite::key_len`] gives, so a key is derived into a
+/// buffer on the stack.
+const MAX_KEY_LEN: usize = 32;
 
 /// QUIC versions this provider derives keys for, which are the ones quinn's
 /// own rustls provider accepts.
@@ -210,13 +215,14 @@ pub(crate) struct Secret {
 
 impl Secret {
     fn packet_key(&self) -> AeadPacketKey {
-        let mut key = Zeroizing::new(vec![0u8; self.suite.key_len()]);
-        expand_label(self.suite.hkdf(), &self.bytes, b"quic key", &mut key);
+        let mut buf = Zeroizing::new([0u8; MAX_KEY_LEN]);
+        let key = &mut buf[..self.suite.key_len()];
+        expand_label(self.suite.hkdf(), &self.bytes, b"quic key", key);
         let mut iv = [0u8; 12];
         expand_label(self.suite.hkdf(), &self.bytes, b"quic iv", &mut iv);
         AeadPacketKey {
             key: LessSafeKey::new(
-                UnboundKey::new(self.suite.aead(), &key).expect("key length matches the suite"),
+                UnboundKey::new(self.suite.aead(), key).expect("key length matches the suite"),
             ),
             iv,
             suite: self.suite,
@@ -224,10 +230,11 @@ impl Secret {
     }
 
     fn header_key(&self) -> AeadHeaderKey {
-        let mut hp = Zeroizing::new(vec![0u8; self.suite.key_len()]);
-        expand_label(self.suite.hkdf(), &self.bytes, b"quic hp", &mut hp);
+        let mut buf = Zeroizing::new([0u8; MAX_KEY_LEN]);
+        let hp = &mut buf[..self.suite.key_len()];
+        expand_label(self.suite.hkdf(), &self.bytes, b"quic hp", hp);
         AeadHeaderKey(
-            aead::quic::HeaderProtectionKey::new(self.suite.header(), &hp)
+            aead::quic::HeaderProtectionKey::new(self.suite.header(), hp)
                 .expect("key length matches the suite"),
         )
     }
