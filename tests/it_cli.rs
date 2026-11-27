@@ -160,6 +160,19 @@ fn the_help_advertises_the_flag_the_deploy_script_probes_for() {
     );
 }
 
+/// `--help` is written for an operator: a doc comment's later paragraphs are
+/// part of the long help clap prints, so none of them may be about clap.
+#[test]
+fn the_help_says_nothing_about_how_it_is_built() {
+    let output = run(&["--help"]);
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let usage = stdout_of(&output);
+    for word in ["clap", "conflicts_with"] {
+        assert!(!usage.contains(word), "--help names {word}: {usage}");
+    }
+}
+
 /// The everyday answer: the file loads, one line says so, nothing is started.
 ///
 /// The port in the file is one this test is already holding, which is what

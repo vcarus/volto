@@ -51,11 +51,8 @@ struct Cli {
     check_config: bool,
 
     /// Print a support bundle to stdout, then exit without serving.
-    ///
-    /// `conflicts_with` rather than a precedence rule: the two flags answer
-    /// different questions and neither is the obvious winner, so a command line
-    /// naming both is refused by clap with a message naming them, rather than
-    /// one of them being silently ignored.
+    // conflicts_with: the two flags answer different questions, so naming both
+    // is refused rather than one ignored.
     #[arg(long, conflicts_with = "check_config")]
     diagnostics: bool,
 
