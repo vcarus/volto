@@ -1546,6 +1546,84 @@ fn a_replaced_binary_that_fails_to_restart_is_rolled_back() {
     );
 }
 
+/// The unit is written beside its target and renamed over it, on a first
+/// install, on `--replace-binary` and on its rollback (S9-L8).
+///
+/// Written straight to its name, a full `/etc` or a crash in mid-write left a
+/// truncated unit that systemd then parsed at `daemon-reload`. The stand-in
+/// `install` records its arguments already; the stand-in `mv` here records its
+/// own and runs the host's.
+#[test]
+fn the_unit_is_replaced_by_a_rename() {
+    for (name, rollback) in [("unit-rename-first", false), ("unit-rename-rollback", true)] {
+        let root = if rollback {
+            configured_root(name, "")
+        } else {
+            scratch_tree(
+                "install",
+                name,
+                &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+            )
+        };
+        let stubs = plant_root_stubs(&root, 0, "active");
+        write_executable(
+            &stubs.join("mv"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+                stubs.join("mv.log").display(),
+                real_tool("mv").display(),
+            ),
+        );
+        if rollback {
+            write_executable(
+                &stubs.join("systemctl"),
+                &format!(
+                    "#!/bin/sh\n\
+                     [ \"$1\" = show ] && exit 0\n\
+                     printf '%s\\n' \"$*\" >> '{}'\n\
+                     [ \"$*\" = 'restart volto' ] && exit 1\n\
+                     exit 0\n",
+                    stubs.join("systemctl.log").display()
+                ),
+            );
+        }
+
+        let args: &[&str] = if rollback { &["--replace-binary"] } else { &[] };
+        let output = run_full_install_with_stubs(&root, &stubs, args);
+
+        let stderr = stderr_of(&output);
+        let unit = root.join("etc/systemd/system/volto.service");
+        let expected = if rollback {
+            assert!(!output.status.success(), "{name}: {}", stdout_of(&output));
+            OLD_UNIT.to_owned()
+        } else {
+            assert!(output.status.success(), "{name}: {stderr}");
+            fs::read_to_string(repo_root().join("script/masque.service"))
+                .expect("the shipped unit must be readable")
+        };
+        assert_eq!(
+            fs::read_to_string(&unit).ok(),
+            Some(expected),
+            "{name}: the unit must be the one this run leaves in place: {stderr}"
+        );
+        let installs = fs::read_to_string(stubs.join("install.log")).unwrap_or_default();
+        let unit = unit.display().to_string();
+        assert!(
+            installs
+                .lines()
+                .all(|line| !line.ends_with(&format!(" {unit}"))),
+            "{name}: nothing may be installed straight over {unit}: {installs}"
+        );
+        let moves = fs::read_to_string(stubs.join("mv.log")).unwrap_or_default();
+        let rename = format!("-f {unit}.new {unit}");
+        assert_eq!(
+            moves.lines().filter(|line| *line == rename).count(),
+            if rollback { 2 } else { 1 },
+            "{name}: the unit must be written beside itself and renamed over: {moves}"
+        );
+    }
+}
+
 /// A signal while `--replace-binary` swaps the binary and unit rolls them back
 /// as a failure there does (S9-M1).
 ///

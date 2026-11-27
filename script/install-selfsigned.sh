@@ -798,15 +798,15 @@ put_back() {
     local restored="" outcome=failed
     [ "${2:-}" != interrupted ] || outcome="was interrupted"
 
-    rm -f "$BIN.new"
+    rm -f "$BIN.new" "$UNIT.new"
     if [ "$PLACE_BINARY" -eq 1 ]; then
         if [ -f "$BIN.prev" ] && install -m 0755 "$BIN.prev" "$BIN.new" && mv -f "$BIN.new" "$BIN"; then
             restored="binary"
-            if [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT"; then
+            if [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT.new" && mv -f "$UNIT.new" "$UNIT"; then
                 restored="binary and unit"
             fi
         fi
-    elif [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT"; then
+    elif [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT.new" && mv -f "$UNIT.new" "$UNIT"; then
         restored="unit"
     fi
     systemctl daemon-reload || true
@@ -830,7 +830,7 @@ elif [ "$HAD_CONFIG" -eq 1 ]; then
     # deploy.sh keeps them, and put back if the service does not come up. A
     # .prev left by an earlier run is removed, so it is never restored as if
     # it were what this run replaced.
-    rm -f "$BIN.prev" "$UNIT.prev" "$BIN.new"
+    rm -f "$BIN.prev" "$UNIT.prev" "$BIN.new" "$UNIT.new"
     if [ "$PLACE_BINARY" -eq 1 ] && [ -x "$BIN" ]; then
         install -m 0755 "$BIN" "$BIN.prev"
         note "previous binary kept at $BIN.prev"
@@ -850,7 +850,12 @@ elif [ "$HAD_CONFIG" -eq 1 ]; then
         mv -f "$BIN.new" "$BIN"
         note "installed $("$BIN" --version 2>/dev/null || echo volto) to $BIN"
     fi
-    [ "$PLACE_UNIT" -eq 0 ] || install -m 0644 "$UNIT_SRC" "$UNIT"
+    # The unit goes in as the binary does, beside its target and renamed over
+    # it, so systemd never parses a partial copy.
+    if [ "$PLACE_UNIT" -eq 1 ]; then
+        install -m 0644 "$UNIT_SRC" "$UNIT.new"
+        mv -f "$UNIT.new" "$UNIT"
+    fi
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
     trap 'put_back restart interrupted' INT TERM HUP
@@ -874,7 +879,8 @@ else
     install -m 0755 "$BINARY" "$BIN.new"
     mv -f "$BIN.new" "$BIN"
     note "installed $("$BIN" --version 2>/dev/null || echo volto) to $BIN"
-    install -m 0644 "$UNIT_SRC" "$UNIT"
+    install -m 0644 "$UNIT_SRC" "$UNIT.new"
+    mv -f "$UNIT.new" "$UNIT"
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
 

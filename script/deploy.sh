@@ -206,10 +206,10 @@ put_back() {
     trap - ERR
     local restored=""
 
-    rm -f "$BIN.new"
+    rm -f "$BIN.new" "$UNIT.new"
     if [ -f "$BIN.prev" ] && install -m 0755 "$BIN.prev" "$BIN.new" && mv -f "$BIN.new" "$BIN"; then
         restored="binary"
-        if [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT"; then
+        if [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT.new" && mv -f "$UNIT.new" "$UNIT"; then
             restored="binary and unit"
         fi
     fi
@@ -901,7 +901,7 @@ else
         # A .prev left by an earlier update, when this host had no executable
         # binary or no unit to copy, would otherwise be restored below as if it
         # were the release this run replaced.
-        rm -f "$BIN.prev" "$UNIT.prev" "$BIN.new"
+        rm -f "$BIN.prev" "$UNIT.prev" "$BIN.new" "$UNIT.new"
         if [ -x "$BIN" ]; then
             install -m 0755 "$BIN" "$BIN.prev"
             note "previous binary kept at $BIN.prev"
@@ -929,14 +929,15 @@ else
         # is what leaves the health check's rollback reachable for a service
         # that comes up and then dies.
         #
-        # The binary is written beside its target and renamed over it, so the
-        # name /usr/local/bin/volto holds the old file or the new one and never
-        # a partial copy.
+        # The binary and the unit are each written beside their target and
+        # renamed over it, so each name holds the old file or the new one and
+        # never a partial copy, which systemd would execute or parse.
         trap 'put_back start' ERR
         trap 'put_back start interrupted' INT TERM HUP
         install -m 0755 "$SRC/volto" "$BIN.new"
         mv -f "$BIN.new" "$BIN"
-        install -m 0644 "$SRC/script/masque.service" "$UNIT"
+        install -m 0644 "$SRC/script/masque.service" "$UNIT.new"
+        mv -f "$UNIT.new" "$UNIT"
         systemctl daemon-reload
         trap 'put_back restart interrupted' INT TERM HUP
         systemctl restart "$SERVICE_NAME"
@@ -1000,7 +1001,10 @@ if [ "$ENABLE_TIMER" -eq 1 ] || [ -f "$TIMER_UNIT" ]; then
     # systemd disables the start timeout for Type=oneshot, and this oneshot runs
     # a network download. Without a bound a stalled path holds the daily run
     # indefinitely, and the next tick cannot start.
-    cat >"$TIMER_SERVICE" <<'EOF'
+    #
+    # Both units are written beside their target and renamed over it, as the
+    # service's unit is. systemd loads no file whose name ends in .new.
+    cat >"$TIMER_SERVICE.new" <<'EOF'
 [Unit]
 Description=Deploy or update volto from the latest GitHub release
 Wants=network-online.target
@@ -1012,7 +1016,7 @@ TimeoutStartSec=15min
 ExecStart=/usr/local/sbin/volto-deploy
 EOF
 
-    cat >"$TIMER_UNIT" <<'EOF'
+    cat >"$TIMER_UNIT.new" <<'EOF'
 [Unit]
 Description=Daily volto update check
 
@@ -1024,6 +1028,9 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+    chmod 0644 "$TIMER_SERVICE.new" "$TIMER_UNIT.new"
+    mv -f "$TIMER_SERVICE.new" "$TIMER_SERVICE"
+    mv -f "$TIMER_UNIT.new" "$TIMER_UNIT"
 
     systemctl daemon-reload
     if [ "$ENABLE_TIMER" -eq 1 ]; then

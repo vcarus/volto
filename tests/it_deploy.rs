@@ -2792,6 +2792,99 @@ fn the_binary_is_replaced_by_a_rename() {
     );
 }
 
+/// The unit and the two timer units are replaced by a rename too, on the update
+/// and on the rollback (S9-L8).
+///
+/// Written straight to their names, a full `/etc` or a crash in mid-write left
+/// a truncated unit that systemd then parsed at `daemon-reload`, and the
+/// rollback's own copy of the unit failed the same way. The stand-in `install`
+/// and `mv` record their arguments and run the host's own.
+#[test]
+fn the_unit_and_the_timer_units_are_replaced_by_a_rename() {
+    let real = |tool: &str| {
+        let found = Command::new("sh")
+            .args(["-c", &format!("command -v {tool}")])
+            .output()
+            .expect("sh must be runnable");
+        stdout_of(&found).trim().to_owned()
+    };
+    let (real_install, real_mv) = (real("install"), real("mv"));
+
+    for (name, service, args) in [
+        (
+            "atomic-units",
+            Service::ComesUp,
+            &["--allow-unsigned", "--tag", UNSIGNED_TAG, "--enable-timer"][..],
+        ),
+        (
+            "atomic-unit-rollback",
+            Service::DiesAfterRestart,
+            &["--allow-unsigned", "--tag", UNSIGNED_TAG][..],
+        ),
+    ] {
+        let host = Host::new(name, service);
+        host.plant_install();
+        host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+        let previous_unit = fs::read_to_string(host.unit()).expect("the planted unit");
+        for (tool, path) in [("install", &real_install), ("mv", &real_mv)] {
+            write_executable(
+                &host.stubs.join(tool),
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{path}' \"$@\"\n",
+                    host.logs.join(tool).display(),
+                ),
+            );
+        }
+
+        let output = host.run(args);
+
+        let stderr = stderr_of(&output);
+        let (installs, moves) = (host.calls("install"), host.calls("mv"));
+        let unit = host.unit().display().to_string();
+        assert!(
+            installs
+                .lines()
+                .all(|line| !line.ends_with(&format!(" {unit}"))),
+            "{name}: nothing may be installed straight over {unit}: {installs}"
+        );
+        // The rollback renames the unit a second time, back to the previous one.
+        let rollback = name == "atomic-unit-rollback";
+        let mut renamed = vec![(unit, if rollback { 2 } else { 1 })];
+        if !rollback {
+            assert!(output.status.success(), "{name}: {stderr}");
+            assert_eq!(
+                fs::read_to_string(host.unit()).ok().as_deref(),
+                Some("# the unit inside the release archive\n"),
+                "{name}: the release's unit must be installed: {stderr}"
+            );
+            for timer in ["volto-deploy.service", "volto-deploy.timer"] {
+                let path = host.root.join("etc/systemd/system").join(timer);
+                let text = fs::read_to_string(&path).unwrap_or_default();
+                assert!(
+                    text.starts_with("[Unit]\n") && mode_of(&path) == 0o644,
+                    "{name}: {timer} must be written whole, mode 0644: {text}"
+                );
+                renamed.push((path.display().to_string(), 1));
+            }
+        } else {
+            assert!(!output.status.success(), "{name}: {}", stdout_of(&output));
+            assert_eq!(
+                fs::read_to_string(host.unit()).ok(),
+                Some(previous_unit),
+                "{name}: the previous unit must be back in place: {stderr}"
+            );
+        }
+        for (path, times) in renamed {
+            let rename = format!("-f {path}.new {path}");
+            assert_eq!(
+                moves.lines().filter(|line| *line == rename).count(),
+                times,
+                "{name}: {path} must be written beside itself and renamed over: {moves}"
+            );
+        }
+    }
+}
+
 /// A work directory on a `noexec` filesystem is named as the cause, before
 /// anything is downloaded (R8-L4).
 ///
