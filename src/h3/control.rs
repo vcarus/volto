@@ -237,32 +237,20 @@ impl Control {
     /// Through [`serve_control`] only these reach it: the first SETTINGS, and
     /// after it a GOAWAY, CANCEL_PUSH, MAX_PUSH_ID or skipped unknown frame.
     /// `frame::misplaced` refuses every other item from its frame header,
-    /// before any payload is buffered, so that such a frame can neither hold
-    /// the buffer budget nor run on unjudged. The other arms stay because the
-    /// `match` has to cover every [`Frame`], and returning the same error is
-    /// the safe answer if the rules in `frame::misplaced` ever change. They
+    /// before any payload is buffered, and quotes the rules. The two last arms
+    /// repeat its verdicts, because the `match` has to cover every [`Item`]. They
     /// must not become a panic, because an unauthenticated peer writes this
     /// stream.
     fn accept(&mut self, item: Item, seen: bool, shared: &Shared) -> Result<(), Violation> {
-        let frame = match item {
-            Item::Frame(frame) => frame,
-
-            // Unreachable, like every refusing arm below: `frame::misplaced`
-            // decides these from the frame header and quotes the rules.
-            Item::Data(_) => {
-                return Err(if seen {
-                    unexpected("a DATA frame on the control stream")
-                } else {
-                    missing_settings()
-                });
+        match (item, seen) {
+            (Item::Frame(Frame::Settings(settings)), false) => {
+                shared.settings_arrived(settings.datagrams);
+                Ok(())
             }
 
             // RFC 9114 §9's rule that unknown values are ignored, quoted in
-            // full in `super`. A grease frame sent first never gets here.
-            Item::Skipped { kind } => {
-                if !seen {
-                    return Err(missing_settings());
-                }
+            // full in `super`.
+            (Item::Skipped { kind }, true) => {
                 if let Some(skipped) = self.skipped.record() {
                     debug!(
                         frame_type = kind,
@@ -271,17 +259,10 @@ impl Control {
                          further ones are logged as the count doubles"
                     );
                 }
-                return Ok(());
-            }
-        };
-
-        match (frame, seen) {
-            (Frame::Settings(settings), false) => {
-                shared.settings_arrived(settings.datagrams);
                 Ok(())
             }
 
-            (Frame::Goaway(identifier), true) => {
+            (Item::Frame(Frame::Goaway(identifier)), true) => {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
                 //# Receiving a GOAWAY containing a larger identifier than
                 //# previously received MUST be treated as a connection error of
@@ -303,7 +284,7 @@ impl Control {
             //
             // This server never sends PUSH_PROMISE, so no push ID has ever been
             // mentioned and every CANCEL_PUSH names one that has not.
-            (Frame::CancelPush(push_id), true) => Err(Violation::connection(
+            (Item::Frame(Frame::CancelPush(push_id)), true) => Err(Violation::connection(
                 Code::H3_ID_ERROR,
                 format!("a CANCEL_PUSH for push ID {push_id}, which was never promised"),
             )),
@@ -312,7 +293,7 @@ impl Control {
             //# A MAX_PUSH_ID frame cannot reduce the maximum push ID; receipt of
             //# a MAX_PUSH_ID frame that contains a smaller value than previously
             //# received MUST be treated as a connection error of type H3_ID_ERROR.
-            (Frame::MaxPushId(push_id), true) => {
+            (Item::Frame(Frame::MaxPushId(push_id)), true) => {
                 if self.max_push_id.is_some_and(|previous| push_id < previous) {
                     return Err(Violation::connection(
                         Code::H3_ID_ERROR,
@@ -323,12 +304,8 @@ impl Control {
                 Ok(())
             }
 
-            // Unreachable through `serve_control`: `frame::misplaced` refuses
-            // each of these from its header and quotes the rule it applies.
-            (Frame::Settings(_), true) => Err(unexpected("a second SETTINGS frame")),
-            (Frame::PushPromise, true) => Err(unexpected("a PUSH_PROMISE frame")),
-            (Frame::Headers(_), true) => Err(unexpected("a HEADERS frame on the control stream")),
             (_, false) => Err(missing_settings()),
+            (_, true) => Err(unexpected("a frame the control stream does not carry")),
         }
     }
 }
@@ -700,22 +677,6 @@ mod tests {
         );
     }
 
-    /// An empty DATA frame after SETTINGS is a DATA frame like any other, and
-    /// RFC 9114 §7.2.1 does not allow one here.
-    #[test]
-    fn an_empty_data_frame_after_settings_is_still_unexpected() {
-        let shared = Shared::default();
-        let mut control = Control::default();
-        control
-            .accept(settings(true), false, &shared)
-            .expect("accepted");
-
-        let error = control
-            .accept(Item::Data(Bytes::new()), true, &shared)
-            .expect_err("refused");
-        assert_eq!(error.code(), Code::H3_FRAME_UNEXPECTED);
-    }
-
     /// The whole reason the control stream is read in its own task: the flag
     /// the sessions hold is written by whoever parsed the frame, so there is no
     /// moment at which the peer's answer is known here but not there.
@@ -740,33 +701,27 @@ mod tests {
         }
     }
 
+    /// After SETTINGS, every item but the four the stream carries is
+    /// H3_FRAME_UNEXPECTED. An empty DATA frame is a DATA frame like any other,
+    /// and RFC 9114 §7.2.1 does not allow one here.
     #[test]
-    fn a_second_settings_frame_is_refused() {
+    fn every_other_frame_after_settings_is_unexpected() {
         let shared = Shared::default();
-        let mut control = Control::default();
-        control
-            .accept(settings(true), false, &shared)
-            .expect("accepted");
-
-        let error = control
-            .accept(settings(true), true, &shared)
-            .expect_err("refused");
-        assert_eq!(error.code(), Code::H3_FRAME_UNEXPECTED);
-    }
-
-    #[test]
-    fn frames_that_belong_on_a_request_stream_are_refused() {
-        let shared = Shared::default();
-        for frame in [Frame::Headers(Bytes::new()), Frame::PushPromise] {
+        for item in [
+            Item::Data(Bytes::new()),
+            Item::Data(Bytes::from_static(b"nope")),
+            settings(true),
+            Item::Frame(Frame::Headers(Bytes::new())),
+            Item::Frame(Frame::PushPromise),
+        ] {
             let mut control = Control::default();
             control
                 .accept(settings(true), false, &shared)
                 .expect("accepted");
 
-            let error = control
-                .accept(Item::Frame(frame), true, &shared)
-                .expect_err("refused");
+            let error = control.accept(item, true, &shared).expect_err("refused");
             assert_eq!(error.code(), Code::H3_FRAME_UNEXPECTED);
+            assert!(error.is_connection_error());
         }
     }
 
