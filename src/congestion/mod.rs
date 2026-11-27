@@ -601,16 +601,15 @@ impl Controller for Bbr {
         let sample = self.rate.on_end_acks(now, app_limited, self.srtt);
         if let Some(sample) = &sample {
             self.on_interval(sample);
+            // `update_probe` reads the cap this interval set.
             self.refresh();
         }
-        if self.update_probe(now, in_flight) {
-            self.refresh();
-        }
-        if self.on_reading(now) {
-            self.refresh();
-        }
-        // The slow-start limit moved with the bytes this batch acknowledged.
-        if self.update_recovery(now, in_flight) || self.slow_start.is_some() {
+        let probe_ended = self.update_probe(now, in_flight);
+        let closed = self.on_reading(now);
+        let recovery_changed = self.update_recovery(now, in_flight);
+        // Nothing above reads the window, so one refresh covers them all. The
+        // slow-start limit moved with the bytes this batch acknowledged.
+        if probe_ended || closed || recovery_changed || self.slow_start.is_some() {
             self.refresh();
         }
         if let Some(sample) = &sample {
@@ -1949,6 +1948,35 @@ mod tests {
             2_250_000,
             "the probe ends: 1.25 x 15 MB/s x 120 ms"
         );
+    }
+
+    /// A kept reading raises the window at the batch that closes it, with no
+    /// sample interval, probe or recovery changing in that batch.
+    #[test]
+    fn the_stored_window_follows_a_reading_that_closes() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        let t1 = t0 + ms(10_001);
+        ack(&mut c, t1, ms(120), 0, false);
+        // The round trip before the probe delivered 400 kB.
+        ack(&mut c, t1 + ms(1), ms(61), 400_000, false);
+        c.on_end_acks(t1 + ms(1), 0, false, None);
+        // The probe delivered 100 kB of 150 kB.
+        ack(&mut c, t1 + ms(150), ms(61), 100_000, false);
+        c.on_congestion_event(t1 + ms(150), t1 + ms(90), false, 50_000);
+        c.on_end_acks(t1 + ms(201), 0, false, None);
+        assert!(c.probe.is_none());
+        // A packet sent after the loss ends the recovery.
+        ack(&mut c, t1 + ms(300), ms(61), 1_200, false);
+        c.on_end_acks(t1 + ms(300), 0, false, None);
+        assert!(c.recovery.is_none());
+        assert_eq!(c.base.ppm(), 0);
+
+        c.on_end_acks(t1 + ms(401), 0, false, None);
+        assert_eq!(c.base.ppm(), 333_333, "50 kB lost of 150 kB");
+        let stored = (c.cap, c.window);
+        c.refresh();
+        assert_eq!(stored, (c.cap, c.window));
     }
 
     #[test]
