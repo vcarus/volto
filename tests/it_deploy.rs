@@ -1587,52 +1587,6 @@ fn a_run_that_looked_up_the_latest_release_never_goes_back() {
     }
 }
 
-/// The refusal sits where the release has just been resolved and nothing has
-/// been downloaded, the only assignment that arms it is the lookup of the
-/// latest release, and no other line sets the flag. The run itself is
-/// `a_looked_up_release_older_than_the_install_is_refused_before_the_download`.
-#[test]
-fn the_downgrade_refusal_runs_before_any_download_and_is_armed_by_the_lookup_alone() {
-    let text = fs::read_to_string(deploy_script()).expect("the deploy script must be readable");
-
-    let call = text
-        .find("\nrefuse_automatic_downgrade\n")
-        .expect("the script must call refuse_automatic_downgrade at top level");
-    let download = text
-        .find("--- download and verify ---")
-        .expect("the download section");
-    assert!(call < download, "the refusal must come before the download");
-
-    // Every line of code that names the flag is one of three: the default, the
-    // arming line after the lookup, and the read in the refusal. Anything else
-    // is a second assignment, and a second assignment can disarm it.
-    let named: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#') && line.contains("TAG_WAS_RESOLVED"))
-        .collect();
-    assert_eq!(
-        named,
-        [
-            "TAG_WAS_RESOLVED=0",
-            "[ \"$TAG_WAS_RESOLVED\" -eq 1 ] || return 0",
-            "TAG_WAS_RESOLVED=1",
-        ],
-        "TAG_WAS_RESOLVED must be set once to its default, read once by the \
-         refusal and armed once by the lookup, and named nowhere else"
-    );
-    assert!(
-        text.contains("[[ \"$TAG\" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]] ||"),
-        "a looked-up tag must be three numbers, or the refusal cannot order it"
-    );
-    let lookup = text.find("releases/latest").expect("the latest lookup");
-    let arm = text.find("TAG_WAS_RESOLVED=1").expect("the arming line");
-    assert!(
-        lookup < arm && arm < call,
-        "the refusal is armed right after the latest release is looked up"
-    );
-}
-
 /// `--verify-signature` is a mode of its own. An empty file name once fell
 /// through to an ordinary run, which exited 0 having verified nothing.
 #[test]
@@ -3033,9 +2987,12 @@ fn the_first_install_password_reaches_the_installer_outside_its_arguments() {
 /// release older than the installed one before it downloads anything.
 ///
 /// The run is the real one: the stand-in `curl` answers the lookup with an
-/// older tag, and the planted binary reports a newer version. A second host,
-/// whose latest release is newer, shows the same run going on to the download,
-/// so the refusal is what stopped the first one.
+/// older tag, and the planted binary reports a newer version. Three more hosts
+/// show what arms the refusal and what it can order. One whose latest release
+/// is newer goes on to the download, so the refusal is what stopped the first.
+/// One told `--tag v1.3.5` goes on to the download too, since a rollback named
+/// at the host is not refused. One whose latest release is not three numbers
+/// is refused before the download, since the refusal cannot order it.
 #[test]
 fn a_looked_up_release_older_than_the_install_is_refused_before_the_download() {
     let host = Host::new("latest-older", Service::ComesUp);
@@ -3096,5 +3053,44 @@ fn a_looked_up_release_older_than_the_install_is_refused_before_the_download() {
             .contains("/releases/download/v1.3.7/volto-1.3.7-x86_64-unknown-linux-musl.tar.gz\n"),
         "the run must have downloaded the release: {}",
         newer.calls("curl")
+    );
+
+    let named = Host::new("latest-named-rollback", Service::ComesUp);
+    named.plant_install();
+    named.publish("v1.3.5", Candidate::LoadsTheConfig);
+
+    let output = named.run(&["--tag", "v1.3.5"]);
+
+    let stderr = stderr_of(&output);
+    assert!(
+        !stderr.contains("refusing to go back")
+            && stderr
+                .contains("carries no SHA256SUMS.sig -- refusing to install an unsigned release"),
+        "a rollback named with --tag must pass the refusal and reach the download: {stderr}"
+    );
+    assert!(
+        named
+            .calls("curl")
+            .starts_with("https://github.com/example/volto/releases/download/v1.3.5/"),
+        "the named rollback must be downloaded, with no lookup first: {}",
+        named.calls("curl")
+    );
+
+    let unordered = Host::new("latest-prerelease", Service::ComesUp);
+    unordered.plant_install();
+    unordered.mark_latest("v1.3.8-rc1");
+
+    let output = unordered.run(&[]);
+
+    let stderr = stderr_of(&output);
+    assert!(
+        !output.status.success()
+            && stderr.contains("the latest release is tagged v1.3.8-rc1, which is not vX.Y.Z"),
+        "a latest release the refusal cannot order must not be installed: {stderr}"
+    );
+    assert_eq!(
+        unordered.calls("curl"),
+        "https://github.com/example/volto/releases/latest\n",
+        "the lookup must be the only request: {stderr}"
     );
 }
