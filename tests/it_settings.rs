@@ -19,12 +19,13 @@ use common::rawstream::{
     read_varint, status_of, still_serving, stopped_code,
 };
 use common::{
-    TIMEOUT, TestServer, client_endpoint_with_transport, connect_quic, finish_connect,
-    send_udp_payload, spawn_udp_echo_target,
+    H3Client, TIMEOUT, TestServer, client_endpoint_with_transport, connect_quic, connect_request,
+    field_value, finish_connect, send_udp_payload, spawn_udp_echo_target,
 };
 use volto::capsule::CapsuleDecoder;
 use volto::datagram;
 use volto::h3::connection::PEER_SETTINGS_WAIT;
+use volto::h3api::{Code, StreamError};
 use volto::varint;
 
 /// The value the server must advertise, matching `h3api::MAX_FIELD_SECTION_SIZE`.
@@ -134,6 +135,30 @@ async fn an_oversized_header_section_is_refused() {
     // The connection survives it: one oversized request is a stream-level
     // problem, not a reason to drop everything else on the connection.
     still_serving(&connection).await;
+}
+
+/// The shared test client refuses an oversized field section on its first
+/// request, before it can have read the server's SETTINGS.
+///
+/// A harness check: the client starts from the limit this server advertises,
+/// so a test's first request is judged as its later ones are, and an
+/// oversized one never reaches the server.
+#[tokio::test]
+async fn the_test_client_refuses_an_oversized_first_request() {
+    let server = TestServer::start().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut request = connect_request(rawstream::DENIED_TARGET);
+    let padding = "a".repeat(usize::try_from(EXPECTED_MAX_FIELD_SECTION_SIZE).expect("fits"));
+    request.fields.append("x-padding", field_value(&padding));
+
+    match client.send.send_request(request).await {
+        Ok(_) => panic!("an oversized first request must be refused by the client"),
+        Err(StreamError::Local(violation)) => {
+            assert_eq!(violation.code(), Code::H3_EXCESSIVE_LOAD);
+        }
+        Err(other) => panic!("expected a local refusal, got {other:?}"),
+    }
 }
 
 #[tokio::test]

@@ -26,7 +26,8 @@
 //! * A request whose field section is larger than the server's
 //!   `SETTINGS_MAX_FIELD_SECTION_SIZE` is refused *after* its stream has been
 //!   opened, so the server sees a request stream that ends before its HEADERS
-//!   frame.
+//!   frame. Until the server's SETTINGS arrive, the limit is the one this
+//!   server advertises.
 
 #![allow(dead_code)]
 // Each integration test binary uses a subset of this.
@@ -103,10 +104,15 @@ pub struct Response {
 /// everything else the server advertises is validated by the codec and dropped.
 #[derive(Debug)]
 struct Peer {
-    /// `SETTINGS_MAX_FIELD_SECTION_SIZE`, or no limit until it arrives.
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE`.
     ///
     /// RFC 9114 §4.2.2: "An implementation that has received this parameter
-    /// SHOULD NOT send an HTTP message header that exceeds the indicated size."
+    /// SHOULD NOT send an HTTP message header that exceeds the indicated size,
+    /// as the peer will likely refuse to process it."
+    ///
+    /// Until the server's SETTINGS arrive it holds the limit this server
+    /// advertises, which is our rule and not the RFC's default of no limit. A
+    /// test's first request is then judged the same way as its later ones.
     max_field_section_size: AtomicU64,
     /// Whether the server has sent GOAWAY (RFC 9114 §5.2).
     closing: AtomicBool,
@@ -147,7 +153,7 @@ struct Peer {
 impl Default for Peer {
     fn default() -> Self {
         Self {
-            max_field_section_size: AtomicU64::new(u64::MAX),
+            max_field_section_size: AtomicU64::new(volto::h3::MAX_FIELD_SECTION_SIZE),
             closing: AtomicBool::new(false),
             goaway: AtomicU64::new(NO_GOAWAY),
             fault: Mutex::new(None),
