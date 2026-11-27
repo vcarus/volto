@@ -136,13 +136,9 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
                 handle.fail(violation.into_fatal());
                 return;
             }
-            // The connection ending under the control stream is not the
-            // control stream failing. The caller waiting in `accept` already
-            // has the real reason. A critical-stream error here would replace
-            // an idle timeout, the ordinary ending, with a protocol violation
-            // in the operator's log.
-            Err(frame::Error::Stream(StreamError::Connection(_))) => return,
-
+            // The connection ending under the stream is one of these too, and
+            // `critical_stream_closed` lets it pass: quinn records the
+            // connection's error before any read fails with it.
             Err(frame::Error::Stream(error)) => {
                 break format!("the peer reset its control stream: {error}").into();
             }
