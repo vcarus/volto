@@ -143,10 +143,10 @@ fn judge_a_datagram(datagram: &[u8], names: &Names, list: &[&str]) {
             assert_eq!(Some(*refused), version, "the version that was refused");
             assert_ne!(*refused, 1, "version 1 is the one we speak");
         }
-        // The five that need a v1 Initial in a datagram large enough for a
-        // server to look at. Four of them are decided behind the packet
+        // The seven that need a v1 Initial in a datagram large enough for a
+        // server to look at. Six of them are decided behind the packet
         // protection, which is only reachable by opening the packet; the
-        // fifth, the connection ID length, is decided on such a packet's
+        // seventh, the connection ID length, is decided on such a packet's
         // header.
         Verdict::Refuse(refusal) => {
             assert!(
@@ -236,6 +236,8 @@ fn refusing_needs_the_keys_this_datagram_carries(
         verdict,
         Verdict::Refuse(
             Refusal::Frames
+                | Refusal::TooLong
+                | Refusal::Conflict
                 | Refusal::NotClientHello
                 | Refusal::Anonymous
                 | Refusal::OtherName(_)

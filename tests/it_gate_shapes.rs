@@ -1663,6 +1663,53 @@ fn a_first_initial_whose_frames_no_initial_may_carry_is_refused() {
     }
 }
 
+/// Without a key, a first Initial's CRYPTO frames are joined by the
+/// reassembly the hold uses, so the two paths read one packet alike: two
+/// frames that carry different bytes at one offset are refused, whichever
+/// comes first and whichever name each carries, and so is a frame that ends
+/// past the 16 KiB libssl reads at the Initial level. A duplicate that agrees
+/// is joined.
+#[test]
+fn a_first_initial_is_reassembled_as_the_hold_reassembles_it() {
+    let crypto = nameless_crypto();
+    let names = Names::new(&[LISTED.to_owned()]);
+    let listed = named_hello(LISTED);
+    let mut unlisted = named_hello(LISTED);
+    let at = unlisted.len() - 1;
+    unlisted[at] ^= 0x01;
+
+    let mut agreeing = crypto_frame_at(0, &listed);
+    agreeing.extend_from_slice(&crypto_frame_at(0, &listed));
+    assert_eq!(
+        judgement(&initial(&*crypto, &CLIENT_CID, &agreeing), &names),
+        Verdict::Pass,
+        "a duplicate that agrees"
+    );
+    for (first, second) in [(&listed, &unlisted), (&unlisted, &listed)] {
+        let mut frames = crypto_frame_at(0, first);
+        frames.extend_from_slice(&crypto_frame_at(0, second));
+        assert_eq!(
+            judgement(&initial(&*crypto, &CLIENT_CID, &frames), &names),
+            Verdict::Refuse(Refusal::Conflict),
+        );
+    }
+
+    let mut past = crypto_frame_at(0, &listed);
+    past.extend_from_slice(&crypto_frame_at(HOLD_HELLO_BYTES, b"x"));
+    assert_eq!(
+        judgement(&initial(&*crypto, &CLIENT_CID, &past), &names),
+        Verdict::Refuse(Refusal::TooLong),
+        "a frame past the limit"
+    );
+    let mut up_to = crypto_frame_at(0, &listed);
+    up_to.extend_from_slice(&crypto_frame_at(HOLD_HELLO_BYTES - 1, b"x"));
+    assert_eq!(
+        judgement(&initial(&*crypto, &CLIENT_CID, &up_to), &names),
+        Verdict::Pass,
+        "a frame that ends at the limit"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (e) The hold, with an ECH key (D115, batch 2)
 // ---------------------------------------------------------------------------

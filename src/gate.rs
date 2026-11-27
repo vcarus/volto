@@ -60,6 +60,10 @@
 //! * **An Initial whose frames do not parse, or carry a type no Initial
 //!   packet may carry** (RFC 9000 §17.2.2): refused. quinn closes the
 //!   connection over it with a CONNECTION_CLOSE, and no client sends it.
+//! * **An Initial whose CRYPTO frames carry different bytes at one offset, or
+//!   reach past the 16 KiB libssl reads at the Initial level**: refused, as
+//!   the hold refuses them. Its frames are joined by the reassembly the hold
+//!   uses, so the two read one packet alike.
 //! * **An Initial with no CRYPTO frame at offset 0**: passes. It is an
 //!   acknowledgement or a later fragment of a handshake already in progress, and
 //!   the flight it belongs to was judged when it started. Without a key the gate
@@ -224,7 +228,7 @@ pub use hold::Dropped;
 use hold::{Arrival, Memory};
 use initial::{
     DCID_LENGTH_OFFSET, INITIAL_PACKET_TYPE, InitialHeader, LONG_HEADER_FORM, LONG_PACKET_TYPE,
-    QUIC_V1, coalesced_frames, crypto_frames, crypto_stream_prefix, decrypt,
+    QUIC_V1, Refused, Stream, coalesced_frames, crypto_frames, decrypt,
 };
 #[doc(hidden)]
 pub use seam::{
@@ -613,6 +617,15 @@ fn log_refusal(remote: SocketAddr, refusal: &Refusal) {
             %remote,
             "dropping an Initial packet: it carries frames an Initial packet may not"
         ),
+        Refusal::TooLong => debug!(
+            %remote,
+            "dropping an Initial packet: its CRYPTO frames reach past what libssl reads"
+        ),
+        Refusal::Conflict => debug!(
+            %remote,
+            "dropping an Initial packet: two of its CRYPTO frames carry different bytes at one \
+             offset"
+        ),
         Refusal::NotClientHello => debug!(
             %remote,
             "dropping an Initial packet: its first handshake message is not a ClientHello"
@@ -860,17 +873,30 @@ fn judge(datagram: &[u8], expected: &Names) -> Verdict {
 
     // quinn closes a connection over a frame it cannot parse or one no
     // Initial may carry, which is a reply. The hold drops the same shape.
-    if !crypto_frames(&frames).is_some_and(|walk| walk.whole) {
+    let Some(walk) = crypto_frames(&frames).filter(|walk| walk.whole) else {
         return Verdict::Refuse(Refusal::Frames);
-    }
+    };
 
-    let Some(crypto) = crypto_stream_prefix(&frames) else {
+    // The reassembly the hold uses, so one packet reads the same on both
+    // paths. quinn closes a connection whose Initial CRYPTO data ends past
+    // its 16 KiB crypto buffer, which is where `Refused::TooLong` begins.
+    let mut stream = Stream::default();
+    for (offset, bytes) in walk.fragments {
+        if let Err(refused) = stream.insert(offset, bytes) {
+            return Verdict::Refuse(match refused {
+                Refused::TooLong => Refusal::TooLong,
+                Refused::Conflict => Refusal::Conflict,
+            });
+        }
+    }
+    let crypto = stream.contiguous();
+    if crypto.is_empty() {
         // No CRYPTO frame at offset 0: an acknowledgement, or a later
         // fragment of a first flight whose beginning was already judged.
         return Verdict::Pass;
-    };
+    }
 
-    match first_flight(&crypto) {
+    match first_flight(crypto) {
         // A ClientHello that does not fit in this packet is judged by the
         // second gate in the TLS layer instead; see the module
         // documentation.
@@ -1003,6 +1029,12 @@ pub enum Refusal {
     /// A first Initial whose frames do not parse, or carry a type no Initial
     /// packet may carry.
     Frames,
+    /// A first Initial whose CRYPTO frames reach past the most libssl reads
+    /// at the Initial level.
+    TooLong,
+    /// A first Initial whose CRYPTO frames carry different bytes at one
+    /// offset.
+    Conflict,
     /// A first flight that does not begin with a ClientHello.
     NotClientHello,
     /// A complete ClientHello with no `server_name` extension.

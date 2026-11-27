@@ -19,6 +19,7 @@ use quinn::udp::RecvMeta;
 
 use crate::hello::{self, Ech, Message};
 
+use super::initial::{Refused, Stream};
 use super::{Policy, Screened};
 
 /// How long a first flight is held for its ClientHello to complete.
@@ -181,97 +182,6 @@ impl Flight {
     /// Every byte this flight holds, as [`HOLD_FLIGHT_BYTES`] counts it.
     fn bytes(&self) -> usize {
         self.datagram_bytes + self.stream.footprint()
-    }
-}
-
-/// A CRYPTO stream reassembled from offset 0, up to [`HOLD_HELLO_BYTES`].
-///
-/// The buffer grows to the highest offset seen and a bitmap records which of
-/// its bytes have arrived, so inserting a fragment costs its own length plus
-/// what the buffer grows by to reach its end, which over a flight's life is at
-/// most [`HOLD_HELLO_BYTES`], and no arrangement of fragments costs more: no
-/// fragment list to sort, no interval list to merge.
-#[derive(Default)]
-struct Stream {
-    data: Vec<u8>,
-    /// One bit per byte of `data`: set once the byte has arrived.
-    have: Vec<u64>,
-    /// How many bytes from offset 0 have all arrived.
-    prefix: usize,
-}
-
-/// A fragment that cannot join the stream.
-enum Refused {
-    /// It reaches past [`HOLD_HELLO_BYTES`].
-    TooLong,
-    /// It disagrees with bytes already there.
-    Conflict,
-}
-
-impl Stream {
-    /// What the buffer and the bitmap count: their lengths, not their
-    /// capacity.
-    fn footprint(&self) -> usize {
-        self.data.len() + self.have.len() * 8
-    }
-
-    /// What [`Stream::footprint`] would be once the buffer reaches `end`.
-    fn footprint_at(&self, end: usize) -> usize {
-        let end = end.max(self.data.len());
-        end + end.div_ceil(64) * 8
-    }
-
-    fn has(&self, at: usize) -> bool {
-        self.have[at / 64] & (1 << (at % 64)) != 0
-    }
-
-    /// Adds `bytes` at `offset`.
-    ///
-    /// A byte that is already there must be the same byte again. RFC 9000
-    /// §2.2: "The data at a given offset MUST NOT change if it is sent
-    /// multiple times; an endpoint MAY treat receipt of different data at the
-    /// same offset within a stream as a connection error of type
-    /// PROTOCOL_VIOLATION." and §19.6: "CRYPTO frames are functionally
-    /// identical to STREAM frames, except that they do not bear a stream
-    /// identifier". Refusing the difference is what makes the ClientHello
-    /// judged here the one quinn hands libssl, whatever order quinn's own
-    /// reassembly takes the overlapping fragments in.
-    fn insert(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Refused> {
-        let start = usize::try_from(offset).map_err(|_| Refused::TooLong)?;
-        let end = start.checked_add(bytes.len()).ok_or(Refused::TooLong)?;
-        if end > HOLD_HELLO_BYTES {
-            return Err(Refused::TooLong);
-        }
-        // An empty fragment carries nothing, and must not grow the buffer to
-        // its offset.
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        // Checked whole before anything is written, so a refused fragment
-        // leaves the stream as it was.
-        for (index, byte) in bytes.iter().enumerate() {
-            let at = start + index;
-            if at < self.data.len() && self.has(at) && self.data[at] != *byte {
-                return Err(Refused::Conflict);
-            }
-        }
-        if end > self.data.len() {
-            self.data.resize(end, 0);
-            self.have.resize(end.div_ceil(64), 0);
-        }
-        self.data[start..end].copy_from_slice(bytes);
-        for at in start..end {
-            self.have[at / 64] |= 1 << (at % 64);
-        }
-        while self.prefix < self.data.len() && self.has(self.prefix) {
-            self.prefix += 1;
-        }
-        Ok(())
-    }
-
-    /// The bytes from offset 0 that have all arrived.
-    fn contiguous(&self) -> &[u8] {
-        &self.data[..self.prefix]
     }
 }
 
@@ -769,46 +679,6 @@ fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_stream_is_joined_from_fragments_in_any_order() {
-        let mut stream = Stream::default();
-        assert!(stream.insert(4, b"efgh").is_ok());
-        assert_eq!(stream.contiguous(), b"");
-        assert!(stream.insert(0, b"abcd").is_ok());
-        assert_eq!(stream.contiguous(), b"abcdefgh");
-        // A duplicate is welcome, a gap ends the prefix.
-        assert!(stream.insert(2, b"cdef").is_ok());
-        assert!(stream.insert(100, b"z").is_ok());
-        assert_eq!(stream.contiguous(), b"abcdefgh");
-        assert_eq!(stream.data.len(), 101);
-    }
-
-    /// A byte sent twice with two values is refused, and refusing it changes
-    /// nothing that was there.
-    #[test]
-    fn a_fragment_that_disagrees_with_the_stream_is_refused_whole() {
-        let mut stream = Stream::default();
-        assert!(stream.insert(0, b"abcd").is_ok());
-        assert!(matches!(stream.insert(2, b"cX"), Err(Refused::Conflict)));
-        assert!(matches!(stream.insert(3, b"dZZ"), Ok(())));
-        assert!(matches!(stream.insert(1, b"bc!"), Err(Refused::Conflict)));
-        assert_eq!(stream.contiguous(), b"abcdZZ");
-    }
-
-    #[test]
-    fn a_fragment_past_the_hello_limit_is_refused() {
-        let mut stream = Stream::default();
-        let limit = u64::try_from(HOLD_HELLO_BYTES).expect("small");
-        assert!(stream.insert(limit - 1, b"a").is_ok());
-        assert!(matches!(stream.insert(limit, b"b"), Err(Refused::TooLong)));
-        assert!(matches!(
-            stream.insert(u64::MAX, b"c"),
-            Err(Refused::TooLong)
-        ));
-        assert_eq!(stream.data.len(), HOLD_HELLO_BYTES);
-        assert_eq!(stream.footprint(), HOLD_HELLO_BYTES + HOLD_HELLO_BYTES / 8);
-    }
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([192, 0, 2, 1], port))

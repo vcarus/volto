@@ -5,11 +5,10 @@
 //! walk of the frames that finds the CRYPTO data. Every byte read here comes
 //! from a peer that has not authenticated.
 
-use std::borrow::Cow;
-
 use bytes::BytesMut;
 
 use super::MAX_CONNECTION_ID;
+use crate::hello::MAX_INITIAL_FLIGHT;
 use crate::tls::ClientInitialKeys;
 use crate::varint::peek_varint;
 
@@ -319,40 +318,96 @@ pub(super) fn crypto_frames(payload: &[u8]) -> Option<Frames<'_>> {
     })
 }
 
-/// The CRYPTO stream bytes an Initial packet carries from offset 0 onwards.
+/// A CRYPTO stream reassembled from offset 0, up to [`MAX_INITIAL_FLIGHT`]:
+/// the one reassembly both of the gate's judgements read a ClientHello from.
 ///
-/// `None` means the packet has no CRYPTO frame starting at offset 0 (an
-/// acknowledgement, or a retransmitted middle of a first flight), which is the
-/// case the stateless gate passes through rather than judging. The frames are
-/// those [`crypto_frames`] finds.
-pub(super) fn crypto_stream_prefix(payload: &[u8]) -> Option<Cow<'_, [u8]>> {
-    let mut fragments = crypto_frames(payload)?.fragments;
+/// The buffer grows to the highest offset seen and a bitmap records which of
+/// its bytes have arrived, so inserting a fragment costs its own length plus
+/// what the buffer grows by to reach its end, which over a flight's life is at
+/// most [`MAX_INITIAL_FLIGHT`], and no arrangement of fragments costs more: no
+/// fragment list to sort, no interval list to merge.
+#[derive(Default)]
+pub(super) struct Stream {
+    data: Vec<u8>,
+    /// One bit per byte of `data`: set once the byte has arrived.
+    have: Vec<u64>,
+    /// How many bytes from offset 0 have all arrived.
+    prefix: usize,
+}
 
-    // Sorted and appended while contiguous, so a first flight split across
-    // several CRYPTO frames in one packet reads as one stream.
-    fragments.sort_by_key(|(offset, _)| *offset);
+/// A fragment that cannot join the stream.
+pub(super) enum Refused {
+    /// It reaches past [`MAX_INITIAL_FLIGHT`].
+    TooLong,
+    /// It disagrees with bytes already there.
+    Conflict,
+}
 
-    // In practice there is exactly one frame and it starts at offset 0, which
-    // is a first flight that fits in one packet, so that case is borrowed out
-    // of the decrypted frames rather than copied into a second buffer.
-    if let [(0, data)] = fragments.as_slice() {
-        return (!data.is_empty()).then_some(Cow::Borrowed(*data));
+impl Stream {
+    /// What the buffer and the bitmap count: their lengths, not their
+    /// capacity.
+    pub(super) fn footprint(&self) -> usize {
+        self.data.len() + self.have.len() * 8
     }
 
-    let mut stream: Vec<u8> = Vec::new();
-    for (offset, data) in fragments {
-        let offset = usize::try_from(offset).ok()?;
-        if offset > stream.len() {
-            break;
-        }
-        // A retransmission may overlap what is already here.
-        let skip = stream.len() - offset;
-        if let Some(fresh) = data.get(skip..) {
-            stream.extend_from_slice(fresh);
-        }
+    /// What [`Stream::footprint`] would be once the buffer reaches `end`.
+    pub(super) fn footprint_at(&self, end: usize) -> usize {
+        let end = end.max(self.data.len());
+        end + end.div_ceil(64) * 8
     }
 
-    (!stream.is_empty()).then_some(Cow::Owned(stream))
+    fn has(&self, at: usize) -> bool {
+        self.have[at / 64] & (1 << (at % 64)) != 0
+    }
+
+    /// Adds `bytes` at `offset`.
+    ///
+    /// A byte that is already there must be the same byte again. RFC 9000
+    /// §2.2: "The data at a given offset MUST NOT change if it is sent
+    /// multiple times; an endpoint MAY treat receipt of different data at the
+    /// same offset within a stream as a connection error of type
+    /// PROTOCOL_VIOLATION." and §19.6: "CRYPTO frames are functionally
+    /// identical to STREAM frames, except that they do not bear a stream
+    /// identifier". Refusing the difference is what makes the ClientHello
+    /// judged by the gate the one quinn hands libssl, whatever order quinn's own
+    /// reassembly takes the overlapping fragments in.
+    pub(super) fn insert(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Refused> {
+        let start = usize::try_from(offset).map_err(|_| Refused::TooLong)?;
+        let end = start.checked_add(bytes.len()).ok_or(Refused::TooLong)?;
+        if end > MAX_INITIAL_FLIGHT {
+            return Err(Refused::TooLong);
+        }
+        // An empty fragment carries nothing, and must not grow the buffer to
+        // its offset.
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        // Checked whole before anything is written, so a refused fragment
+        // leaves the stream as it was.
+        for (index, byte) in bytes.iter().enumerate() {
+            let at = start + index;
+            if at < self.data.len() && self.has(at) && self.data[at] != *byte {
+                return Err(Refused::Conflict);
+            }
+        }
+        if end > self.data.len() {
+            self.data.resize(end, 0);
+            self.have.resize(end.div_ceil(64), 0);
+        }
+        self.data[start..end].copy_from_slice(bytes);
+        for at in start..end {
+            self.have[at / 64] |= 1 << (at % 64);
+        }
+        while self.prefix < self.data.len() && self.has(self.prefix) {
+            self.prefix += 1;
+        }
+        Ok(())
+    }
+
+    /// The bytes from offset 0 that have all arrived.
+    pub(super) fn contiguous(&self) -> &[u8] {
+        &self.data[..self.prefix]
+    }
 }
 
 /// Advances past `count` varints, or `None` if they do not all fit.
@@ -367,20 +422,12 @@ fn skip_varints(payload: &[u8], mut at: usize, count: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::assert_matches;
 
-    #[test]
-    fn a_crypto_frame_at_offset_zero_is_the_one_that_is_read() {
-        // CRYPTO, offset 0, length 3.
-        let payload = [0x06, 0x00, 0x03, b'a', b'b', b'c'];
-        // One fragment at offset 0, which is every first flight that fits in one
-        // packet, is borrowed out of the frames rather than copied.
-        assert_matches!(crypto_stream_prefix(&payload), Some(Cow::Borrowed(b"abc")));
-        assert_eq!(crypto_stream_prefix(&payload).as_deref(), Some(&b"abc"[..]));
-
-        // The same frame at offset 1 carries no beginning to judge.
-        let payload = [0x06, 0x01, 0x03, b'a', b'b', b'c'];
-        assert_eq!(crypto_stream_prefix(&payload), None);
+    /// The CRYPTO frames of `payload` as the walk finds them.
+    fn fragments(payload: &[u8]) -> Vec<(u64, &[u8])> {
+        let walk = crypto_frames(payload).expect("the frames parse");
+        assert!(walk.whole, "every frame is one an Initial may carry");
+        walk.fragments
     }
 
     #[test]
@@ -390,7 +437,7 @@ mod tests {
         payload.extend_from_slice(&[0x06, 0x00, 0x02, b'h', b'i']);
         payload.extend_from_slice(&[0x00; 8]); // trailing PADDING
 
-        assert_eq!(crypto_stream_prefix(&payload).as_deref(), Some(&b"hi"[..]));
+        assert_eq!(fragments(&payload), vec![(0, &b"hi"[..])]);
     }
 
     #[test]
@@ -400,28 +447,50 @@ mod tests {
         let mut payload = vec![0x02, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00];
         payload.extend_from_slice(&[0x06, 0x00, 0x01, b'x']);
 
-        assert_eq!(crypto_stream_prefix(&payload).as_deref(), Some(&b"x"[..]));
+        assert_eq!(fragments(&payload), vec![(0, &b"x"[..])]);
     }
 
     #[test]
-    fn two_crypto_frames_are_joined_in_offset_order() {
-        let mut payload = vec![0x06, 0x02, 0x02, b'c', b'd']; // offset 2
-        payload.extend_from_slice(&[0x06, 0x00, 0x02, b'a', b'b']); // offset 0
+    fn a_stream_is_joined_from_fragments_in_any_order() {
+        let mut stream = Stream::default();
+        assert!(stream.insert(4, b"efgh").is_ok());
+        assert_eq!(stream.contiguous(), b"");
+        assert!(stream.insert(0, b"abcd").is_ok());
+        assert_eq!(stream.contiguous(), b"abcdefgh");
+        // A duplicate is welcome, a gap ends the prefix.
+        assert!(stream.insert(2, b"cdef").is_ok());
+        assert!(stream.insert(100, b"z").is_ok());
+        assert_eq!(stream.contiguous(), b"abcdefgh");
+        assert_eq!(stream.data.len(), 101);
+    }
 
+    /// A byte sent twice with two values is refused, and refusing it changes
+    /// nothing that was there.
+    #[test]
+    fn a_fragment_that_disagrees_with_the_stream_is_refused_whole() {
+        let mut stream = Stream::default();
+        assert!(stream.insert(0, b"abcd").is_ok());
+        assert!(matches!(stream.insert(2, b"cX"), Err(Refused::Conflict)));
+        assert!(matches!(stream.insert(3, b"dZZ"), Ok(())));
+        assert!(matches!(stream.insert(1, b"bc!"), Err(Refused::Conflict)));
+        assert_eq!(stream.contiguous(), b"abcdZZ");
+    }
+
+    #[test]
+    fn a_fragment_past_the_hello_limit_is_refused() {
+        let mut stream = Stream::default();
+        let limit = u64::try_from(MAX_INITIAL_FLIGHT).expect("small");
+        assert!(stream.insert(limit - 1, b"a").is_ok());
+        assert!(matches!(stream.insert(limit, b"b"), Err(Refused::TooLong)));
+        assert!(matches!(
+            stream.insert(u64::MAX, b"c"),
+            Err(Refused::TooLong)
+        ));
+        assert_eq!(stream.data.len(), MAX_INITIAL_FLIGHT);
         assert_eq!(
-            crypto_stream_prefix(&payload).as_deref(),
-            Some(&b"abcd"[..])
+            stream.footprint(),
+            MAX_INITIAL_FLIGHT + MAX_INITIAL_FLIGHT / 8
         );
-    }
-
-    /// A gap is not filled in: what is returned is the contiguous prefix, and a
-    /// ClientHello read out of a stream with a hole in it would be nonsense.
-    #[test]
-    fn a_gap_ends_the_assembled_prefix() {
-        let mut payload = vec![0x06, 0x00, 0x02, b'a', b'b']; // offset 0
-        payload.extend_from_slice(&[0x06, 0x09, 0x02, b'y', b'z']); // offset 9
-
-        assert_eq!(crypto_stream_prefix(&payload).as_deref(), Some(&b"ab"[..]));
     }
 
     /// The header reader is total: no input makes it panic, and none of the
@@ -446,7 +515,7 @@ mod tests {
             let payload: Vec<u8> = (0..64u16)
                 .map(|i| u8::try_from((i.wrapping_mul(31).wrapping_add(seed)) & 0xff).unwrap())
                 .collect();
-            let _ = crypto_stream_prefix(&payload);
+            let _ = crypto_frames(&payload);
         }
     }
 }
