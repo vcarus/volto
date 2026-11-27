@@ -24,6 +24,7 @@
 #[path = "common/scripts.rs"]
 mod scripts;
 
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -31,31 +32,74 @@ use std::process::{Command, Output, Stdio};
 
 use scripts::{
     Scratch, loadable_config_text, path_with_stubs, plant_binary_without_the_flag,
-    plant_placeholder_certificates, real_binary, repo_root, scratch_tree, stderr_of, stdout_of,
-    write_executable,
+    plant_placeholder_certificates, real_binary, real_tool, repo_root, run_within_deadline,
+    scratch_tree, shell_function_body, stderr_of, stdout_of, write_executable,
 };
 
 fn deploy_script() -> PathBuf {
     repo_root().join("script/deploy.sh")
 }
 
-fn run_deploy(args: &[&str]) -> Output {
-    run_deploy_under(None, args)
-}
+/// The variables `deploy.sh` reads from its environment or hands on to the
+/// bundled installer, which a run clears so that an operator's shell cannot
+/// change it.
+const DEPLOY_ENVIRONMENT: [&str; 12] = [
+    "TAG",
+    "REPO",
+    "PASSWORD",
+    "SNI",
+    "PORT",
+    "USERNAME",
+    "BINARY",
+    "RUST_LOG",
+    "JOURNAL_STREAM",
+    "VOLTO_DEPLOY_CANDIDATE",
+    "VOLTO_DEPLOY_SIGNER",
+    "VOLTO_INSTALL_ROOT",
+];
 
-/// Runs the script as a file, optionally with its install paths relocated.
-fn run_deploy_under(root: Option<&Path>, args: &[&str]) -> Output {
-    let mut command = Command::new("bash");
+/// `bash`, run from the checkout with a null stdin, the variables in
+/// [`DEPLOY_ENVIRONMENT`] cleared, `VOLTO_DEPLOY_ROOT` set to `root` and
+/// `stubs` first on `PATH`. A caller adds the script, or `-s` to pipe it in.
+///
+/// `stubs` gets a `curl` and a `systemctl` that fail, unless the caller has
+/// planted its own, so a run that gets further than it should reaches neither
+/// the network nor the host's systemd.
+fn deploy_shell(root: &Path, stubs: &Path) -> Command {
+    fs::create_dir_all(stubs).expect("the stub directory must be creatable");
+    for tool in ["curl", "systemctl"] {
+        let stand_in = stubs.join(tool);
+        if !stand_in.exists() {
+            write_executable(
+                &stand_in,
+                &format!("#!/bin/sh\necho \"the test's {tool} refuses: $*\" >&2\nexit 97\n"),
+            );
+        }
+    }
+    let mut command = Command::new(real_tool("bash"));
     command
-        .arg(deploy_script())
-        .args(args)
-        .current_dir(repo_root());
-    if let Some(root) = root {
-        command.env("VOLTO_DEPLOY_ROOT", root);
+        .current_dir(repo_root())
+        .stdin(Stdio::null())
+        .env("PATH", path_with_stubs(stubs))
+        .env("VOLTO_DEPLOY_ROOT", root);
+    for variable in DEPLOY_ENVIRONMENT {
+        command.env_remove(variable);
     }
     command
-        .output()
-        .expect("the deploy script must be runnable")
+}
+
+/// [`deploy_shell`] running `script/deploy.sh`. Every run of the script starts
+/// here; a caller adds the arguments and what it sets.
+fn deploy(root: &Path, stubs: &Path) -> Command {
+    let mut command = deploy_shell(root, stubs);
+    command.arg(deploy_script());
+    command
+}
+
+/// Runs the script with `args`, its install paths under `root` and the
+/// stand-ins in `root/stubs`.
+fn run_deploy(root: &Path, args: &[&str]) -> Output {
+    run_within_deadline(deploy(root, &root.join("stubs")).args(args))
 }
 
 /// Runs the script with a binary standing in for the one a release would carry.
@@ -68,30 +112,11 @@ fn run_deploy_under(root: Option<&Path>, args: &[&str]) -> Output {
 /// from a branch of its own, and the real path's call is run by
 /// `the_real_update_path_refuses_a_release_that_cannot_load_the_config`.
 fn run_deploy_with_candidate(root: &Path, candidate: &Path, args: &[&str]) -> Output {
-    Command::new("bash")
-        .arg(deploy_script())
-        .args(args)
-        .current_dir(repo_root())
-        .env("VOLTO_DEPLOY_ROOT", root)
-        .env("VOLTO_DEPLOY_CANDIDATE", candidate)
-        .output()
-        .expect("the deploy script must be runnable")
-}
-
-/// Runs the script the way the documented one-liner does: `curl … | bash -s --`,
-/// which leaves `$0` as `bash` instead of a path, from the directory `cwd`.
-fn run_deploy_piped(root: &Path, cwd: &Path, args: &[&str]) -> Output {
-    let script = fs::File::open(deploy_script()).expect("the deploy script must be readable");
-
-    Command::new("bash")
-        .arg("-s")
-        .arg("--")
-        .args(args)
-        .current_dir(cwd)
-        .env("VOLTO_DEPLOY_ROOT", root)
-        .stdin(Stdio::from(script))
-        .output()
-        .expect("the deploy script must be runnable from stdin")
+    run_within_deadline(
+        deploy(root, &root.join("stubs"))
+            .args(args)
+            .env("VOLTO_DEPLOY_CANDIDATE", candidate),
+    )
 }
 
 /// A stand-in for a host's filesystem: the directories a Linux host already has,
@@ -144,7 +169,7 @@ fn plant_loadable_config(root: &Path, body: &str) {
 /// `-h` must work and describe the flags the documentation relies on.
 #[test]
 fn the_script_documents_itself() {
-    let output = run_deploy(&["-h"]);
+    let output = run_deploy(&install_root("usage"), &["-h"]);
 
     assert!(output.status.success());
     let usage = stdout_of(&output);
@@ -168,7 +193,10 @@ fn the_script_documents_itself() {
 /// Garbage flags must be rejected before anything privileged is attempted.
 #[test]
 fn unknown_options_are_rejected() {
-    let output = run_deploy(&["--definitely-not-a-flag"]);
+    let output = run_deploy(
+        &install_root("unknown-option"),
+        &["--definitely-not-a-flag"],
+    );
 
     assert!(!output.status.success(), "garbage flags must fail");
     let stderr = stderr_of(&output);
@@ -181,7 +209,7 @@ fn unknown_options_are_rejected() {
 /// A `--tag` with no value must be caught before any download starts.
 #[test]
 fn a_tag_option_without_a_value_is_rejected() {
-    let output = run_deploy(&["--tag"]);
+    let output = run_deploy(&install_root("tag-no-value"), &["--tag"]);
 
     assert!(!output.status.success(), "--tag without a value must fail");
     let stderr = stderr_of(&output);
@@ -195,7 +223,7 @@ fn a_tag_option_without_a_value_is_rejected() {
 /// dry run can reach it on a dev host.
 #[test]
 fn a_tag_without_its_leading_v_is_rejected() {
-    let output = run_deploy(&["--dry-run", "--tag", "0.2.4"]);
+    let output = run_deploy(&install_root("tag-no-v"), &["--dry-run", "--tag", "0.2.4"]);
 
     assert!(!output.status.success(), "a bare version must not be a tag");
     let stderr = stderr_of(&output);
@@ -208,7 +236,7 @@ fn a_tag_without_its_leading_v_is_rejected() {
 /// Resolving "latest" is a network call, which a dry run must never make.
 #[test]
 fn a_dry_run_without_a_tag_refuses_rather_than_resolving_one() {
-    let output = run_deploy(&["--dry-run"]);
+    let output = run_deploy(&install_root("dry-run-no-tag"), &["--dry-run"]);
 
     assert!(!output.status.success(), "a dry run needs an explicit tag");
     let stderr = stderr_of(&output);
@@ -223,7 +251,7 @@ fn a_dry_run_without_a_tag_refuses_rather_than_resolving_one() {
 /// words.
 #[test]
 fn forcing_a_reinstall_without_a_tag_is_rejected() {
-    let output = run_deploy(&["--force"]);
+    let output = run_deploy(&install_root("force-no-tag"), &["--force"]);
 
     assert!(
         !output.status.success(),
@@ -241,7 +269,7 @@ fn forcing_a_reinstall_without_a_tag_is_rejected() {
 /// release without a signature, because it is the path the timer takes.
 #[test]
 fn allowing_an_unsigned_release_without_a_tag_is_rejected() {
-    let output = run_deploy(&["--allow-unsigned"]);
+    let output = run_deploy(&install_root("unsigned-no-tag"), &["--allow-unsigned"]);
 
     assert!(
         !output.status.success(),
@@ -268,7 +296,7 @@ fn an_intact_install_is_reinstalled_when_the_run_is_forced() {
     plant_config(&root);
     plant_unit(&root);
 
-    let output = run_deploy_under(Some(&root), &["--dry-run", "--tag", "v0.2.4", "--force"]);
+    let output = run_deploy(&root, &["--dry-run", "--tag", "v0.2.4", "--force"]);
 
     assert!(output.status.success(), "{}", stderr_of(&output));
     assert_eq!(
@@ -287,7 +315,7 @@ fn an_intact_install_of_the_release_version_is_left_alone() {
     plant_config(&root);
     plant_unit(&root);
 
-    let output = run_deploy_under(Some(&root), &["--dry-run", "--tag", "v0.2.4"]);
+    let output = run_deploy(&root, &["--dry-run", "--tag", "v0.2.4"]);
 
     assert!(output.status.success(), "{}", stderr_of(&output));
     assert_eq!(
@@ -304,7 +332,7 @@ fn a_missing_config_reinstalls_at_the_matching_version() {
     plant_binary(&root, "0.2.4");
     plant_unit(&root);
 
-    let output = run_deploy_under(Some(&root), &["--dry-run", "--tag", "v0.2.4"]);
+    let output = run_deploy(&root, &["--dry-run", "--tag", "v0.2.4"]);
 
     assert!(output.status.success(), "{}", stderr_of(&output));
     assert_eq!(
@@ -321,7 +349,7 @@ fn a_missing_unit_at_the_matching_version_is_an_update() {
     plant_binary(&root, "0.2.4");
     plant_config(&root);
 
-    let output = run_deploy_under(Some(&root), &["--dry-run", "--tag", "v0.2.4"]);
+    let output = run_deploy(&root, &["--dry-run", "--tag", "v0.2.4"]);
 
     assert!(output.status.success(), "{}", stderr_of(&output));
     assert_eq!(
@@ -338,7 +366,7 @@ fn an_older_installed_version_becomes_an_update() {
     plant_config(&root);
     plant_unit(&root);
 
-    let output = run_deploy_under(Some(&root), &["--dry-run", "--tag", "v0.2.4"]);
+    let output = run_deploy(&root, &["--dry-run", "--tag", "v0.2.4"]);
 
     assert!(output.status.success(), "{}", stderr_of(&output));
     assert_eq!(
@@ -366,7 +394,7 @@ fn a_downgrade_says_what_bites_on_the_way_back() {
     plant_config(&root);
     plant_unit(&root);
 
-    let output = run_deploy_under(Some(&root), &["--dry-run", "--tag", "v0.4.4"]);
+    let output = run_deploy(&root, &["--dry-run", "--tag", "v0.4.4"]);
 
     assert!(output.status.success(), "{}", stderr_of(&output));
     let stdout = stdout_of(&output);
@@ -414,7 +442,7 @@ fn an_upgrade_and_a_reinstall_say_nothing_about_downgrades() {
         plant_config(&root);
         plant_unit(&root);
 
-        let output = run_deploy_under(Some(&root), &["--dry-run", "--tag", tag]);
+        let output = run_deploy(&root, &["--dry-run", "--tag", tag]);
 
         assert!(output.status.success(), "{}", stderr_of(&output));
         assert_eq!(
@@ -480,15 +508,12 @@ fn the_config_check_does_not_write_for_the_journal() {
     plant_loadable_config(&root, "\n[limits]\na_key_a_later_release_added = 2\n");
     plant_unit(&root);
 
-    let output = Command::new("bash")
-        .arg(deploy_script())
-        .args(["--dry-run", "--tag", "v0.4.4"])
-        .current_dir(repo_root())
-        .env("VOLTO_DEPLOY_ROOT", &root)
-        .env("VOLTO_DEPLOY_CANDIDATE", real_binary())
-        .env("JOURNAL_STREAM", "8:12345")
-        .output()
-        .expect("the deploy script must be runnable");
+    let output = run_within_deadline(
+        deploy(&root, &root.join("stubs"))
+            .args(["--dry-run", "--tag", "v0.4.4"])
+            .env("VOLTO_DEPLOY_CANDIDATE", real_binary())
+            .env("JOURNAL_STREAM", "8:12345"),
+    );
 
     let stderr = stderr_of(&output);
     assert!(
@@ -597,10 +622,7 @@ fn the_timer_copy_is_installed_once_and_then_left_alone() {
     plant_config(&root);
     plant_unit(&root);
 
-    let first = run_deploy_under(
-        Some(&root),
-        &["--dry-run", "--enable-timer", "--tag", "v0.2.4"],
-    );
+    let first = run_deploy(&root, &["--dry-run", "--enable-timer", "--tag", "v0.2.4"]);
     assert!(first.status.success(), "{}", stderr_of(&first));
 
     let installed = root.join("usr/local/sbin/volto-deploy");
@@ -625,10 +647,7 @@ fn the_timer_copy_is_installed_once_and_then_left_alone() {
         "the timer decision must be the last thing printed: {first_out}"
     );
 
-    let second = run_deploy_under(
-        Some(&root),
-        &["--dry-run", "--enable-timer", "--tag", "v0.2.4"],
-    );
+    let second = run_deploy(&root, &["--dry-run", "--enable-timer", "--tag", "v0.2.4"]);
     assert!(second.status.success(), "{}", stderr_of(&second));
     let second_out = stdout_of(&second);
     assert!(
@@ -676,13 +695,14 @@ fn a_dry_run_does_not_rewrite_the_installed_script() {
         &format!("#!/bin/sh\necho '{}'\n", deploy_script().display()),
     );
 
-    let output = Command::new("bash")
-        .arg(deploy_script())
-        .args(["--dry-run", "--enable-timer", "--tag", "v0.2.4"])
-        .current_dir(repo_root())
-        .env("PATH", path_with_stubs(&stubs))
-        .output()
-        .expect("the deploy script must be runnable");
+    // No VOLTO_DEPLOY_ROOT: the paths are the host's own, which is the case
+    // under test.
+    let output = run_within_deadline(deploy(&dir, &stubs).env_remove("VOLTO_DEPLOY_ROOT").args([
+        "--dry-run",
+        "--enable-timer",
+        "--tag",
+        "v0.2.4",
+    ]));
 
     assert!(
         output.status.success(),
@@ -701,44 +721,30 @@ fn a_dry_run_does_not_rewrite_the_installed_script() {
     );
 }
 
-/// The body of the shell function `name` in `script`, from its opening brace to
-/// the closing brace at column zero.
-///
-/// The braces bound the function, so a test runs exactly that function and
-/// none of the script around it.
-fn shell_function_body(script: &str, name: &str) -> String {
-    let text = fs::read_to_string(repo_root().join(script)).expect("the script must be readable");
-    let start = text
-        .find(&format!("\n{name}() {{"))
-        .unwrap_or_else(|| panic!("{script} carries no `{name}()` function"));
-    let rest = &text[start + 1..];
-    let end = rest
-        .find("\n}")
-        .unwrap_or_else(|| panic!("`{name}()` in {script} is never closed"));
-    rest[..end].to_owned()
-}
-
 /// Runs the shell function `name` from `script` on its own, with the stubs in
 /// `stubs` first on `PATH` and `prelude` run before the call.
 ///
 /// `die` is defined as a recorder that exits nonzero, so a test can read what
-/// the function reported. The function runs under `set -eE`, as in the script.
+/// the function reported. The function runs under `set -eEuo pipefail`, as in
+/// the script.
 fn run_shell_function(script: &str, name: &str, stubs: &Path, prelude: &str) -> Output {
-    run_shell_call(script, name, "", stubs, prelude)
+    run_shell_call(script, name, "", &path_with_stubs(stubs), prelude)
 }
 
-/// [`run_shell_function`], with `args` after the function's name in the call.
-fn run_shell_call(script: &str, name: &str, args: &str, stubs: &Path, prelude: &str) -> Output {
+/// [`run_shell_function`], with `then` after the function's name in the call
+/// and `path` as the whole `PATH`.
+fn run_shell_call(script: &str, name: &str, then: &str, path: &OsStr, prelude: &str) -> Output {
     let body = shell_function_body(script, name);
     let program = format!(
-        "set -eE\ndie() {{ printf 'die: %s\\n' \"$*\" >&2; exit 1; }}\nnote() {{ printf 'note: %s\\n' \"$*\"; }}\n{body}\n}}\n{prelude}\n{name} {args}\n"
+        "set -eEuo pipefail\ndie() {{ printf 'die: %s\\n' \"$*\" >&2; exit 1; }}\nnote() {{ printf 'note: %s\\n' \"$*\"; }}\n{body}\n}}\n{prelude}\n{name} {then}\n"
     );
 
-    Command::new("bash")
-        .args(["-c", &program])
-        .env("PATH", path_with_stubs(stubs))
-        .output()
-        .expect("bash must be runnable")
+    run_within_deadline(
+        Command::new(real_tool("bash"))
+            .args(["-c", &program])
+            .env("PATH", path)
+            .stdin(Stdio::null()),
+    )
 }
 
 /// The rollback puts the previous files back, reloads systemd, and starts the
@@ -782,7 +788,13 @@ fn restoring_the_previous_files_starts_rather_than_restarts_the_service() {
         bin.display(),
         unit.display()
     );
-    let output = run_shell_call("script/deploy.sh", "put_back", "start", &stubs, &prelude);
+    let output = run_shell_call(
+        "script/deploy.sh",
+        "put_back",
+        "start",
+        &path_with_stubs(&stubs),
+        &prelude,
+    );
 
     let stderr = stderr_of(&output);
     assert!(
@@ -1073,10 +1085,14 @@ fn a_piped_run_installs_nothing_even_beside_a_file_named_bash() {
     let elsewhere = scratch_tree("deploy", "piped-bash-cwd", &[]);
     write_executable(&elsewhere.join("bash"), "#!/bin/sh\necho planted\n");
 
-    let output = run_deploy_piped(
-        &root,
-        &elsewhere,
-        &["--dry-run", "--enable-timer", "--tag", "v0.2.4"],
+    // The documented one-liner, `curl ... | bash -s --`, which leaves `$0` as
+    // `bash` instead of a path.
+    let script = fs::File::open(deploy_script()).expect("the deploy script must be readable");
+    let output = run_within_deadline(
+        deploy_shell(&root, &root.join("stubs"))
+            .args(["-s", "--", "--dry-run", "--enable-timer", "--tag", "v0.2.4"])
+            .current_dir(&elsewhere)
+            .stdin(Stdio::from(script)),
     );
 
     assert!(
@@ -1160,21 +1176,15 @@ fn sign(dir: &Path, name: &str, namespace: &str, file: &Path) -> PathBuf {
     PathBuf::from(signature)
 }
 
-/// Runs `--verify-signature`, with the trusted key replaced when one is given.
-fn verify_signature(signer: Option<&str>, sums: &Path, signature: &Path) -> Output {
-    let mut command = Command::new("bash");
-    command
-        .arg(deploy_script())
-        .arg("--verify-signature")
-        .arg(sums)
-        .arg(signature)
-        .current_dir(repo_root());
+/// Runs `--verify-signature` on `root`, with the trusted key replaced when one
+/// is given.
+fn verify_signature(root: &Path, signer: Option<&str>, sums: &Path, signature: &Path) -> Output {
+    let mut command = deploy(root, &root.join("stubs"));
+    command.arg("--verify-signature").arg(sums).arg(signature);
     if let Some(signer) = signer {
         command.env("VOLTO_DEPLOY_SIGNER", signer);
     }
-    command
-        .output()
-        .expect("the deploy script must be runnable")
+    run_within_deadline(&mut command)
 }
 
 /// The key the script carries is the key that signs releases.
@@ -1187,6 +1197,7 @@ fn verify_signature(signer: Option<&str>, sums: &Path, signature: &Path) -> Outp
 fn the_embedded_key_accepts_a_signature_made_with_the_release_key() {
     let fixture = repo_root().join("tests/fixtures/release-signature");
     let output = verify_signature(
+        &install_root("embedded-key"),
         None,
         &fixture.join("SHA256SUMS"),
         &fixture.join("SHA256SUMS.sig"),
@@ -1218,7 +1229,7 @@ fn a_signature_is_accepted_only_from_the_trusted_key_over_the_same_bytes() {
     .unwrap();
     let signature = sign(&dir, "trusted", SIGN_NAMESPACE, &sums);
 
-    let good = verify_signature(Some(&trusted), &sums, &signature);
+    let good = verify_signature(&dir, Some(&trusted), &sums, &signature);
     assert!(
         good.status.success(),
         "a signature by the trusted key over the same bytes must verify: {}",
@@ -1232,7 +1243,7 @@ fn a_signature_is_accepted_only_from_the_trusted_key_over_the_same_bytes() {
         "0123abce  volto-9.9.9-x86_64-unknown-linux-musl.tar.gz\n",
     )
     .unwrap();
-    let output = verify_signature(Some(&trusted), &tampered, &signature);
+    let output = verify_signature(&dir, Some(&trusted), &tampered, &signature);
     assert!(!output.status.success(), "a changed list must be refused");
     assert!(
         stderr_of(&output).contains("is not the release key's signature"),
@@ -1244,7 +1255,7 @@ fn a_signature_is_accepted_only_from_the_trusted_key_over_the_same_bytes() {
     let by_stranger = dir.join("by-stranger");
     fs::copy(&sums, &by_stranger).unwrap();
     let stranger_signature = sign(&dir, "stranger", SIGN_NAMESPACE, &by_stranger);
-    let output = verify_signature(Some(&trusted), &by_stranger, &stranger_signature);
+    let output = verify_signature(&dir, Some(&trusted), &by_stranger, &stranger_signature);
     assert!(
         !output.status.success(),
         "a signature by another key must be refused"
@@ -1254,14 +1265,14 @@ fn a_signature_is_accepted_only_from_the_trusted_key_over_the_same_bytes() {
     let other_purpose = dir.join("other-purpose");
     fs::copy(&sums, &other_purpose).unwrap();
     let git_signature = sign(&dir, "trusted", "git", &other_purpose);
-    let output = verify_signature(Some(&trusted), &other_purpose, &git_signature);
+    let output = verify_signature(&dir, Some(&trusted), &other_purpose, &git_signature);
     assert!(
         !output.status.success(),
         "a signature under another namespace must be refused"
     );
 
     // No signature at all.
-    let output = verify_signature(Some(&trusted), &sums, &dir.join("absent.sig"));
+    let output = verify_signature(&dir, Some(&trusted), &sums, &dir.join("absent.sig"));
     assert!(
         !output.status.success(),
         "a missing signature must be refused"
@@ -1269,7 +1280,7 @@ fn a_signature_is_accepted_only_from_the_trusted_key_over_the_same_bytes() {
 
     // And the key the script carries does not accept the test key's signature,
     // so the override above is what made the first case pass.
-    let output = verify_signature(None, &sums, &signature);
+    let output = verify_signature(&dir, None, &sums, &signature);
     assert!(
         !output.status.success(),
         "the embedded key accepted a signature made by a test key"
@@ -1638,10 +1649,7 @@ fn the_trusted_key_is_a_literal_and_the_install_path_is_one_call() {
 fn allowing_an_unsigned_release_is_refused_from_the_first_signed_version_on() {
     let root = install_root("allow-unsigned-range");
 
-    let output = run_deploy_under(
-        Some(&root),
-        &["--dry-run", "--tag", "v1.4.0", "--allow-unsigned"],
-    );
+    let output = run_deploy(&root, &["--dry-run", "--tag", "v1.4.0", "--allow-unsigned"]);
     assert!(
         !output.status.success(),
         "--allow-unsigned must not apply to the first signed release"
@@ -1653,8 +1661,8 @@ fn allowing_an_unsigned_release_is_refused_from_the_first_signed_version_on() {
     );
 
     // Fields compare as numbers, so 1.10.0 is not before 1.4.0.
-    let output = run_deploy_under(
-        Some(&root),
+    let output = run_deploy(
+        &root,
         &["--dry-run", "--tag", "v1.10.0", "--allow-unsigned"],
     );
     assert!(
@@ -1662,10 +1670,7 @@ fn allowing_an_unsigned_release_is_refused_from_the_first_signed_version_on() {
         "--allow-unsigned must not apply to 1.10.0"
     );
 
-    let output = run_deploy_under(
-        Some(&root),
-        &["--dry-run", "--tag", "v1.3.7", "--allow-unsigned"],
-    );
+    let output = run_deploy(&root, &["--dry-run", "--tag", "v1.3.7", "--allow-unsigned"]);
     assert!(
         output.status.success(),
         "--allow-unsigned must apply to a release from before signing: {}",
@@ -1788,7 +1793,10 @@ fn the_downgrade_refusal_runs_before_any_download_and_is_armed_by_the_lookup_alo
 /// through to an ordinary run, which exited 0 having verified nothing.
 #[test]
 fn verifying_a_signature_with_an_empty_file_name_fails() {
-    let output = run_deploy(&["--verify-signature", "", "x"]);
+    let output = run_deploy(
+        &install_root("verify-empty-name"),
+        &["--verify-signature", "", "x"],
+    );
 
     assert!(
         !output.status.success(),
@@ -1805,13 +1813,16 @@ fn verifying_a_signature_takes_no_other_option() {
     let fixture = repo_root().join("tests/fixtures/release-signature");
     let sums = fixture.join("SHA256SUMS");
     let signature = fixture.join("SHA256SUMS.sig");
-    let output = run_deploy(&[
-        "--verify-signature",
-        sums.to_str().unwrap(),
-        signature.to_str().unwrap(),
-        "--tag",
-        "v1.4.0",
-    ]);
+    let output = run_deploy(
+        &install_root("verify-other-option"),
+        &[
+            "--verify-signature",
+            sums.to_str().unwrap(),
+            signature.to_str().unwrap(),
+            "--tag",
+            "v1.4.0",
+        ],
+    );
 
     assert!(
         !output.status.success(),
@@ -2139,42 +2150,19 @@ impl Host {
         .expect("the latest marker must be writable");
     }
 
-    /// Runs `script/deploy.sh` with `args`, its paths under `root` and the stubs
-    /// first on `PATH`.
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new("bash")
-            .arg(deploy_script())
-            .args(args)
-            .current_dir(repo_root())
-            .env("PATH", path_with_stubs(&self.stubs))
-            .env("VOLTO_DEPLOY_ROOT", &self.root)
+    /// A run of `script/deploy.sh` on this host: [`deploy`] with the stubs,
+    /// the release page's repository and the run's `TMPDIR`.
+    fn command(&self) -> Command {
+        let mut command = deploy(&self.root, &self.stubs);
+        command
             .env("REPO", "example/volto")
-            .env("TMPDIR", &self.tmp)
-            .env_remove("RUST_LOG")
-            .env_remove("TAG")
-            .env_remove("VOLTO_DEPLOY_CANDIDATE")
-            .env_remove("VOLTO_DEPLOY_SIGNER")
-            .output()
-            .expect("the deploy script must be runnable")
+            .env("TMPDIR", &self.tmp);
+        command
     }
 
-    /// [`Host::run`] with `RUST_LOG` set to `rust_log` in the script's own
-    /// environment, as an operator's shell may have it.
-    fn run_with_rust_log(&self, args: &[&str], rust_log: &str) -> Output {
-        Command::new("bash")
-            .arg(deploy_script())
-            .args(args)
-            .current_dir(repo_root())
-            .env("PATH", path_with_stubs(&self.stubs))
-            .env("VOLTO_DEPLOY_ROOT", &self.root)
-            .env("REPO", "example/volto")
-            .env("TMPDIR", &self.tmp)
-            .env("RUST_LOG", rust_log)
-            .env_remove("TAG")
-            .env_remove("VOLTO_DEPLOY_CANDIDATE")
-            .env_remove("VOLTO_DEPLOY_SIGNER")
-            .output()
-            .expect("the deploy script must be runnable")
+    /// Runs `script/deploy.sh` on this host with `args`.
+    fn run(&self, args: &[&str]) -> Output {
+        run_within_deadline(self.command().args(args))
     }
 
     /// Makes `systemctl show -p Environment --value volto` answer `words`.
@@ -2702,8 +2690,13 @@ fn a_unit_rust_log_the_release_accepts_or_none_lets_the_update_proceed() {
         let candidate = host.publish(UNSIGNED_TAG, Candidate::RefusesASilencingRustLog);
         host.set_unit_environment(environment);
 
-        let output =
-            host.run_with_rust_log(&["--allow-unsigned", "--tag", UNSIGNED_TAG], "quinn=debug");
+        // The script's own environment sets the value the release refuses, as
+        // an operator's shell may.
+        let output = run_within_deadline(
+            host.command()
+                .args(["--allow-unsigned", "--tag", UNSIGNED_TAG])
+                .env("RUST_LOG", "quinn=debug"),
+        );
 
         let stdout = stdout_of(&output);
         assert!(
@@ -2849,16 +2842,12 @@ fn the_binary_is_replaced_by_a_rename() {
     let host = Host::new("atomic-swap", Service::ComesUp);
     host.plant_install();
     let candidate = host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
-    let real_install = Command::new("sh")
-        .args(["-c", "command -v install"])
-        .output()
-        .expect("sh must be runnable");
     write_executable(
         &host.stubs.join("install"),
         &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
             host.logs.join("install").display(),
-            stdout_of(&real_install).trim()
+            real_tool("install").display()
         ),
     );
 
@@ -2891,14 +2880,7 @@ fn the_binary_is_replaced_by_a_rename() {
 /// and `mv` record their arguments and run the host's own.
 #[test]
 fn the_unit_and_the_timer_units_are_replaced_by_a_rename() {
-    let real = |tool: &str| {
-        let found = Command::new("sh")
-            .args(["-c", &format!("command -v {tool}")])
-            .output()
-            .expect("sh must be runnable");
-        stdout_of(&found).trim().to_owned()
-    };
-    let (real_install, real_mv) = (real("install"), real("mv"));
+    let (real_install, real_mv) = (real_tool("install"), real_tool("mv"));
 
     for (name, service, args) in [
         (
@@ -2920,8 +2902,9 @@ fn the_unit_and_the_timer_units_are_replaced_by_a_rename() {
             write_executable(
                 &host.stubs.join(tool),
                 &format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{path}' \"$@\"\n",
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
                     host.logs.join(tool).display(),
+                    path.display(),
                 ),
             );
         }
@@ -3083,27 +3066,18 @@ fn without_flock_a_directory_with_a_live_pid_is_the_lock() {
     let dir = scratch_tree("deploy", "lock-fallback", &["tools", "run"]);
     let tools = dir.join("tools");
     for tool in ["mkdir", "cat", "rm"] {
-        let real = Command::new("sh")
-            .args(["-c", &format!("command -v {tool}")])
-            .output()
-            .expect("sh must be runnable");
-        std::os::unix::fs::symlink(stdout_of(&real).trim(), tools.join(tool))
-            .expect("link the tool");
+        std::os::unix::fs::symlink(real_tool(tool), tools.join(tool)).expect("link the tool");
     }
     let lock = dir.join("run/volto-deploy.lock");
     let held = dir.join("run/volto-deploy.lock.d");
     let acquire = |name: &str| {
-        let body = shell_function_body("script/deploy.sh", "acquire_lock");
-        let program = format!(
-            "set -eE\ndie() {{ printf 'die: %s\\n' \"$*\" >&2; exit 1; }}\n{body}\n}}\n\
-             LOCK='{}'\nLOCK_DIR=\nacquire_lock\necho \"took $LOCK_DIR\"\n",
-            lock.display()
+        let output = run_shell_call(
+            "script/deploy.sh",
+            "acquire_lock",
+            "&& echo \"took $LOCK_DIR\"",
+            tools.as_os_str(),
+            &format!("LOCK='{}'\nLOCK_DIR=", lock.display()),
         );
-        let output = Command::new("/bin/bash")
-            .args(["-c", &program])
-            .env("PATH", &tools)
-            .output()
-            .expect("bash must be runnable");
         (name.to_owned(), output)
     };
 
