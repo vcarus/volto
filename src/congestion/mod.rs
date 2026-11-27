@@ -424,6 +424,120 @@ impl Bbr {
         );
     }
 
+    /// What a closed sample interval moves, in this order: the close line's
+    /// counts, the startup, the early probe after it, the steady gain and the
+    /// countdown to the probe that confirms a first reading. The caller
+    /// refreshes the window.
+    fn on_interval(&mut self, sample: &Sample) {
+        let was_ended = self.startup.ended;
+        // The close line's counts, read before this interval moves the
+        // startup, the estimate and the cap, and before the startup takes
+        // the interval's lost bytes. A probe's ACKs count as app-limited,
+        // so an interval with a probe in it is left out with the others.
+        let flight = std::mem::take(&mut self.flight);
+        if was_ended && !sample.app_limited {
+            self.record.count(Counted {
+                length: sample.ack_elapsed,
+                rate: sample.rate,
+                at_floor: self.cap.is_some_and(|cap| cap <= INITIAL_WINDOW),
+                lossless: self.startup.lossless(),
+                window: self.window,
+                flight,
+                min_rtt: self.min_rtt.map_or(Duration::ZERO, |(min, _)| min),
+                base_loss_ppm: self.base.ppm(),
+                gain_permille: self.gain.permille,
+            });
+        }
+        // 1.5 times the base loss: any lost byte while it is zero.
+        let exit_above = self.base.ppm() * 3 / 2;
+        self.startup.on_interval(
+            self.rate.max().unwrap_or(0),
+            sample.app_limited,
+            exit_above,
+            self.exit_packets() * self.mtu,
+        );
+        if self.startup.ended
+            && !was_ended
+            && !self.base.has_reading()
+            && self.startup.lost_ppm() >= self.base.early_probe_ppm()
+        {
+            self.probe_due = true;
+            self.repeat = true;
+        }
+        if self.startup.ended {
+            self.slow_start = None;
+            let estimate = self.rate.max().unwrap_or(0);
+            let packets = WINDOW_PACKETS * self.mtu;
+            let probing = self.probe.is_some();
+            self.gain.on_interval(
+                probing,
+                sample.app_limited,
+                estimate,
+                packets,
+                self.base.ppm(),
+            );
+        } else {
+            self.gain = Gain::default();
+        }
+        if self.probe.is_none()
+            && let Some(left) = self.confirm
+        {
+            if left <= 1 {
+                self.confirm = None;
+                self.probe_due = true;
+            } else {
+                self.confirm = Some(left - 1);
+            }
+        }
+    }
+
+    /// Closes the base-loss reading when it is due, and moves the probes it
+    /// makes due: the confirming probe and the repeat of the early probe.
+    /// Returns whether a reading closed, which can change the window.
+    fn on_reading(&mut self, now: Instant) -> bool {
+        let least = READING_PACKETS * self.mtu;
+        let was_zero = self.base.ppm() == 0;
+        let closed = self.base.close(now, self.srtt, least);
+        if closed != Closed::No {
+            #[cfg(test)]
+            {
+                self.last_closed = Some((now, closed));
+            }
+            tracing::debug!(
+                outcome = ?closed,
+                base_loss_ppm = self.base.ppm(),
+                "bbr reading"
+            );
+        }
+        match closed {
+            Closed::Kept { .. } if was_zero && self.base.ppm() >= self.base.early_probe_ppm() => {
+                // A reading that takes the base loss up from zero acts at once
+                // and is confirmed by one more probe.
+                self.confirm = Some(CONFIRM_INTERVALS);
+            }
+            Closed::Unverified { .. } | Closed::Cleared { .. } => {
+                // What arrived did not fall with what was sent: the startup's
+                // loss was a limit's, and probing again soon tells nothing more.
+                self.repeat = false;
+            }
+            Closed::Short { own, lost_ppm, .. } if self.repeat => {
+                // At least a quarter of a reading, so that four such probes
+                // complete one, and a loss that a reading is needed for. Under
+                // either, the regular probes take the carry further.
+                if own.saturating_mul(4) >= least && lost_ppm >= self.base.early_probe_ppm() {
+                    self.probe_due = true;
+                } else {
+                    self.repeat = false;
+                }
+            }
+            _ => {}
+        }
+        if self.base.has_reading() {
+            self.repeat = false;
+        }
+        closed != Closed::No
+    }
+
     /// The window limit, once there is a delivery-rate sample to compute it
     /// from: the steady gain times the bandwidth-delay product, the startup
     /// gain times it until the startup has ended, or half of it during a probe.
@@ -486,114 +600,13 @@ impl Controller for Bbr {
         self.unsent = Some(in_flight);
         let sample = self.rate.on_end_acks(now, app_limited, self.srtt);
         if let Some(sample) = &sample {
-            let was_ended = self.startup.ended;
-            // The close line's counts, read before this interval moves the
-            // startup, the estimate and the cap, and before the startup takes
-            // the interval's lost bytes. A probe's ACKs count as app-limited,
-            // so an interval with a probe in it is left out with the others.
-            let flight = std::mem::take(&mut self.flight);
-            if was_ended && !sample.app_limited {
-                self.record.count(Counted {
-                    length: sample.ack_elapsed,
-                    rate: sample.rate,
-                    at_floor: self.cap.is_some_and(|cap| cap <= INITIAL_WINDOW),
-                    lossless: self.startup.lossless(),
-                    window: self.window,
-                    flight,
-                    min_rtt: self.min_rtt.map_or(Duration::ZERO, |(min, _)| min),
-                    base_loss_ppm: self.base.ppm(),
-                    gain_permille: self.gain.permille,
-                });
-            }
-            // 1.5 times the base loss: any lost byte while it is zero.
-            let exit_above = self.base.ppm() * 3 / 2;
-            self.startup.on_interval(
-                self.rate.max().unwrap_or(0),
-                sample.app_limited,
-                exit_above,
-                self.exit_packets() * self.mtu,
-            );
-            if self.startup.ended
-                && !was_ended
-                && !self.base.has_reading()
-                && self.startup.lost_ppm() >= self.base.early_probe_ppm()
-            {
-                self.probe_due = true;
-                self.repeat = true;
-            }
-            if self.startup.ended {
-                self.slow_start = None;
-                let estimate = self.rate.max().unwrap_or(0);
-                let packets = WINDOW_PACKETS * self.mtu;
-                let probing = self.probe.is_some();
-                self.gain.on_interval(
-                    probing,
-                    sample.app_limited,
-                    estimate,
-                    packets,
-                    self.base.ppm(),
-                );
-            } else {
-                self.gain = Gain::default();
-            }
-            if self.probe.is_none()
-                && let Some(left) = self.confirm
-            {
-                if left <= 1 {
-                    self.confirm = None;
-                    self.probe_due = true;
-                } else {
-                    self.confirm = Some(left - 1);
-                }
-            }
+            self.on_interval(sample);
             self.refresh();
         }
         if self.update_probe(now, in_flight) {
             self.refresh();
         }
-        let least = READING_PACKETS * self.mtu;
-        let was_zero = self.base.ppm() == 0;
-        let closed = self.base.close(now, self.srtt, least);
-        if let Closed::Kept { .. } = closed
-            && was_zero
-            && self.base.ppm() >= self.base.early_probe_ppm()
-        {
-            // A reading that takes the base loss up from zero acts at once
-            // and is confirmed by one more probe.
-            self.confirm = Some(CONFIRM_INTERVALS);
-        }
-        if closed != Closed::No {
-            #[cfg(test)]
-            {
-                self.last_closed = Some((now, closed));
-            }
-            tracing::debug!(
-                outcome = ?closed,
-                base_loss_ppm = self.base.ppm(),
-                "bbr reading"
-            );
-        }
-        if let Closed::Unverified { .. } | Closed::Cleared { .. } = closed {
-            // What arrived did not fall with what was sent: the startup's
-            // loss was a limit's, and probing again soon tells nothing more.
-            self.repeat = false;
-        }
-        if let Closed::Short { own, lost_ppm, .. } = closed
-            && self.repeat
-        {
-            // At least a quarter of a reading, so that four such probes
-            // complete one, and a loss that a reading is needed for. Under
-            // either, the regular probes take the carry further.
-            if own.saturating_mul(4) >= least && lost_ppm >= self.base.early_probe_ppm() {
-                self.probe_due = true;
-            } else {
-                self.repeat = false;
-            }
-        }
-        if self.base.has_reading() {
-            self.repeat = false;
-        }
-        if closed != Closed::No {
+        if self.on_reading(now) {
             self.refresh();
         }
         // The slow-start limit moved with the bytes this batch acknowledged.
