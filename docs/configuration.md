@@ -662,8 +662,10 @@ Some details worth knowing before relying on it:
 - **A packet that names nobody can still draw an acknowledgement.** The check
   refuses an Initial whose Destination Connection ID is under the eight bytes
   RFC 9000 §7.2 requires of a client's first packet, since no later one is that
-  shape either and quinn applies the same floor before decrypting;
-  what it passes, it passes to quinn, which acknowledges an Initial carrying an
+  shape either and quinn applies the same floor before decrypting. It also
+  refuses an Initial whose frames do not parse or include a type no Initial
+  packet may carry (RFC 9000 §17.2.2), which quinn would answer with a
+  `CONNECTION_CLOSE`. What it passes, it passes to quinn, which acknowledges an Initial carrying an
   ack-eliciting frame whether or not a name is in it. Sending one means building
   a QUIC Initial packet on purpose, which is a probe aimed at this server rather
   than a scan of the address.

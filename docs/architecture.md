@@ -108,7 +108,10 @@ same floor ahead of its own decryption, in `early_validate_first_packet`. A
 shorter one is refused here, which is the `CONNECTION_CLOSE` above never sent.
 The packet is then opened: the keys for it are derived from the Destination
 Connection ID in the packet itself (RFC 9001 §5.2), so no connection state is
-needed to read it. Its CRYPTO frames are assembled from offset zero,
+needed to read it. An Initial whose frames do not parse, or carry a type no
+Initial packet may carry (RFC 9000 §17.2.2), is refused, because quinn would
+close the connection over it with a `CONNECTION_CLOSE`. Its CRYPTO frames are
+assembled from offset zero,
 the ClientHello is parsed, and the `server_name` extension (RFC 6066 §3) is
 compared with the configured list — ASCII case-insensitively, with a trailing
 root dot ignored, name for name and no wildcards.
@@ -522,6 +525,10 @@ handled by `src/capsule.rs` as an incremental TLV decoder:
 - **Unknown capsule types are skipped** by reading the length and discarding the
   value edge-to-edge, with no accumulation — a peer declaring a 2⁶²-byte capsule
   costs no memory. A truncated capsule is a malformed message.
+- A DATAGRAM capsule whose value ends before its Context ID is a malformed
+  message as well (RFC 9297 §3.3), and its stream is reset with
+  `H3_MESSAGE_ERROR`. One that declares more than a UDP payload can hold breaks
+  this server's own bound and is reset with `H3_DATAGRAM_ERROR`.
 - The DATAGRAM capsule (type 0x00) is the reliable fallback channel for when QUIC
   datagrams are unavailable. It is a *fallback*, not a downgrade: a target packet
   too large for a QUIC datagram is dropped rather than re-routed through the
@@ -580,6 +587,8 @@ is what a CONNECT proxy needs, and it is stated in full:
   CONNECTION_CLOSE carrying `H3_CLOSED_CRITICAL_STREAM`.
 - **Request validation** — RFC 9114 §4.1.2, §4.3 and §4.4 plus RFC 8441 §4: the
   point at which a field section becomes a request or is refused as malformed.
+  A `%` in the path, its query or the authority that two hex digits do not
+  follow (RFC 3986 §2.1) is malformed too.
 - **The message vocabulary** — a status, a method, a request and a list of field
   lines, in `src/h3/message.rs`. A field section is decoded once, validated
   once, and carried in one type. D78 gives why this is not the `http` crate.
@@ -668,7 +677,9 @@ malformed whoever sent it, and judging it afterwards answered that MUST with a
 
 A peer that closes its QPACK encoder or decoder stream is treated as
 `H3_CLOSED_CRITICAL_STREAM`, the connection error RFC 9204 §4.2 requires, and
-both endings count: a clean finish and a reset alike. The one exemption is a
+both endings count: a clean finish and a reset alike. A STOP_SENDING from the
+peer on one of this endpoint's own two QPACK streams is answered the same way,
+as one on its control stream is. The one exemption is a
 connection that has already ended, where the closure is the connection going
 away rather than a fault the peer committed. That is the exemption the control
 stream makes for the same race.
