@@ -1048,11 +1048,12 @@ const QUINN_PROTO_MARKERS: [&str; 5] = [
 
 /// Whether `line` carries a line number.
 ///
-/// Two spellings: `line N` or `lines N to M`, where the word starts at a word
-/// boundary and is followed by a digit; and a source path followed by a colon
-/// and digits, as in `src/connection/mod.rs:42`. For a directory prefix the
-/// text before the colon is the file name and must contain no whitespace; a
-/// full file path may be followed by the colon directly.
+/// Three spellings: `line N` or `lines N to M`, where the word starts at a word
+/// boundary and is followed by a digit; a source path followed by a colon and
+/// digits, as in `src/connection/mod.rs:42`, where for a directory prefix the
+/// text before the colon is the file name and must contain no whitespace and a
+/// full file path may be followed by the colon directly; and a permalink's
+/// `#L` anchor followed by a digit.
 fn carries_a_line_number(line: &str) -> bool {
     let bytes = line.as_bytes();
     let word_form = line.match_indices("line").any(|(at, _)| {
@@ -1078,7 +1079,11 @@ fn carries_a_line_number(line: &str) -> bool {
         })
     });
 
-    word_form || colon_form
+    let anchor_form = line
+        .match_indices("#L")
+        .any(|(at, _)| line[at + "#L".len()..].starts_with(|c: char| c.is_ascii_digit()));
+
+    word_form || colon_form || anchor_form
 }
 
 #[test]
@@ -1101,6 +1106,11 @@ fn carries_a_line_number_recognizes_each_spelling() {
         "quinn-proto src/connection/mod.rs: 42"
     ));
 
+    // The anchor form of a permalink.
+    assert!(carries_a_line_number(
+        "https://github.com/quinn-rs/quinn/blob/main/quinn-proto/src/connection/mod.rs#L42"
+    ));
+
     // Not a line-number citation.
     assert!(!carries_a_line_number("quinn-proto src/connection/mod.rs"));
     assert!(!carries_a_line_number(
@@ -1108,6 +1118,9 @@ fn carries_a_line_number_recognizes_each_spelling() {
     ));
     assert!(!carries_a_line_number(
         "quinn-proto src/connection/ has no file name"
+    ));
+    assert!(!carries_a_line_number(
+        "quinn-proto src/connection/mod.rs#Lost"
     ));
 }
 
