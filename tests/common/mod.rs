@@ -1549,8 +1549,9 @@ pub async fn spawn_bursting_udp_target(count: u32, size: usize) -> SocketAddr {
 /// the server finishes its sending side.
 ///
 /// Returns the bytes read and whether the stream ended before `enough` did.
-/// `caller` is the test's location, captured by the public helper that called
-/// this (D66).
+/// The whole read is bounded by [`TIMEOUT`], not each chunk, so a stream that
+/// keeps delivering and never ends fails here too. `caller` is the test's
+/// location, captured by the public helper that called this (D66).
 async fn read_while(
     stream: &mut ClientStream,
     mut enough: impl FnMut(usize) -> bool,
@@ -1558,9 +1559,10 @@ async fn read_while(
 ) -> (Vec<u8>, bool) {
     use bytes::Buf;
 
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
     let mut out = Vec::new();
     while !enough(out.len()) {
-        let chunk = tokio::time::timeout(TIMEOUT, stream.recv_data())
+        let chunk = tokio::time::timeout_at(deadline, stream.recv_data())
             .await
             .unwrap_or_else(|_| {
                 panic!(

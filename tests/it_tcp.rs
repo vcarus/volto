@@ -2121,3 +2121,36 @@ async fn a_trailer_section_sent_before_the_connect_is_answered_ends_the_connecti
         "a tunnel cut before it carried anything is still cut abortively"
     );
 }
+
+/// `read_to_end` gives up on a tunnel that keeps delivering and never ends.
+///
+/// A harness check: the read is bounded as a whole, so a regression that kept
+/// a stream open behind a talkative target fails the test that read it rather
+/// than holding it until the target stops.
+#[tokio::test]
+#[should_panic(expected = "timed out after")]
+async fn read_to_end_is_bounded_as_a_whole() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+    let target = listener.local_addr().expect("target address");
+    // One byte every 200 ms, for three times the bound and then no more, so
+    // only a bound on the whole read can end the read below in time.
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("the proxy connects");
+        for _ in 0..(3 * TIMEOUT.as_millis() / 200) {
+            if socket.write_all(b".").await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    let server = TestServer::start().await;
+    let mut client = H3Client::connect(&server).await;
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+
+    let outer = tokio::time::timeout(2 * TIMEOUT, read_to_end(&mut stream)).await;
+    panic!(
+        "read_to_end was not bounded: {} bytes",
+        outer.map_or(0, |read| read.len())
+    );
+}
