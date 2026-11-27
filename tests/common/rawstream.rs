@@ -727,6 +727,8 @@ pub fn expect_reset<'a>(
             ),
             other => panic!("at {caller}: {what}: expected a reset with {code:#x}, got {other:?}"),
         }
+    }
+}
 
 /// Writes `request`, a request stream's opening bytes that the server will
 /// accept, on a connection that grants no stream window, and asserts that the
