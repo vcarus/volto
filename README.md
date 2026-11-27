@@ -80,7 +80,7 @@ A commented example configuration is [script/config.example.toml](script/config.
 | **TLS** | TLS 1.3 on AWS-LC's libssl with the key exchange groups X25519MLKEM768, X25519, P-256 and P-384, of which the client's order of preference picks one, 1-RTT only with no session tickets, and optional Encrypted Client Hello: `volto ech-keygen` writes the key and prints the ECHConfigList a client's `ech-config` takes. See [Encrypted Client Hello](docs/configuration.md#encrypted-client-hello). |
 | **QUIC transport** | Stream limits, idle timeout, keep-alive, initial MTU, PMTU probing, congestion controller (BBR by default) and initial RTT are configuration, not constants. |
 | **Operations** | `SIGHUP` reload that rejects a bad configuration whole and keeps serving; graceful shutdown with GOAWAY and a grace period; systemd unit, installer and self-updating deploy script included. |
-| **Diagnostics** | Per-request debug logging with redacted credentials, `SSLKEYLOGFILE` for frame-level analysis, `--check-config`, which runs the same configuration loading as startup, including the ECH key file and the leaf certificate, but does not parse the key or check that it pairs with the certificate ([what it covers](docs/configuration.md#checking-a-file-without-starting-the-server)), and `--diagnostics`, which prints a support bundle with the passwords redacted. |
+| **Diagnostics** | Per-request debug logging with redacted credentials, `SSLKEYLOGFILE` for frame-level analysis, `--check-config` (see [what it covers](docs/configuration.md#checking-a-file-without-starting-the-server)), and `--diagnostics`, which prints a support bundle with the passwords redacted. |
 
 **Explicit non-goals:** CONNECT-IP (RFC 9484), traffic obfuscation, and a web admin panel.
 
