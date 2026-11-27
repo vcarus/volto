@@ -619,16 +619,9 @@ fn a_parked_name_lookup_does_not_hold_the_exit_past_the_bound() {
          measures nothing: {bound:?} + {MARGIN:?} against {PARKED:?}"
     );
 
-    // Built exactly as `main` builds it, blocking pool included: a bound that
-    // held only on a runtime with a different pool would not be the one the
-    // binary gets.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .max_blocking_threads(volto::net::blocking_pool_size(
-            volto::config::Limits::default().max_connections,
-        ))
-        .build()
-        .expect("build the runtime the way the binary does");
+    // The runtime `main` serves on, blocking pool included.
+    let runtime = volto::shutdown::runtime(volto::config::Limits::default().max_connections)
+        .expect("build the runtime the binary serves on");
 
     runtime.block_on(async {
         let mut server =

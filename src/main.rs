@@ -201,12 +201,7 @@ fn start() -> Result<()> {
         return Ok(());
     }
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .max_blocking_threads(volto::net::blocking_pool_size(
-            config.limits.max_connections,
-        ))
-        .build()
+    let runtime = volto::shutdown::runtime(config.limits.max_connections)
         .context("failed to build the async runtime")?;
 
     let served = runtime.block_on(run(path, config));

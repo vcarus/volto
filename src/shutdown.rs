@@ -46,6 +46,18 @@ pub const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 // on the wire.
 const _: () = assert!(!CLOSE_FLUSH_TIMEOUT.is_zero());
 
+/// The runtime the binary serves on, with a blocking pool sized for
+/// `max_connections` ([`crate::net::blocking_pool_size`]).
+///
+/// Built here, beside [`stop_runtime`], so the test of the exit bound runs on
+/// the same runtime the binary does.
+pub fn runtime(max_connections: u32) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(crate::net::blocking_pool_size(max_connections))
+        .build()
+}
+
 /// Stops `runtime`, waiting at most [`EXIT_SLACK`] for its blocking tasks.
 ///
 /// The replacement for dropping the runtime, which tokio documents as blocking
