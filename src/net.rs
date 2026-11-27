@@ -863,7 +863,7 @@ pub async fn connected_udp_socket(target: SocketAddr) -> io::Result<UdpSocket> {
     };
 
     let socket = UdpSocket::bind(bind).await?;
-    set_dont_fragment(&socket);
+    set_dont_fragment(&socket, target.is_ipv4());
     socket.connect(target).await?;
 
     // ECN is left alone: an unset codepoint is Not-ECT (RFC 3168), which is what
@@ -872,20 +872,16 @@ pub async fn connected_udp_socket(target: SocketAddr) -> io::Result<UdpSocket> {
     Ok(socket)
 }
 
-/// Sets the IP "don't fragment" bit and enables path MTU discovery.
+/// Sets the IP "don't fragment" bit and enables path MTU discovery on a
+/// socket of the family `is_ipv4` names.
 ///
 /// A proxy must not let the kernel fragment tunnelled UDP: fragments defeat PMTU
 /// discovery end to end and are widely dropped. Failure is logged rather than
 /// fatal: the tunnel still works, but it may lose oversized packets silently.
 #[cfg(target_os = "linux")]
-fn set_dont_fragment(socket: &UdpSocket) {
+fn set_dont_fragment(socket: &UdpSocket, is_ipv4: bool) {
     use rustix::net::sockopt::{Ipv4PathMtuDiscovery, Ipv6PathMtuDiscovery};
     use tracing::debug;
-
-    let is_ipv4 = socket
-        .local_addr()
-        .map(|address| address.is_ipv4())
-        .unwrap_or(true);
 
     // The socket is borrowed as an `AsFd` rather than a raw descriptor, so the
     // setsockopt cannot outlive it. rustix's own `cfg` on these two is
@@ -909,7 +905,7 @@ fn set_dont_fragment(socket: &UdpSocket) {
 /// Development happens on macOS, where the tunnel still works; only the DF bit
 /// is missing, which matters on the Linux production host.
 #[cfg(not(target_os = "linux"))]
-fn set_dont_fragment(_socket: &UdpSocket) {}
+fn set_dont_fragment(_socket: &UdpSocket, _is_ipv4: bool) {}
 
 #[cfg(test)]
 mod tests {
