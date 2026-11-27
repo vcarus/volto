@@ -2,7 +2,7 @@
 """Cross-implementation interop checks: aioquic drives volto.
 
 The masque-go suite next door already removes the volto-on-both-ends symmetry
-for CONNECT-UDP, but it leaves two holes this suite covers:
+for CONNECT-UDP, but it leaves three holes this suite covers:
 
 - masque-go speaks only CONNECT-UDP, so the plain CONNECT (TCP) tunnel has no
   cross-implementation check at all without this suite.

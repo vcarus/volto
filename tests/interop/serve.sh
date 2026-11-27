@@ -5,9 +5,7 @@
 # Both need the same three things before either suite can run: a self-signed
 # certificate the clients will validate, a server configuration that matches
 # the VOLTO_* environment the suites read, and a way to wait for the server to
-# be listening. Both used to write all three out, and run-local.sh's header
-# promised it mirrored CI "step for step" with nothing enforcing it. This file
-# is that enforcement.
+# be listening.
 #
 # What is deliberately *not* here is starting and stopping the server. The two
 # callers differ there for a structural reason rather than by accident: a CI
@@ -160,8 +158,8 @@ wait_until_ready() {
 # configuration asks for, and the 407 the missing-credentials test draws on
 # purpose. Anything else at WARN, and any ERROR at all, is a finding.
 #
-# The authentication filter is keyed by log_id, which D100's 2026-09-05 addendum
-# makes the stable half of a line. 3gmzhaq7 is the "authentication failed"
+# The authentication filter is keyed by log_id, which D100 makes the stable
+# half of a line. 3gmzhaq7 is the "authentication failed"
 # statement in src/conn.rs.
 # The `reason=` field stays in the pattern: the id covers every authentication
 # failure, including a wrong password, and only the credential-less one is
@@ -180,10 +178,7 @@ check_log() {
     # only turns ANSI off under $JOURNAL_STREAM, and tracing-subscriber's own
     # default consults NO_COLOR and nothing else. A log redirected into a file
     # therefore holds " WARN\033[0m " rather than " WARN ", and every pattern
-    # below would read a line that is not there. Measured on 2026-09-07: the
-    # filter matched 0 lines of a log holding one WARN before this strip and 1
-    # after, so this check reported every local run clean without ever looking
-    # at one.
+    # below would read a line that is not there.
     local esc plain
     esc="$(printf '\033')"
     plain="$(sed "s/${esc}\[[0-9;]*m//g" "$log")"

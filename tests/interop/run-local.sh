@@ -100,8 +100,7 @@ fi
 "$VENV/bin/python" "$ROOT/tests/interop/aioquic/interop_test.py"
 
 # The ops runbook's final step, automated, from the fixture the CI job calls
-# too. It used to live here, which is why the `interop` job never made it: the
-# job is the only independent judge of src/h3, and it was the weaker of the two.
+# too.
 "$ROOT/tests/interop/serve.sh" check "$WORK/server.log"
 "$ROOT/tests/interop/serve.sh" check "$WORK/server-ech.log"
 

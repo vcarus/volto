@@ -1,7 +1,7 @@
 // Cross-implementation interop checks: a third-party MASQUE client drives
 // CONNECT-UDP sessions through a running volto server.
 //
-// Every other test in this repository has volto on both ends — the in-process
+// The Rust tests have volto on both ends: the in-process
 // HTTP/3 client in `tests/common/h3client.rs` is built on the server's own
 // HTTP/3 codec, so the two agree by construction even where both are wrong.
 // This suite removes that symmetry: the client is Go's
@@ -244,9 +244,8 @@ func checkCapsuleResponse(t *testing.T, rsp *http.Response) {
 // payloads in both directions unmodified.
 //
 // More than one round trip on purpose. A Context ID or Quarter Stream ID that
-// is only right for the first packet is a real failure mode (it is exactly what
-// the h3-datagram release bug looked like), and a single-exchange test would
-// pass straight through it.
+// is only right for the first packet is a real failure mode, and a
+// single-exchange test would pass straight through it.
 func TestSingleSessionRoundTrips(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
