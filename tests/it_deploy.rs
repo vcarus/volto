@@ -2,11 +2,11 @@
 //!
 //! `script/deploy.sh` is the only channel a release reaches a host through, and
 //! it runs unattended from a daily timer. Downloading, verifying and installing
-//! needs root, a Linux host and the network, none of which a test should touch —
-//! but the *decision* in front of all that is pure logic, and both of its most
-//! fragile branches have already broken in production once: the convergence
-//! check ("already deployed and intact") and `refresh_self` under a piped
-//! bootstrap, where `$0` is `bash` rather than a file.
+//! needs root, a Linux host and the network, none of which a test should touch.
+//! The *decision* in front of all that is pure logic, and two of its branches
+//! are fragile: the convergence check ("already deployed and intact") and
+//! `refresh_self` under a piped bootstrap, where `$0` is `bash` rather than a
+//! file.
 //!
 //! `--dry-run` exists for this test, in the spirit of the installer's
 //! `--print-config`: it skips the preflight, prints the decision it would act on
@@ -14,8 +14,8 @@
 //! directory stands in for `/usr/local` and `/etc`.
 //!
 //! The real install path runs as well, end to end and without root: `Host`
-//! below puts stand-ins for `id`, `uname`, `sleep`, `sha256sum`, `systemctl` and
-//! `curl` first on `PATH`, and serves a local archive in place of the release
+//! below puts stand-ins for `id`, `chown`, `uname`, `sleep`, `sha256sum`,
+//! `systemctl` and `curl` first on `PATH`, and serves a local archive in place of the release
 //! page. It installs a release from before signing with `--allow-unsigned`,
 //! because no test holds the release key. The signed half of `verify_release`
 //! therefore runs on its own, with a test key, as do `acquire_lock` and
@@ -234,8 +234,7 @@ fn arguments_that_cannot_be_acted_on_are_refused() {
 /// so a host reporting the release's version keeps whatever binary it has.
 ///
 /// A release deleted and published again under the same tag leaves exactly
-/// that, and on 2026-09-05 it left a host running the bytes of the first
-/// upload. Without `--force` the run is the no-op below; with it the same
+/// that. Without `--force` the run is the no-op below; with it the same
 /// intact install is downloaded, verified and installed again.
 #[test]
 fn an_intact_install_is_reinstalled_when_the_run_is_forced() {
@@ -272,7 +271,7 @@ fn an_intact_install_of_the_release_version_is_left_alone() {
     );
 }
 
-/// The regression the v0.2.1 fix was about: a deleted config must pull the run
+/// A deleted config must pull the run
 /// back onto the first-install path even though the version already matches.
 #[test]
 fn a_missing_config_reinstalls_at_the_matching_version() {
@@ -329,9 +328,7 @@ fn an_older_installed_version_becomes_an_update() {
 /// the outside until they bite.
 ///
 /// The config file is never rewritten by anything here, so it may name keys the
-/// older binary refuses outright — `mtu_upper_bound` reached the shipped example
-/// in v0.4.5, and every install is derived from that example — and an older
-/// volto rejects the whole file rather than the one key, so the service simply
+/// older binary refuses outright, and an older volto rejects the whole file rather than the one key, so the service simply
 /// does not start. And `--tag` pins nothing: the update timer resolves the
 /// latest release, so a rollback left alone is undone on the next tick.
 ///
@@ -369,13 +366,13 @@ fn a_downgrade_says_what_bites_on_the_way_back() {
     );
 }
 
-/// The advisory's successor: a downgrade the candidate binary cannot survive is
+/// A downgrade the candidate binary cannot survive is
 /// refused at the door rather than announced and then attempted.
 ///
 /// This is the D93 shape end to end, with the real binary as the judge: the
 /// config carries a key it does not know, every table is `deny_unknown_fields`,
 /// so it refuses the whole file and would not start. Saying so is only useful
-/// before the swap — afterwards the service is already down and the automatic
+/// before the swap: afterwards the service is already down and the automatic
 /// rollback restores the release the operator was trying to leave.
 #[test]
 fn a_candidate_that_cannot_load_this_hosts_config_is_refused_before_anything_moves() {
@@ -409,12 +406,12 @@ fn a_candidate_that_cannot_load_this_hosts_config_is_refused_before_anything_mov
     );
 }
 
-/// The config check does not pass the script's `JOURNAL_STREAM` on (S9-L9).
+/// The config check does not pass the script's `JOURNAL_STREAM` on.
 ///
 /// Under the timer the script's own output goes to the journal, so systemd sets
 /// `JOURNAL_STREAM` for it, and volto takes the variable alone as the cue to
 /// put a `<N>` priority before each line. The check's output is captured and
-/// printed by the script, so the refusal carried a literal `<3>`. The run here
+/// printed by the script, so the refusal would carry a literal `<3>`. The run here
 /// sets the variable as the timer's service does, and the real binary refuses
 /// the config.
 #[test]
@@ -471,10 +468,9 @@ fn a_candidate_that_loads_the_config_lets_the_run_continue() {
 ///
 /// Such a binary answers `--check-config` with clap's usage error, and reading
 /// that as "your configuration is broken" would refuse every rollback to a
-/// release older than this one — the exact opposite of what the check is for.
-/// So the flag is detected by name in the candidate's own `--help` before it is
-/// used at all, and a candidate without it falls back to the advisory the script
-/// printed before any of this existed. The stand-in fails loudly on an unknown
+/// release older than this one, the opposite of what the check is for. So the
+/// flag is detected by name in the candidate's own `--help` before it is used
+/// at all, and a candidate without it falls back to the downgrade advisory. The stand-in fails loudly on an unknown
 /// argument, so an implementation that tried the flag first would be caught
 /// here rather than on a host.
 #[test]
@@ -693,7 +689,7 @@ fn rust_log_reader(script: &str) -> String {
 }
 
 /// `read_unit_rust_log` and `check_config_as_the_unit` are the same in both
-/// scripts, comments included (S9-D2).
+/// scripts, comments included.
 ///
 /// `deploy.sh` runs piped from curl with no file of its own, so it cannot
 /// source a shared file, and each script's behaviour tests exercise only its own
@@ -918,12 +914,11 @@ fn systemd_seconds(value: &str) -> u64 {
 }
 
 /// The bootstrap one-liner from the release notes: piped into `bash`, `$0` is
-/// not a file. This once aborted the whole run; it must be a quiet no-op.
+/// not a file. It must be a quiet no-op.
 ///
-/// `$0` is then the word `bash`. With a file of that name in the working
-/// directory, the script once installed that file as the copy the timer runs as
-/// root (second review, 2026-11-13), so the run is made from a directory that
-/// holds one.
+/// `$0` is then the word `bash`. A file of that name in the working directory
+/// must not become the copy the timer runs as root, so the run is made from a
+/// directory that holds one.
 #[test]
 fn a_piped_run_installs_nothing_even_beside_a_file_named_bash() {
     let root = install_root("piped-bash");
@@ -1034,7 +1029,7 @@ fn verify_signature(root: &Path, signer: Option<&str>, sums: &Path, signature: &
 
 /// The key the script carries is the key that signs releases.
 ///
-/// The fixture is a file signed on 2026-11-13 with the real release key, whose
+/// The fixture is a file signed with the real release key, whose
 /// private half no test can reach. Changing `RELEASE_SIGNER` to any other key
 /// turns this red, which is the point: an edit to that line decides what every
 /// host will install.
@@ -1286,7 +1281,7 @@ fn a_release_is_refused_without_the_release_keys_signature() {
 /// The lists a checksum tool can be made to disagree about, each signed by the
 /// release key and each refused.
 ///
-/// Found by review on 2026-11-13: one `sha256sum` skips a line that starts with
+/// One `sha256sum` skips a line that starts with
 /// a space or a backslash and reports success, while GNU's accepts it. A list
 /// checked by the first when it was signed and read by the second on a host
 /// could name an archive nobody checked. `verify_release` therefore reads the
@@ -1523,8 +1518,8 @@ fn a_run_that_looked_up_the_latest_release_never_goes_back() {
     }
 }
 
-/// `--verify-signature` is a mode of its own. An empty file name once fell
-/// through to an ordinary run, which exited 0 having verified nothing.
+/// `--verify-signature` is a mode of its own. An empty file name must not fall
+/// through to an ordinary run, which would exit 0 having verified nothing.
 #[test]
 fn verifying_a_signature_with_an_empty_file_name_fails() {
     let output = run_deploy(
@@ -1617,8 +1612,9 @@ enum Candidate {
 ///
 /// `root` is `VOLTO_DEPLOY_ROOT`. `stubs` holds the commands that need root, a
 /// Linux host, systemd or the network: `id` reports root, `uname` reports an
-/// x86_64 Linux host, `sleep` returns at once, `sha256sum` runs `shasum`, and
-/// `systemctl` and `curl` record their arguments in `logs`. `curl` serves the
+/// x86_64 Linux host, `chown` records its arguments in `logs` and changes
+/// nothing, `sleep` returns at once, `sha256sum` runs `shasum`, and `systemctl`
+/// and `curl` record their arguments in `logs`. `curl` serves the
 /// files under `release/<tag>/` by the last two parts of the URL it is asked
 /// for, and answers the latest-release lookup with the URL in `logs/latest`.
 /// Everything else the script runs is the host's own: `install`, `tar`,
@@ -1952,7 +1948,7 @@ fn mode_of(path: &Path) -> u32 {
         & 0o7777
 }
 
-/// A host on the layout releases before R8-M3 wrote moves to root ownership on
+/// A host on the old layout moves to root ownership on
 /// the next run of the script, and the run after that changes nothing.
 ///
 /// In the old layout `/etc/volto` and its files belonged to the service user,
@@ -2272,13 +2268,13 @@ fn a_release_that_does_not_stay_up_is_rolled_back() {
 }
 
 /// A signal inside the swap window rolls the update back as a failure there
-/// does, and the run still ends through its cleanup (S9-M1).
+/// does, and the run still ends through its cleanup.
 ///
 /// A Ctrl-C under `sudo volto-deploy`, the SIGHUP that sudo relays when an SSH
 /// session drops, and the SIGTERM that systemd sends when it stops the timer's
-/// service all reach the script. With the rollback armed on ERR alone, a signal
-/// after the binary was moved ended the run through the EXIT trap, which
-/// restores nothing, and left the new release installed with no health check.
+/// service all reach the script. Without the signal traps, a signal after the
+/// binary was moved would end the run through the EXIT trap, which restores
+/// nothing, and leave the new release installed with no health check.
 ///
 /// Before the restart is issued the old process still serves, so the rollback
 /// starts the service, which leaves an active unit alone. Once the restart is
@@ -2401,11 +2397,10 @@ fn the_real_update_path_refuses_a_release_that_cannot_load_the_config() {
 
 /// The update check runs with the `RUST_LOG` the service unit sets, so a value
 /// the new release refuses at startup stops the update before the swap, with
-/// the old binary still running (F3-M2).
+/// the old binary still running.
 ///
-/// Without it the check ran in the script's own environment, passed, and the
-/// new binary was swapped in, refused to start, and was rolled back, on every
-/// timer run. The unit's value reaches the check from `Environment=` and from
+/// In the script's own environment the check would pass, and the new binary
+/// would be swapped in, refuse to start and be rolled back on every timer run. The unit's value reaches the check from `Environment=` and from
 /// an `EnvironmentFile=`, whose assignment overrides `Environment=` as
 /// systemd's does.
 #[test]
@@ -2588,12 +2583,11 @@ fn a_host_without_a_config_runs_the_bundled_installer() {
 }
 
 /// A `.prev` left by an earlier update is never restored as if it were the
-/// release this run replaced (R8-L5).
+/// release this run replaced.
 ///
-/// `.prev` was written only for a file that was there to copy, so on a host
-/// with a deleted unit, or no executable binary, an older run's copy stayed and
-/// both rollback paths restored it: the host went back past the release it was
-/// running, and the run said it had rolled back to the previous release.
+/// On a host with a deleted unit or no executable binary, an older run's
+/// `.prev` would otherwise be restored by both rollback paths, taking the host
+/// back past the release it was running.
 #[test]
 fn a_stale_prev_from_an_earlier_update_is_never_restored() {
     // The unit was deleted; the ERR path restores the binary only.
@@ -2746,11 +2740,11 @@ fn the_binary_the_unit_and_the_timer_units_are_replaced_by_a_rename() {
 }
 
 /// A work directory on a `noexec` filesystem is named as the cause, before
-/// anything is downloaded (R8-L4).
+/// anything is downloaded.
 ///
 /// Linux reports a file on such a mount as not executable, so `[ -x ]` on the
-/// unpacked binary failed and the run said the archive held no binary, every
-/// day, on a host whose `/tmp` follows a common hardening benchmark. The
+/// unpacked binary fails and the run would otherwise say the archive held no
+/// binary. The
 /// stand-in `findmnt` reports the mount the way util-linux prints it.
 #[test]
 fn a_noexec_work_directory_is_named_as_the_cause() {
@@ -2781,7 +2775,7 @@ echo rw,nosuid,nodev,noexec,relatime
 }
 
 /// A binary that is in the archive and cannot be executed is not reported as
-/// missing (R8-L4).
+/// missing.
 #[test]
 fn an_unexecutable_binary_is_not_reported_as_missing() {
     let host = Host::new("unexecutable", Service::ComesUp);
@@ -2805,11 +2799,11 @@ fn an_unexecutable_binary_is_not_reported_as_missing() {
     );
 }
 
-/// A run that finds the lock held stops before it does anything (R8-L6).
+/// A run that finds the lock held stops before it does anything.
 ///
 /// systemd starts no second `volto-deploy.service`, but `sudo volto-deploy`
-/// runs outside that service, and two runs inside the same few seconds copied
-/// each other's new binary into `.prev`.
+/// runs outside that service, and two runs inside the same few seconds would
+/// copy each other's new binary into `.prev`.
 #[test]
 fn a_run_stops_when_another_run_holds_the_lock() {
     let host = Host::new("lock-held", Service::ComesUp);
@@ -2907,7 +2901,7 @@ fn without_flock_a_directory_with_a_live_pid_is_the_lock() {
     assert!(!takeover.exists(), "a takeover releases its own lock");
 
     // A stale lock that another run is taking over: refused, and left to
-    // that run (F3-L3). Two runs that found the same dead pid could both
+    // that run. Two runs that found the same dead pid could both
     // remove and re-create the directory, and both go on.
     fs::write(held.join("pid"), format!("{gone_pid}\n")).expect("plant a dead pid");
     fs::create_dir(&takeover).expect("plant a takeover in progress");
@@ -2930,11 +2924,10 @@ fn without_flock_a_directory_with_a_live_pid_is_the_lock() {
 }
 
 /// The first-install password reaches the bundled installer in its
-/// environment and not on its command line (R8-M1).
+/// environment and not on its command line.
 ///
-/// `deploy.sh` used to copy `-w PASS` into the installer's arguments, where it
-/// sat in `/proc/<pid>/cmdline`, readable by every local user, for the whole
-/// installer run.
+/// An argument sits in `/proc/<pid>/cmdline`, readable by every local user, for
+/// the whole installer run.
 #[test]
 fn the_first_install_password_reaches_the_installer_outside_its_arguments() {
     const SECRET: &str = "argv-canary-d3p|&";
