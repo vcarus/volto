@@ -10,15 +10,13 @@
 //! great deal of freedom in how its first packet is laid out, and none of it may
 //! move the verdict; and a later Initial of an admitted handshake, keyed by the
 //! first packet rather than by the connection ID it now carries, must not be
-//! mistaken for a stranger — the defect of 2026-09-03, when refusing those cost
-//! every handshake a probe timeout.
+//! mistaken for a stranger.
 //!
 //! **Does a first flight from a real stack read the way the builders say it
 //! does?** A parser can agree with its own builder while disagreeing with the
 //! wire. So a real quinn client's first datagram is captured off a socket that
-//! never answers and judged, and a real aioquic first flight — a different stack
-//! again, and the one whose habit of coalescing packets found that defect — is
-//! pinned here as bytes.
+//! never answers and judged, and a real aioquic first flight is pinned here as
+//! bytes.
 //!
 //! **What still answers a stranger with the gate on?** The gate judges a
 //! datagram's first packet, and some of what it refuses is decided without a
@@ -434,8 +432,7 @@ fn a_sealed_initial_opens_under_rustls_initial_keys() {
 /// A later Initial of an admitted handshake cannot be opened here, and must
 /// not be refused for it: the Handshake packet carrying the client's Finished
 /// rides in the same datagram, and blinding it costs the handshake a probe
-/// timeout. Seen on a production host on 2026-09-03 as every handshake's RTT
-/// stuck at the configured initial estimate.
+/// timeout.
 #[test]
 fn a_later_initial_keyed_by_the_first_packet_is_not_a_stranger() {
     let crypto = nameless_crypto();
@@ -523,9 +520,9 @@ fn a_first_initial_with_a_full_connection_id_is_not_refused_for_its_length() {
 /// before `first_decode.finish` and answers a Destination Connection ID under
 /// eight bytes with CONNECTION_CLOSE(PROTOCOL_VIOLATION) without opening the
 /// packet. So an Initial nobody sealed, which costs its sender no cryptography
-/// at all, drew that reply through the gate until 2026-09-07. The two other
-/// witnesses for this rule both seal their payloads, which is why this one is
-/// built by hand.
+/// at all, would draw that reply if the length were read after the
+/// decryption. The two other witnesses for this rule both seal their payloads,
+/// which is why this one is built by hand.
 #[test]
 fn an_unsealed_initial_with_a_short_connection_id_is_refused() {
     let names = Names::new(&["localhost".to_owned()]);
@@ -633,16 +630,13 @@ async fn a_refused_name_is_logged_escaped_by_both_gates() {
 }
 
 /// An Initial whose Length field leaves no room for a packet number is passed
-/// through, and is answered before any key is derived.
+/// through.
 ///
 /// RFC 9001 §5.4.2 samples header protection from four bytes past the packet
 /// number offset, so a packet declaring fewer bytes than that after the offset
-/// cannot be opened under any cipher. `gate::initial::decrypt` asks that half
-/// of the length test above `tls::client_initial_keys`, which is nearly the
-/// whole cost of judging
-/// an Initial, and the verdict is the same on both sides of the move: a packet
-/// that does not open is one quinn tells apart with state this gate does not
-/// have, so it reaches quinn.
+/// cannot be opened under any cipher. `gate::initial::decrypt` makes this
+/// check before it derives keys. A packet that does not open is one quinn
+/// tells apart with state this gate does not have, so it reaches quinn.
 #[test]
 fn an_initial_too_short_for_a_packet_number_is_passed_through() {
     let crypto = nameless_crypto();
@@ -1262,9 +1256,7 @@ async fn quinn_first_flight(name: &str, alpn: &[&str]) -> Vec<u8> {
 
 /// A first flight from aioquic, pinned as the bytes it put on the wire.
 ///
-/// A second stack, and the one whose habit of coalescing packets exposed the
-/// later-Initial defect on 2026-09-03, so what it does differently from quinn
-/// is exactly what this gate has already been wrong about once. Captured with
+/// A second stack, which coalesces packets where quinn does not. Captured with
 /// aioquic 1.3.0 asking for `localhost`, and kept as bytes because generating it
 /// needs a Python interpreter the `cargo test` jobs do not have.
 ///
@@ -1353,7 +1345,7 @@ fn the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for() {
     let anonymous = client_hello(&[]);
     let cut = ours[..ours.len() - 4].to_vec();
     // An acknowledgement of the server's Initial, keyed by the client's first
-    // packet: the shape v0.9.1 stopped refusing.
+    // packet, which the gate passes.
     let ack = [0x02, 0x00, 0x00, 0x00, 0x00];
     let later = Shape {
         dcid: SERVER_CID.to_vec(),
@@ -3220,9 +3212,8 @@ async fn require_ech_admits_a_client_with_the_list_and_nothing_else() {
 /// draws nothing, and the server goes on answering: a client with the list
 /// connects after it.
 ///
-/// Before the fix of the hold's byte count this datagram underflowed that
-/// count inside `poll_recv`, under quinn's endpoint driver, and the panic
-/// took the endpoint with it.
+/// An underflow of the hold's byte count on this datagram would panic inside
+/// `poll_recv`, under quinn's endpoint driver, and end the endpoint.
 #[tokio::test]
 async fn a_datagram_that_disagrees_with_itself_leaves_the_server_answering() {
     let crypto = nameless_crypto();
@@ -3407,8 +3398,8 @@ fn run_hold_input(
 /// current one, and the `previous-` seeds carry ECH under it, with and without
 /// that bit. The `sealed-` seeds carry the
 /// same flights as frames for the target to seal, which is how the fuzzer
-/// edits what the hold reads rather than ciphertext. `fuzz/corpus/` is
-/// machine-local and gitignored (D83), so this runs with every `cargo test`.
+/// edits what the hold reads rather than ciphertext. It runs with every
+/// `cargo test`, as the gate corpus does.
 #[test]
 fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
     let crypto = nameless_crypto();
