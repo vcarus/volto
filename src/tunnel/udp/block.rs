@@ -296,8 +296,8 @@ pub(super) fn landed(packets: &mut PacketBlock, payload: &[u8]) {
     if !packets.prepared {
         packets.prepare();
     }
-    let prefix_len = packets.prefix_len;
-    packets.block[prefix_len..prefix_len + payload.len()].copy_from_slice(payload);
+    let room = packets.room;
+    packets.block[room..room + payload.len()].copy_from_slice(payload);
     packets.len = payload.len();
     packets.spilled = None;
 }
@@ -347,6 +347,16 @@ mod tests {
     }
 
     /// Payload bytes that differ from packet to packet and within one.
+    /// `landed` puts the payload where a receive would, behind the room, on
+    /// a block with capsule room as on one without.
+    #[test]
+    fn a_landed_payload_is_the_packet_in_hand() {
+        for mut packets in [PacketBlock::new(0x40), PacketBlock::with_capsule_room(0x40)] {
+            landed(&mut packets, b"landed payload");
+            assert_eq!(PacketBlock::payload(&packets), b"landed payload");
+        }
+    }
+
     fn payload(seed: usize, len: usize) -> Vec<u8> {
         (0..len)
             .map(|i| u8::try_from((seed * 31 + i) % 251).expect("below 251"))
