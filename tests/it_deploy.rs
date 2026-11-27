@@ -2857,19 +2857,18 @@ fn without_flock_a_directory_with_a_live_pid_is_the_lock() {
     }
     let lock = dir.join("run/volto-deploy.lock");
     let held = dir.join("run/volto-deploy.lock.d");
-    let acquire = |name: &str| {
-        let output = run_shell_call(
+    let acquire = || {
+        run_shell_call(
             "script/deploy.sh",
             "acquire_lock",
             "&& echo \"took $LOCK_DIR\"",
             tools.as_os_str(),
             &format!("LOCK='{}'\nLOCK_DIR=", lock.display()),
-        );
-        (name.to_owned(), output)
+        )
     };
 
     // A free lock is taken, and the pid file names the run that took it.
-    let (_, output) = acquire("free");
+    let output = acquire();
     assert!(output.status.success(), "{}", stderr_of(&output));
     assert!(stdout_of(&output).contains(&format!("took {}", held.display())));
     assert!(
@@ -2879,13 +2878,13 @@ fn without_flock_a_directory_with_a_live_pid_is_the_lock() {
 
     // Held by a live process: refused.
     fs::write(held.join("pid"), format!("{}\n", std::process::id())).expect("plant a live pid");
-    let (_, output) = acquire("live");
+    let output = acquire();
     assert!(!output.status.success(), "a live holder must stop the run");
     assert!(stderr_of(&output).contains("another run of this script holds"));
 
     // An empty pid file: a run between mkdir and its pid write. Refused.
     fs::write(held.join("pid"), "").expect("empty the pid file");
-    let (_, output) = acquire("empty");
+    let output = acquire();
     assert!(!output.status.success(), "an empty pid file counts as held");
 
     // Held by a process that has exited: taken over.
@@ -2893,7 +2892,7 @@ fn without_flock_a_directory_with_a_live_pid_is_the_lock() {
     let gone_pid = gone.id();
     gone.wait().expect("wait for it");
     fs::write(held.join("pid"), format!("{gone_pid}\n")).expect("plant a dead pid");
-    let (_, output) = acquire("stale");
+    let output = acquire();
     assert!(
         output.status.success(),
         "a lock whose run is gone must be taken over: {}",
@@ -2912,7 +2911,7 @@ fn without_flock_a_directory_with_a_live_pid_is_the_lock() {
     // remove and re-create the directory, and both go on.
     fs::write(held.join("pid"), format!("{gone_pid}\n")).expect("plant a dead pid");
     fs::create_dir(&takeover).expect("plant a takeover in progress");
-    let (_, output) = acquire("takeover-held");
+    let output = acquire();
     assert!(
         !output.status.success(),
         "a takeover in progress must stop a second one: {}",
