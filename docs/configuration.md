@@ -233,10 +233,10 @@ unauthenticated peer can make the server hold.
 
 **Every tunnel also holds its request's header fields.** volto advertises
 `MAX_FIELD_SECTION_SIZE` = 65536 in its SETTINGS, and a client is entitled to
-send a request that large; decoded, it costs roughly that much again — about 77
+send a request that large; decoded, it costs roughly that much again — about 65
 KiB measured — and it is kept for the whole life of the tunnel the request
 opened, not just until the target has been named. At the defaults that is
-another 19 MiB per connection and about 4.8 GiB across the server, on top of the
+another 16 MiB per connection and about 4.1 GiB across the server, on top of the
 tunnel figures above. Real clients send a few hundred bytes of headers, so this
 is a ceiling reached only by a client that chooses to fill the advertised limit;
 it is listed because nothing else in this section accounts for it.

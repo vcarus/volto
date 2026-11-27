@@ -84,9 +84,10 @@
 //! default. This binary adds `docs/` as the third corner and does not repeat
 //! either of those; gate 5 is the edge that closes it, since a Default column
 //! is a table cell rather than the `` `IDENT` = value `` notation gate 2 reads
-//! and was pinned by nothing before. `tests/it_bounds.rs` weighs the memory figures
-//! `docs/configuration.md` quotes; gate 2 here is what makes its claim that
-//! "`docs/configuration.md` quotes the same numbers" mechanical.
+//! and was pinned by nothing before. `tests/it_bounds.rs` measures the memory
+//! figures `docs/configuration.md` quotes, and nothing here checks those
+//! figures: gate 2 reads only a constant quoted in the `` `IDENT` = value ``
+//! notation, and a measured figure is not one.
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the counting is over the documentation this file scans.
