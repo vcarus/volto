@@ -156,10 +156,7 @@ async fn a_peer_that_never_sends_a_request_is_closed_by_the_bound() {
     // as closed. This is not a slot check: at the cap a newcomer is admitted by
     // eviction whether or not a slot is held.
     let (_endpoint, admitted) = common::connect_quic(&server).await;
-    assert!(
-        admitted.close_reason().is_none(),
-        "the server must still be serving once the silent peers are gone"
-    );
+    still_serving(&admitted).await;
 }
 
 /// A peer whose only request failed authentication is no better off.
@@ -264,10 +261,7 @@ async fn opening_request_streams_does_not_extend_the_bound() {
     poking.abort();
 
     let (_endpoint, admitted) = common::connect_quic(&server).await;
-    assert!(
-        admitted.close_reason().is_none(),
-        "the server must still be serving once the peer that never authenticated is gone"
-    );
+    still_serving(&admitted).await;
 }
 
 /// Nor does opening them without pause, which is a different way round the same
