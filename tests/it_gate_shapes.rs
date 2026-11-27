@@ -328,27 +328,6 @@ fn unsealed_initial(dcid: &[u8]) -> Vec<u8> {
     datagram
 }
 
-/// A quinn crypto configuration around a throwaway certificate.
-///
-/// The one builder here that carries a certificate, for the one test whose
-/// point is that a certificate is not an input to Initial keys.
-fn certified_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
-    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-        .expect("a self-signed certificate");
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let crypto = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3")
-        .with_no_client_auth()
-        .with_single_cert(vec![issued.cert.der().clone()], key)
-        .expect("a usable certificate/key pair");
-    Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
-            .expect("a QUIC-capable configuration"),
-    )
-}
-
 // ---------------------------------------------------------------------------
 // (a) Hand-spelled first flights, judged through the seam the socket uses
 // ---------------------------------------------------------------------------
@@ -1308,14 +1287,7 @@ fn a_real_aioquic_first_flight_is_judged_by_the_name_it_carries() {
 ///
 /// The assertions are the other half of it. They pin what each seed is a seed
 /// *for*, so a verdict that moves is a red test rather than a corpus that
-/// quietly stops covering anything. They also pin the claim [`nameless_crypto`]
-/// rests on. These packets are built under a real self-signed certificate
-/// (`certified_crypto`) and opened by [`judgement`], which derives Initial keys
-/// with the server's own key code and no certificate at all, as it does for the
-/// packets the other tests build with [`nameless_crypto`]. Initial keys do not
-/// depend on the certificate; if they ever did, every refusal below
-/// that is decided behind the packet protection would fall through to
-/// [`Verdict::Pass`].
+/// quietly stops covering anything.
 #[test]
 fn the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for() {
     /// The target's mode byte for a whole datagram.
@@ -1323,7 +1295,7 @@ fn the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for() {
     /// The target's mode byte for bare CRYPTO bytes.
     const AS_CRYPTO_BYTES: u8 = 0x01;
 
-    let crypto = certified_crypto();
+    let crypto = nameless_crypto();
     // The list the target configures for mode byte `AS_A_DATAGRAM`.
     let names = Names::new(&["localhost".to_owned()]);
 
