@@ -1185,7 +1185,7 @@ const REAL_NAME: &str = "localhost";
 /// says the ClientHello was read rather than given up on.
 #[tokio::test]
 async fn a_real_quinn_first_flight_is_judged_by_the_name_it_carries() {
-    let datagram = quinn_first_flight(&["h3"]).await;
+    let datagram = quinn_first_flight(REAL_NAME, &["h3"]).await;
 
     assert_eq!(
         judgement(&datagram, &Names::new(&[REAL_NAME.to_owned()])),
@@ -1210,7 +1210,7 @@ async fn a_real_quinn_first_flight_is_judged_by_the_name_it_carries() {
 async fn a_real_first_flight_larger_than_one_packet_is_passed_by_both_lists() {
     let alpn = bulk_alpn();
     let alpn: Vec<&str> = alpn.iter().map(String::as_str).collect();
-    let datagram = quinn_first_flight(&alpn).await;
+    let datagram = quinn_first_flight(REAL_NAME, &alpn).await;
 
     for list in [REAL_NAME, "other.example"] {
         assert_eq!(
@@ -1221,8 +1221,24 @@ async fn a_real_first_flight_larger_than_one_packet_is_passed_by_both_lists() {
     }
 }
 
-/// The first datagram a quinn client sends when asking for [`REAL_NAME`].
-async fn quinn_first_flight(alpn: &[&str]) -> Vec<u8> {
+/// A real quinn client asked for an IP literal sends no `server_name`, and the
+/// gate refuses its first flight as anonymous.
+///
+/// This is the premise of `it_sni_gate`'s test of a handshake carrying no
+/// server name. That test sees only silence, which a name off the list draws
+/// too, so the ClientHello is read here.
+#[tokio::test]
+async fn a_real_quinn_first_flight_to_an_ip_literal_carries_no_name() {
+    let datagram = quinn_first_flight("127.0.0.1", &["h3"]).await;
+    assert_eq!(
+        judgement(&datagram, &Names::new(&[REAL_NAME.to_owned()])),
+        Verdict::Refuse(Refusal::Anonymous)
+    );
+}
+
+/// The first datagram a quinn client sends when asking for `name`, under a
+/// certificate for [`REAL_NAME`].
+async fn quinn_first_flight(name: &str, alpn: &[&str]) -> Vec<u8> {
     let sink = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("bind a socket that never answers");
@@ -1231,7 +1247,7 @@ async fn quinn_first_flight(alpn: &[&str]) -> Vec<u8> {
     let issued = rcgen::generate_simple_self_signed(vec![REAL_NAME.to_owned()])
         .expect("a self-signed certificate");
     let endpoint = client_endpoint(&issued.cert.der().clone(), alpn);
-    let handshake = tokio::spawn(endpoint.connect(addr, REAL_NAME).expect("start connecting"));
+    let handshake = tokio::spawn(endpoint.connect(addr, name).expect("start connecting"));
 
     let mut buffer = vec![0u8; 2048];
     let read = tokio::time::timeout(PATIENCE, sink.recv(&mut buffer))

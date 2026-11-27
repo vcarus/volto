@@ -136,6 +136,8 @@ async fn a_handshake_naming_another_host_is_dropped_without_a_reply() {
 ///
 /// quinn's client always sends one, so this is driven by hand: an IP literal as
 /// the server name is what rustls declines to put in the extension.
+/// `it_gate_shapes::a_real_quinn_first_flight_to_an_ip_literal_carries_no_name`
+/// reads that ClientHello, since silence alone does not say why.
 #[tokio::test]
 async fn a_handshake_carrying_no_server_name_is_dropped_without_a_reply() {
     let server = TestServer::start_with_certificate_names(GATE_LOCALHOST, &[OTHER]).await;
