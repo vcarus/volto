@@ -114,13 +114,8 @@ const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
 /// port        = *DIGIT
 /// ```
 ///
-/// Used by both parsers in place of `u16::from_str`, and stricter than both
-/// it and the grammar, so that a port has one spelling per target. Two
-/// spellings of one port would be dialled as one number, so nothing would be
-/// bypassed: `Policy::allows_port` judges the number that came out of the
-/// parse and that is the number the socket is opened on. The cost is
-/// normalisation: the authority in the log and the port on the wire would
-/// disagree, and RFC 9110 §9.3.6 asks a server to "reject a CONNECT request
+/// Stricter than `u16::from_str` and the grammar, so that a port has one
+/// spelling, as RFC 9110 §9.3.6 asks a server to "reject a CONNECT request
 /// that targets an empty or invalid port number". Two spellings are refused:
 ///
 /// * A sign, which `u16::from_str` takes and the grammar does not.
@@ -302,10 +297,7 @@ pub struct Context {
     /// [`crate::h3api::DatagramReceiver`] that stream handed it (D79). The other
     /// use is a connection-wide decision a request can reach: raising the
     /// stream allowance once a request authenticates
-    /// (`Context::mark_authenticated`). That is why the handle is named for what
-    /// it is rather than for what it mostly does. Closing after repeated
-    /// authentication failures goes through the request's stream instead, so
-    /// the HTTP/3 layer records it as the connection's reason.
+    /// (`Context::mark_authenticated`).
     pub quic: quinn::Connection,
     /// What the peer's SETTINGS say about HTTP Datagrams, and whether they
     /// have been read.
@@ -346,10 +338,6 @@ pub struct Context {
     /// first (and the slot stays) or finds it taken and is refused. An evicted
     /// gate reads closed, so the connection stays under every
     /// pre-authentication bound for the moment it has left.
-    ///
-    /// Its transition matters as well as its value, which is why it is an
-    /// [`AuthGate`] and not the bare atomic it wraps; see
-    /// `Context::mark_authenticated`.
     ///
     /// Owned by [`crate::quic`] rather than allocated here, because it is read
     /// from outside the connection as well: the accept loop needs to know which
@@ -485,10 +473,7 @@ impl Context {
     ///
     /// `peer_settings` comes from the HTTP/3 connection, whose control stream
     /// reader updates what it shows. `resolver` is this connection's own view
-    /// of the server's blocking-pool allowance. `tunnels` is the connection's
-    /// tunnel counter and `authenticated` its authentication flag, both created
-    /// by [`crate::quic`] so that they outlive this context: the first is read
-    /// once the connection is over, the second while it runs.
+    /// of the server's blocking-pool allowance.
     pub fn new(
         generation: Arc<Generation>,
         quic: quinn::Connection,
@@ -558,15 +543,9 @@ impl Context {
     /// connection is already being closed. The eviction signal, not a response
     /// written here, is what ends it.
     ///
-    /// The counters are what make guessing cost a handshake every
-    /// `max_auth_failures` attempts, and clearing them is what stops them adding
-    /// up over the life of a connection that *is* authenticated: a client whose
-    /// password was rotated, or an app that omits the header on some request,
-    /// would otherwise spend the budget a failure at a time over hours and then
-    /// lose every live tunnel to a cap meant for an attacker.
-    ///
-    /// Exactly two buckets are cleared ([`AuthFailures::clear_for`]), because a
-    /// guesser *can* arrive here; [`AuthFailures`] says how.
+    /// Clearing keeps an authenticated client's occasional failures from adding
+    /// up to `max_auth_failures`; [`AuthFailures`] says which buckets a success
+    /// clears and why.
     ///
     /// # The stream allowance
     ///
@@ -597,7 +576,8 @@ impl Context {
         true
     }
 
-    /// Whether any request on this connection has (D76).
+    /// Whether any request on this connection has passed the credentials check
+    /// (D76).
     pub(crate) fn is_authenticated(&self) -> bool {
         self.authenticated.is_open()
     }
@@ -721,7 +701,7 @@ pub(crate) struct Resolved {
 /// that is not "no address in this family", the preferred family's first.
 ///
 /// With `system` this is one lookup of both families, in the resolver's
-/// order, as before.
+/// order.
 pub(crate) async fn resolve_within(
     host: &str,
     port: u16,
@@ -1180,10 +1160,6 @@ fn own_address_probes(address: std::net::SocketAddr) -> Vec<std::net::SocketAddr
 /// or the 200 that closes on the spot), and the caller has nothing left to do
 /// but return.
 ///
-/// Both tunnel types run exactly this preamble, which is why it is written once:
-/// two copies could drift, and the two protocols would then disagree about what
-/// a policy refusal looks like.
-///
 /// The order of the three steps is part of the design:
 ///
 /// * The port rule needs no address, so it is applied before the resolver is
@@ -1200,18 +1176,9 @@ fn own_address_probes(address: std::net::SocketAddr) -> Vec<std::net::SocketAddr
 ///   anything is decided, so what follows is judged on both families together
 ///   ([`judge`]).
 ///
-/// Nothing left after that filter splits two ways (decision D49). A name whose
-/// every address is the unspecified one was blocked by a filtering resolver
-/// upstream, and that verdict is not this proxy's: answering 403 would make the
-/// client attribute an ad blocker's decision to the proxy. Of the client's
-/// protocols this is the only one with an in-band channel to say anything at
-/// all, so it would be the only one blamed. Such a request is accepted and
-/// closed on the spot instead. Every other refusal (loopback, RFC 1918, a mix)
-/// keeps its loud 403 with the RFC 9209 reason, because that is what an SSRF
-/// probe looks like from here and the client really is being refused by this
-/// proxy. The criterion belongs to [`policy::is_dns_blackhole`] and the response
-/// mechanics to [`accept_then_close`]; only the choice between them is made
-/// here.
+/// A target whose every address is the unspecified one is accepted and closed
+/// on the spot ([`accept_then_close`], decision D49); every other refusal keeps
+/// its 403 with the RFC 9209 reason.
 ///
 /// `accepted_fields` supplies what an accepted response of the caller's tunnel
 /// type has to carry: nothing for a TCP tunnel, the RFC 9297 `Capsule-Protocol`
@@ -1685,7 +1652,7 @@ mod tests {
 
     /// A resolver that never answers costs the request its budget and no more,
     /// and is reported as the timeout it is rather than as an ordinary lookup
-    /// failure — the two carry different statuses.
+    /// failure: the two carry different statuses.
     ///
     /// On a paused clock, so the budget is the shipped default and both sides
     /// of the deadline are pinned exactly: nothing a millisecond short of it,
@@ -1720,8 +1687,8 @@ mod tests {
     ///
     /// The resumed-VM shape: `Instant::now()` is hours past where the deadline
     /// was armed and every timer in the process fires in one instant. The
-    /// budget must still resolve to `TimedOut` — the 504 with
-    /// `error=dns_timeout` — rather than wrap, panic, or leave the request
+    /// budget must still resolve to `TimedOut`, the 504 with
+    /// `error=dns_timeout`, rather than wrap, panic, or leave the request
     /// parked on a deadline the clock has already gone by. `TimedOut` carries
     /// the *budget*, not the time actually waited, so the answer the client
     /// gets says the same thing either way.
@@ -1893,7 +1860,7 @@ mod tests {
     /// [`super::tcp`]: a timer that has not fired is a future that is still
     /// pending, and one poll is the whole question. Polled through a bare waker
     /// rather than awaited, so a `None` is the future's own answer and not a
-    /// race with the runtime -- `tokio::time` advances only where a test says
+    /// race with the runtime: `tokio::time` advances only where a test says
     /// so, and nothing in either module wakes anything but a timer.
     pub(crate) fn poll_once<F: std::future::Future>(
         mut future: std::pin::Pin<&mut F>,
