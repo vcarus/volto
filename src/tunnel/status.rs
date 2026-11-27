@@ -232,13 +232,8 @@ impl ProxyError {
     /// this proxy rather than reports about an upstream hop, and a client that
     /// sees 502 would reasonably retry.
     ///
-    /// One address refusal never arrives here at all (decision D49, an exception
-    /// to D11 rather than a revision of it): a target whose every resolved
-    /// address is the unspecified one is a name the upstream resolver filtered.
-    /// It is answered with a 200 that closes on the spot (`accept_then_close`)
-    /// and carries no `Proxy-Status` field, because nothing about it is this
-    /// proxy's verdict. Every refusal that is actually sent follows the table
-    /// below.
+    /// The DNS blackhole of D49 is not a refusal and never reaches this table
+    /// ([`accept_then_close`]).
     pub fn recommended_status(self) -> Status {
         match self {
             Self::DnsError | Self::ConnectionRefused => Status::BAD_GATEWAY,
@@ -265,9 +260,7 @@ impl ProxyError {
 /// * `EMFILE` / `ENFILE`: no descriptor, per process or system-wide. This is
 ///   the one an operator meets: `max_connections` x `max_targets_per_conn`
 ///   sockets is what `crate::quic`'s startup check sizes `RLIMIT_NOFILE`
-///   against, and a host that is over it fails every `socket()` at once. The
-///   product counts only tunnels of live connections, which is all there are:
-///   `conn::handle` aborts a connection's request tasks when it returns.
+///   against, and a host that is over it fails every `socket()` at once.
 /// * `ENOBUFS` / `ENOMEM`: no kernel buffer or memory for another socket.
 /// * `EADDRNOTAVAIL`: no source address left to bind, which on a connect to a
 ///   remote address is the ephemeral port range exhausted. A target address
@@ -428,19 +421,9 @@ pub(crate) async fn refuse_with(stream: &mut Stream, status: Status, fields: Fie
 /// (H3_CONNECT_ERROR), which this is not, and a client is entitled to read a
 /// reset as "the proxy broke".
 ///
-/// The FIN is this server's own choice rather than a rule read off a spec.
-/// RFC 9297 §3.3 mentions a cleanly terminated capsule stream only to rule on
-/// what a truncated last capsule means then: "If the receive side of a stream
-/// carrying Capsules is terminated cleanly (for example, in HTTP/3 this is
-/// defined as receiving a QUIC STREAM frame with the FIN bit set) and the last
-/// Capsule on the stream was truncated, this MUST be treated as if it were a
-/// malformed or incomplete message". It says nothing about ending one on
-/// purpose. RFC 9298 §3.1 ties the request stream to a socket that exists: a
-/// UDP proxy "MUST keep the socket open while the request stream is open", and
-/// when it closes a socket it "MUST close the request stream". No socket is
-/// ever opened here, so neither sentence reaches this case. The FIN is the
-/// ending an established session gets, and the only one that says nothing went
-/// wrong.
+/// The FIN is this server's own choice: neither RFC 9297 §3.3 nor RFC 9298
+/// §3.1 rules on ending a capsule stream that never had a socket, and a FIN is
+/// the ending that says nothing went wrong.
 ///
 /// Keep the STOP_SENDING up front. RFC 9114 §4.1 leaves the choice open: a
 /// server may abort reading the request, or leave the client to finish and
@@ -555,7 +538,7 @@ mod tests {
     ///
     /// Every errno here is raised by the allocation itself, before anything is
     /// addressed anywhere, so none of them can be evidence that "the next hop
-    /// [is] unavailable" — RFC 9209 §2.3.4's definition of the type they used
+    /// [is] unavailable", RFC 9209 §2.3.4's definition of the type they used
     /// to be reported as. `proxy_internal_error` is §2.3.30's "internal error
     /// unrelated to the origin", which is what happened.
     #[test]
@@ -583,7 +566,7 @@ mod tests {
     /// The other side of that line: a failure that really is about reaching
     /// this target keeps saying so.
     ///
-    /// `EACCES` and `EPERM` are the pair worth naming — a local firewall
+    /// `EACCES` and `EPERM` are the pair worth naming: a local firewall
     /// refusing the route to one destination is a fact about that destination,
     /// however local the component enforcing it is.
     #[test]
@@ -636,7 +619,7 @@ mod tests {
     }
 
     /// RFC 9209 §2.1.2's `next-hop` "identifies the intermediary or origin server
-    /// selected (and used, if contacted) to obtain this response" — so it belongs
+    /// selected (and used, if contacted) to obtain this response", so it belongs
     /// on the failures that are about reaching one, and nowhere else.
     #[test]
     fn only_failures_to_reach_a_hop_name_it() {
@@ -656,7 +639,7 @@ mod tests {
 
     /// The exclusions, and the reason for the middle two: a policy refusal that
     /// echoed the resolved address would hand the client this server's view of a
-    /// name it is not allowed to reach — an internal DNS mapping, read straight
+    /// name it is not allowed to reach: an internal DNS mapping, read straight
     /// out of the refusal. `dns_error` has no hop to name at all.
     #[test]
     fn refusals_that_are_not_about_a_hop_never_echo_an_address() {
@@ -685,7 +668,7 @@ mod tests {
         }
     }
 
-    /// No address to report — an empty candidate list — leaves the field as the
+    /// No address to report (an empty candidate list) leaves the field as the
     /// plain one, byte for byte.
     #[test]
     fn a_missing_address_leaves_the_field_untouched() {
@@ -703,7 +686,7 @@ mod tests {
 
     /// RFC 9209 §2.1.2 accepts a String or a Token, and RFC 8941 §3.3.3 defines
     /// the String: DQUOTE-delimited, with DQUOTE and backslash escaped. An IPv6
-    /// hop is the case that decides it — its brackets are not Token characters.
+    /// hop is the case that decides it: its brackets are not Token characters.
     #[test]
     fn a_next_hop_is_a_quoted_structured_field_string() {
         let ipv6: std::net::SocketAddr = "[2001:db8::1]:53".parse().expect("address");
