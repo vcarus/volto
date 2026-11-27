@@ -43,65 +43,67 @@ async fn expect_close(name: &str, stream_type: u64, bytes: &[u8], code: u64, nam
     );
 }
 
-/// Accepts the server's unidirectional streams until its control stream turns
-/// up, and hands it back with its type varint already read.
-async fn server_control_stream(connection: &quinn::Connection) -> quinn::RecvStream {
-    for _ in 0..8 {
+/// Accepts the server's three critical streams and hands each back with its
+/// type varint already read.
+///
+/// All three are kept: dropping a `quinn::RecvStream` sends STOP_SENDING, which
+/// the server answers by closing the connection.
+async fn server_streams(connection: &quinn::Connection) -> Vec<(u64, quinn::RecvStream)> {
+    let mut streams = Vec::new();
+    for _ in 0..3 {
         let mut recv = tokio::time::timeout(TIMEOUT, connection.accept_uni())
             .await
             .expect("the server opens its critical streams")
             .expect("accept a unidirectional stream");
-
-        if read_varint(&mut recv).await == STREAM_CONTROL {
-            return recv;
-        }
+        streams.push((read_varint(&mut recv).await, recv));
     }
-
-    panic!("the server never opened a control stream");
+    streams
 }
 
-/// A control stream the peer refuses to read is H3_CLOSED_CRITICAL_STREAM on
-/// the wire, not merely in this server's own head.
+/// Each of the server's three critical streams, stopped by the peer, ends the
+/// connection with H3_CLOSED_CRITICAL_STREAM, with no write of the server's to
+/// find it. The two QPACK streams are never written after their type.
 ///
 //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-//# If either control stream is closed at any point, this MUST be treated
-//# as a connection error of type H3_CLOSED_CRITICAL_STREAM.
+//# The sender MUST NOT close the control stream, and the receiver
+//# MUST NOT request that the sender close the control stream.  If either
+//# control stream is closed at any point, this MUST be treated as a
+//# connection error of type H3_CLOSED_CRITICAL_STREAM.
 ///
-/// STOP_SENDING is the only way a client can end a stream it does not own, and
-/// the sentence before that one forbids it in as many words: "the receiver MUST
-/// NOT request that the sender close the control stream". What the server owes
-/// is the code on the wire, which it can only reach by trying to write there --
-/// and the one frame it writes on that stream after its SETTINGS is the GOAWAY
-/// of a graceful shutdown, so that is the trigger.
-///
-/// H3_NO_ERROR (0x100) is what a server that reached the verdict but never sent
-/// it would end up closing with, from the drop that ends every connection.
+/// RFC 9204 §4.2 says the same of the QPACK streams. H3_NO_ERROR (0x100) is
+/// what a server that never noticed would end up closing with, from the drop
+/// that ends every connection.
 #[tokio::test]
-async fn a_stopped_control_stream_ends_the_connection() {
-    let server = TestServer::start().await;
-    let (_endpoint, connection) = connect_quic(&server).await;
+async fn a_stopped_critical_stream_ends_the_connection() {
+    for (name, stream_type) in [
+        ("control", STREAM_CONTROL),
+        ("QPACK encoder", STREAM_QPACK_ENCODER),
+        ("QPACK decoder", STREAM_QPACK_DECODER),
+    ] {
+        let server = TestServer::start().await;
+        let (_endpoint, connection) = connect_quic(&server).await;
 
-    let mut control = server_control_stream(&connection).await;
-    // Any code would do here -- what is under test is the server's answer to
-    // being stopped at all, not what it was stopped with. H3_REQUEST_CANCELLED
-    // says why without claiming a fault of the server's.
-    control
-        .stop(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED as u32))
-        .expect("stop the server's control stream");
+        let mut streams = server_streams(&connection).await;
+        let (_, stream) = streams
+            .iter_mut()
+            .find(|(kind, _)| *kind == stream_type)
+            .unwrap_or_else(|| panic!("the server opened no {name} stream"));
+        // Any code would do: what is under test is the server's answer to being
+        // stopped at all.
+        stream
+            .stop(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED as u32))
+            .expect("stop the server's stream");
 
-    // So the STOP_SENDING is not merely queued here but processed there: it was
-    // written before these bytes were, and a server that has answered them has
-    // read past it.
-    still_serving(&connection).await;
-
-    server.shutdown();
-
-    let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
-    assert_eq!(
-        closed_with, H3_CLOSED_CRITICAL_STREAM,
-        "a control stream the peer refuses to read; the reason was {reason:?}"
-    );
-    assert!(!reason.is_empty(), "the peer must be told what it did");
+        let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
+        assert_eq!(
+            closed_with, H3_CLOSED_CRITICAL_STREAM,
+            "{name}: a stopped critical stream; the reason was {reason:?}"
+        );
+        assert!(
+            reason.contains(name),
+            "{name}: the reason {reason:?} does not name the stream"
+        );
+    }
 }
 
 /// A peer that resets its own control stream, with the connection still up, is

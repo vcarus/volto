@@ -8,7 +8,8 @@
 //!   for its lifetime: control, QPACK encoder, QPACK decoder;
 //! * a background task that serves everything the peer sends outside its
 //!   request streams: its unidirectional streams, its control stream, and its
-//!   HTTP Datagrams;
+//!   HTTP Datagrams, and that watches this endpoint's three streams for a
+//!   STOP_SENDING;
 //! * [`Connection::accept`], which hands request streams to the caller.
 //!
 //! The background task makes the peer's SETTINGS usable when they arrive. The
@@ -422,7 +423,8 @@ impl Handle {
     /// RFC 9114 §6.2.1 forbids a peer from resetting or stopping the control
     /// stream, so anything other than the connection going away is the peer
     /// breaking that rule, which is H3_CLOSED_CRITICAL_STREAM (quoted at
-    /// `control::critical_stream_closed`).
+    /// [`stop_requested`], which watches for the same STOP_SENDING without a
+    /// write).
     ///
     /// The same verdict covers the two QPACK streams this endpoint opens, on the
     /// strength of RFC 9204 §4.2 rather than this sentence (the reasoning is on
@@ -496,7 +498,8 @@ pub struct Connection {
     ///
     /// Never written to again, and never dropped before the connection is:
     /// dropping a [`quinn::SendStream`] finishes it, and RFC 9204 §4.2 makes
-    /// the closure of either stream a connection error at the peer.
+    /// the closure of either stream a connection error at the peer. A
+    /// STOP_SENDING on either is seen by [`stop_requested`].
     _qpack: [quinn::SendStream; 2],
     /// The task reading the peer's unidirectional streams and datagrams.
     peer: JoinHandle<()>,
@@ -578,7 +581,8 @@ impl Connection {
             }
         };
 
-        let peer = tokio::spawn(serve_peer(handle.clone()));
+        let stopped = stop_requested(control.stopped(), encoder.stopped(), decoder.stopped());
+        let peer = tokio::spawn(serve_peer(handle.clone(), stopped));
 
         Ok(Self {
             handle,
@@ -765,11 +769,19 @@ fn next_request_id(last_accepted: Option<u64>) -> u64 {
 /// unidirectional stream gets a task of its own, and a datagram is a map lookup
 /// and a `try_send` that never blocks. So a flood of one kind cannot hold the
 /// other up.
-async fn serve_peer(handle: Handle) {
+///
+/// `stopped` is [`stop_requested`] over this endpoint's three critical streams.
+async fn serve_peer(handle: Handle, stopped: impl Future<Output = String>) {
     let mut streams = JoinSet::new();
+    let mut stopped = std::pin::pin!(stopped);
 
     loop {
         tokio::select! {
+            detail = &mut stopped => {
+                handle.fail(Violation::connection(Code::H3_CLOSED_CRITICAL_STREAM, detail));
+                return;
+            }
+
             accepted = handle.quic.accept_uni() => {
                 let Ok(recv) = accepted else {
                     // The connection is gone; so is anything that could arrive
@@ -800,6 +812,48 @@ async fn serve_peer(handle: Handle) {
                 }
             }
         }
+    }
+}
+
+/// Completes when the peer sends STOP_SENDING on one of this endpoint's three
+/// critical streams, with the text of the violation.
+///
+/// A write would find the STOP_SENDING too ([`Handle::critical_write`]), but
+/// the control stream is written once more at most, for GOAWAY, and the two
+/// QPACK streams never are. So the three are watched for the life of the
+/// connection.
+///
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+//# The sender MUST NOT close the control stream, and the receiver
+//# MUST NOT request that the sender close the control stream.  If either
+//# control stream is closed at any point, this MUST be treated as a
+//# connection error of type H3_CLOSED_CRITICAL_STREAM.
+//
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+//# The sender MUST NOT close either of these streams, and the receiver
+//# MUST NOT request that the sender close either of these streams.
+//# Closure of either unidirectional stream type MUST be treated as a
+//# connection error of type H3_CLOSED_CRITICAL_STREAM.
+///
+/// Each argument is the stream's `quinn::SendStream::stopped`. One that ends
+/// without a STOP_SENDING never completes this: an error is the connection
+/// ending, and `Ok(None)` needs a finish, which this endpoint never sends on
+/// these streams.
+async fn stop_requested<F>(control: F, encoder: F, decoder: F) -> String
+where
+    F: Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>>,
+{
+    let watch = |name: &'static str, stopped: F| async move {
+        match stopped.await {
+            Ok(Some(code)) => format!("the peer stopped this endpoint's {name} stream ({code})"),
+            Ok(None) | Err(_) => std::future::pending().await,
+        }
+    };
+
+    tokio::select! {
+        detail = watch("control", control) => detail,
+        detail = watch("QPACK encoder", encoder) => detail,
+        detail = watch("QPACK decoder", decoder) => detail,
     }
 }
 
