@@ -1327,9 +1327,9 @@ proptest! {
 /// frames declaring 2^62-1 bytes each is handed a HEADERS frame of exactly the
 /// largest size it allows. That frame is 64 KiB of a 1 MiB budget and must be
 /// accepted, which it cannot be if the refusals had charged anything like what
-/// they declared. Sixty-four of them is sixteen times the budget at the largest
-/// *allowed* length, so even a refusal that charged only the cap rather than
-/// the declared length would show up here.
+/// they declared. Sixty-four of them is four times the budget at the largest
+/// *allowed* length, and sixteen would already fill it, so even a refusal that
+/// charged only the cap rather than the declared length would show up here.
 ///
 /// The refusals are made twice. Over the wire each reader is dropped before
 /// the next starts, and a dropped decoder gives back what it charged, so that
@@ -2058,9 +2058,9 @@ proptest! {
     /// The acceptance sets are the point. `Method::parse` is RFC 9110 §5.6.2's
     /// `token`; `field_name` is that restricted by RFC 9114 §4.2's rule that an
     /// uppercase name is malformed; `FieldValue::parse` is VCHAR, `obs-text`, SP
-    /// and HTAB, which is RFC 9114 §10.3's three dangerous octets refused and
-    /// nothing else. A parser that drifted either way would change what this
-    /// server calls malformed.
+    /// and HTAB, which refuses the three octets RFC 9114 §10.3 names, every
+    /// other control character and DEL. A parser that drifted either way would
+    /// change what this server calls malformed.
     #[test]
     fn the_message_parsers_accept_exactly_what_they_document(
         name in any_name_bytes(),
