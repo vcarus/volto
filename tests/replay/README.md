@@ -245,8 +245,7 @@ arrive, so a sizeable share of connections never establish at all. The run
 reports them by what ended each one — the path running out the ten-second bound,
 the server refusing at `max_connections`, or the server evicting a connection
 that had not yet authenticated (D76) — and carries on. None of the three is a
-fault, and until the tier was first run the harness treated all of them as one,
-by panicking.
+fault.
 
 The two that name the server are also the two the harness must not provoke. A
 run that drove the server into its own admission control would be measuring its
