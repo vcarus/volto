@@ -1305,7 +1305,6 @@ async fn production_shapes_are_replayed() {
     let scaling = shape::Scaling {
         wall_seconds: settings.wall_seconds,
         compression: settings.compression,
-        idle_seconds: settings.idle_seconds,
         // The idle timeout that was in force when the capture was taken. The
         // server configures 60 seconds and both captured hosts run that
         // default, but RFC 9000 §10.1 makes the effective value the smaller of

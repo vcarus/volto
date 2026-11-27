@@ -22,13 +22,11 @@
 //! storing the values themselves, and it is stable under a seed, so a run that
 //! finds something can be run again.
 
-#![allow(dead_code)]
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the capture arithmetic is over numbers this module counted itself.
 #![allow(clippy::as_conversions)]
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 // --------------------------------------------------------------------------
 // JSON
@@ -359,15 +357,6 @@ impl Rng {
         }
     }
 
-    /// A value in `0..limit`.
-    pub fn below(&mut self, limit: usize) -> usize {
-        if limit == 0 {
-            0
-        } else {
-            (self.next_u64() % limit as u64) as usize
-        }
-    }
-
     /// Whether an event of probability `chance` happens.
     pub fn chance(&mut self, chance: f64) -> bool {
         self.unit() < chance
@@ -432,10 +421,6 @@ impl Histogram {
             max,
             empty_value,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.total == 0
     }
 
     /// One sample: a bucket in proportion to its count, uniform inside it.
@@ -613,17 +598,6 @@ pub enum Ending {
     Outlive,
 }
 
-impl fmt::Display for Ending {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Ending::Idle => "idle",
-            Ending::PeerClose => "peer_close",
-            Ending::ProtocolViolation => "protocol_violation",
-            Ending::Outlive => "outlive",
-        })
-    }
-}
-
 /// What a replayed tunnel does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelKind {
@@ -665,22 +639,18 @@ pub struct ConnectionPlan {
     pub active_ms: u64,
     pub ending: Ending,
     pub tunnels: Vec<TunnelPlan>,
-    /// How many distinct targets this connection's tunnels use.
-    pub targets: usize,
     /// Whether this connection is one of a restart burst, and so aborts a
     /// predecessor mid-transfer when it starts.
     pub in_burst: bool,
 }
 
-/// Everything the planner was told, kept so the report can print it.
+/// Everything the planner was told.
 #[derive(Debug, Clone, Copy)]
 pub struct Scaling {
     /// Wall-clock seconds the run is allowed.
     pub wall_seconds: u64,
     /// How much production time one second of the run stands for.
     pub compression: f64,
-    /// The lab server's idle timeout, in seconds.
-    pub idle_seconds: u64,
     /// The idle timeout in force when the capture was taken, in seconds.
     /// Subtracted from an idle-ended connection's lifetime, because that
     /// lifetime includes the whole wait for the timer that ended it.
@@ -733,9 +703,7 @@ pub struct Compromises {
 
 pub struct Plan {
     pub connections: Vec<ConnectionPlan>,
-    pub scaling: Scaling,
     pub compromises: Compromises,
-    pub fanout: FanOut,
 }
 
 /// One row of the profile's `(outcome, lifetime, tunnels)` contingency table.
@@ -1005,7 +973,6 @@ pub fn plan(profile: &Json, scaling: Scaling, seed: u64) -> Plan {
             active_ms,
             ending,
             tunnels,
-            targets: targets.max(1),
             in_burst,
         });
 
@@ -1020,9 +987,7 @@ pub fn plan(profile: &Json, scaling: Scaling, seed: u64) -> Plan {
 
     Plan {
         connections,
-        scaling,
         compromises,
-        fanout,
     }
 }
 
