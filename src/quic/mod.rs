@@ -464,10 +464,17 @@ impl Server {
         // Read per accepted connection rather than snapshotted before the
         // loop: `docs/deployment.md#reloading` promises a reload applies to
         // connections accepted from then on, and lowering this cap during an
-        // incident is exactly the sort of thing that promise is for. The cost
-        // is an `Arc` load on a path that is already opening a QUIC
-        // connection.
-        let max_connections = self.config().limits.max_connections;
+        // incident is exactly the sort of thing that promise is for. Read
+        // under the slot's read lock, which clones nothing, because a flood
+        // takes this path once per arrival.
+        let max_connections = self
+            .live
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .generation
+            .config
+            .limits
+            .max_connections;
 
         // Zero is no cap at all, so nothing below is measured and the roster is
         // not even asked for its length.
