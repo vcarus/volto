@@ -12,13 +12,8 @@
 //!
 //! # Normalization comes first
 //!
-//! `::ffff:127.0.0.1` is loopback written as IPv6: the kernel routes it to
-//! 127.0.0.1, while a naive matcher sees an IPv6 address that matches none of the
-//! IPv4 rules. Every check therefore starts by canonicalizing
-//! ([`canonical`]). The deprecated `::/96` compatible range is not canonicalized:
-//! its row in `PRIVATE_PREFIXES` refuses it whole. Nor is the IPv4-translated
-//! `::ffff:0:0:0/96`, which its row refuses whole by default; see
-//! `translated_ipv4`.
+//! `::ffff:127.0.0.1` is loopback written as IPv6, so every check starts with
+//! [`canonical`].
 //!
 //! # Two buckets
 //!
@@ -40,11 +35,6 @@
 //! because it is syntactically a global IPv6 address would undo the
 //! whole IPv4 half of this module. `embedded_ipv4` unwraps them before any rule
 //! is applied.
-//!
-//! The local-use NAT64 prefix `64:ff9b:1::/48` (RFC 8215) is the one transition
-//! form that is not unwrapped. Its operator chooses the layout, RFC 8215 §5
-//! forbids a reader assuming one, and a guess can read a private target as
-//! public. The whole prefix sits in the private bucket instead.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -80,11 +70,8 @@ impl Policy {
 
     /// Whether one resolved address may be dialled.
     pub fn allows_address(&self, ip: IpAddr) -> bool {
-        // A transition address is judged as the IPv4 address it carries, since
-        // that is what a host routing it actually reaches. Done here rather than
-        // inside the two rules below because the verdict may be either of them:
-        // an embedded multicast or unspecified address is never allowed, an
-        // embedded private one is private.
+        // Judged in the routed form, before both rules, because an embedded
+        // address can fall in either bucket.
         let ip = routed_form(ip);
 
         if is_never_allowed(ip) {
@@ -138,10 +125,7 @@ pub fn is_dns_blackhole(addresses: &[SocketAddr]) -> bool {
 ///
 /// [`canonical`] first, then [`embedded_ipv4`]: a transition address is a route
 /// to the IPv4 address it carries, so that is the address every rule and the
-/// own-address check must judge. One helper rather than the same two steps
-/// spelled out at each site, because [`Policy::allows_address`],
-/// [`is_dns_blackhole`] and the tunnel's own-address check have to agree on
-/// what "the routed form" means.
+/// own-address check must judge.
 pub(crate) fn routed_form(ip: IpAddr) -> IpAddr {
     let ip = canonical(ip);
     embedded_ipv4(ip).map_or(ip, IpAddr::V4)
@@ -150,8 +134,6 @@ pub(crate) fn routed_form(ip: IpAddr) -> IpAddr {
 /// Normalizes an address into the form the kernel will actually route.
 ///
 /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) becomes the IPv4 address it stands for.
-/// The deprecated IPv4-compatible range (`::a.b.c.d`) is left as IPv6; its row in
-/// `PRIVATE_PREFIXES` says why.
 pub fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_canonical(),
@@ -308,12 +290,8 @@ const fn v6(leading: &[u16], len: u32, name: &'static str, source: &'static str)
 /// RFC 6890 set up, minus the entries [`is_never_allowed`] has already claimed,
 /// and from the IPv6 address space registry's "Reserved by IETF" blocks.
 /// Everything on it is either not globally reachable or not a destination an
-/// internet-facing proxy has any business dialling, and every one of them is a
-/// way past `allow_private_networks = false` if it is missing: `100.64.0.0/10` is where a
-/// carrier-grade NAT keeps its subscribers, `198.18.0.0/15` is what some
-/// networks number their own infrastructure with, `192.0.0.0/24` holds protocol
-/// assignments including the DS-Lite `192.0.0.0/29` link, and `240.0.0.0/4` is
-/// routed inside more than one large private network in practice.
+/// internet-facing proxy has any business dialling, and a missing row is a way
+/// past `allow_private_networks = false`. Each row states its own reason.
 ///
 /// Where an allocation has an IPv4 and an IPv6 half, the two rows sit together
 /// under one comment. `docs/configuration.md` and `script/config.example.toml`
@@ -363,26 +341,14 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
     // carrier-grade NAT.
     v4([100, 64, 0, 0], 10, "Shared Address Space", "RFC 6598"),
     // `192.0.0.0/24` and `2001::/23`, IETF Protocol Assignments (RFC 6890 for
-    // the IPv4 block, RFC 2928 for the IPv6 one). Both are refused whole.
+    // the IPv4 block, RFC 2928 for the IPv6 one). Both are refused whole. The
+    // IPv4 block holds the DS-Lite `192.0.0.0/29` link among its assignments.
     //
-    // RFC 6890 Table 22 gives every one of the /23's Source, Destination,
-    // Forwardable and Global attributes as "False[1]", and footnote [1] is
-    // "Unless allowed by a more specific allocation". The allocations inside it
-    // are the anycast service addresses `2001:1::1` (Port Control Protocol,
-    // RFC 7723), `2001:1::2` (TURN, RFC 8155) and `2001:1::3` (DNS-SD Service
-    // Registration Protocol, RFC 9665), Benchmarking `2001:2::/48` (RFC 5180),
-    // AMT `2001:3::/32` (RFC 7450), AS112-v6 `2001:4:112::/48` (RFC 7535),
-    // ORCHID `2001:10::/28` (RFC 4843), ORCHIDv2 `2001:20::/28` (RFC 7343), the
-    // Drone Remote ID Protocol Entity Tags (DETs) prefix `2001:30::/28`
-    // (RFC 9374), and Teredo `2001::/32` (RFC 4380). Apart from Teredo, this
-    // proxy refuses each of them for a reason of its own. The anycast service
-    // addresses, AMT and AS112 reach a service of the proxy's own network, for
-    // the reason given below and beside the IPv4 rows that follow. Benchmarking
-    // is what a lab numbers a device under test with. An ORCHID is a hash of a
-    // host identity and a DET an identifier for a drone's remote identity:
-    // neither is a locator, nothing forwards one, and a tunnel to it can only
-    // hold a slot. The space between the allocations has no allocation to
-    // allow it.
+    // Every allocation inside the /23 is refused for a reason of its own: the
+    // anycast service addresses, AMT and AS112 reach a service of the proxy's
+    // own network (below), Benchmarking is lab space, and ORCHID and DET
+    // identifiers are not locators. Space between allocations has no
+    // allocation to allow it (RFC 6890 Table 22, "False[1]").
     //
     // Teredo is the one allocation inside the /23 that this row does not
     // decide. `routed_form` unwraps a Teredo address before the table is
@@ -438,9 +404,8 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
     // inside the `2001::/23` row.
     v4([198, 18, 0, 0], 15, "Benchmarking", "RFC 2544"),
     // The documentation ranges: three IPv4 blocks (RFC 5737), and
-    // `2001:db8::/32` (RFC 3849) and `3fff::/20` for IPv6. RFC 3849's block is
-    // the one in long use; the IANA registry added `3fff::/20` as a second
-    // documentation block in July 2024.
+    // `2001:db8::/32` (RFC 3849) and `3fff::/20` for IPv6. `3fff::/20` is
+    // RFC 9637's.
     //
     // Reachable nowhere by definition, and the ranges examples and test
     // fixtures are written with, so a request for one is a misconfiguration
@@ -471,8 +436,10 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
         "6to4 Relay Anycast (deprecated)",
         "RFC 7526",
     ),
-    // 240.0.0.0/4, reserved (RFC 1112 §4). The broadcast address at the top of
-    // it is already `is_never_allowed`, which runs first.
+    // 240.0.0.0/4, reserved (RFC 1112 §4). More than one large private network
+    // routes it internally in practice, so a host on such a network reaches
+    // whatever that network put there. The broadcast address at the top of it
+    // is already `is_never_allowed`, which runs first.
     v4([240, 0, 0, 0], 4, "Reserved", "RFC 1112"),
     // `100::/64` is the discard-only prefix (RFC 6666). Traffic to it is meant
     // to be black-holed, which makes it a way to ask this proxy to open a
@@ -573,7 +540,7 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
 ///
 /// # The local-use prefix is refused whole rather than read
 ///
-/// The well-known prefix is fixed at /96 by RFC 6052 §3.1, so there is one
+/// The well-known prefix is fixed at /96 by RFC 6052 §2.1, so there is one
 /// answer for it. `64:ff9b:1::/48` is not like that. RFC 8215 §5: "64:ff9b:1::/48
 /// is intended as a technology-agnostic and generic reservation. A network
 /// operator may freely use it in combination with any kind of IPv4/IPv6
@@ -1075,8 +1042,8 @@ mod tests {
 
     /// The extraction itself, address by address.
     ///
-    /// The bucket assertions above would pass on a near-miss — 169.254.0.169 is
-    /// as link-local as 169.254.169.254 — so the exact value is asserted here.
+    /// The bucket assertions above would pass on a near-miss: 169.254.0.169 is
+    /// as link-local as 169.254.169.254, so the exact value is asserted here.
     #[test]
     fn the_embedded_ipv4_is_extracted_exactly() {
         for (address, expected) in [
@@ -1119,7 +1086,7 @@ mod tests {
     }
 
     /// A Teredo address's *client* IPv4 is the inverted last 32 bits, and the
-    /// bits in between are a server address this proxy never dials — so the
+    /// bits in between are a server address this proxy never dials, so the
     /// verdict must come from the right half of the address.
     #[test]
     fn a_teredo_address_is_read_from_its_client_field() {
@@ -1239,7 +1206,7 @@ mod tests {
     }
 
     /// The IPv4-translated form of RFC 2765 §2.1, `::ffff:0:a.b.c.d`, and the
-    /// rest of `::/8` are private (R6-L5).
+    /// rest of `::/8` are private.
     ///
     /// The translated form is segments `[0, 0, 0, 0, 0xffff, 0, hi, lo]`:
     /// `to_canonical` leaves it alone because segment 4, not segment 5, is
@@ -1336,7 +1303,7 @@ mod tests {
         }
     }
 
-    /// The new rows shadow neither the mapped form nor the well-known NAT64
+    /// These rows shadow neither the mapped form nor the well-known NAT64
     /// prefix, which both lie inside `::/8` and are judged by the IPv4 address
     /// they carry before the table is read.
     #[test]
@@ -1394,21 +1361,18 @@ mod tests {
         assert!(!policy.allows_port(25));
     }
 
-    /// A name that resolves to a mix keeps only what may be dialled — the reason
+    /// A name that resolves to a mix keeps only what may be dialled: the reason
     /// resolution is explicit rather than left to `TcpStream::connect`.
     #[test]
     fn filtering_keeps_the_dialable_addresses() {
         let policy = policy(false, &[]);
-        let addresses: Vec<SocketAddr> = [
+        let addresses = addresses(&[
             "127.0.0.1:443",
             "8.8.8.8:443",
             "[::1]:443",
             "[2606:4700::1111]:443",
             "[::ffff:10.0.0.1]:443",
-        ]
-        .iter()
-        .map(|a| a.parse().expect("socket address"))
-        .collect();
+        ]);
 
         let allowed = policy.allowed_addresses(&addresses);
         assert_eq!(
@@ -1491,10 +1455,7 @@ mod tests {
     #[test]
     fn filtering_everything_out_yields_an_empty_list() {
         let policy = policy(false, &[]);
-        let addresses: Vec<SocketAddr> = ["127.0.0.1:443", "[::ffff:127.0.0.1]:443"]
-            .iter()
-            .map(|a| a.parse().expect("socket address"))
-            .collect();
+        let addresses = addresses(&["127.0.0.1:443", "[::ffff:127.0.0.1]:443"]);
 
         assert!(policy.allowed_addresses(&addresses).is_empty());
     }
