@@ -189,7 +189,10 @@ check_log() {
     # requires the level token in the shape the filter below reads, " WARN ",
     # because the colour codes surround the level and not the message: a floor
     # on the message text alone matches whether or not the strip above worked.
-    printf '%s\n' "$plain" | grep -qE ' WARN .*allow_private_networks is on' || {
+    # A here-string, not a pipe: grep -q exits at the first match, and under
+    # pipefail the writer it leaves behind fails the floor with SIGPIPE once
+    # the log outgrows the pipe buffer.
+    grep -qE ' WARN .*allow_private_networks is on' <<< "$plain" || {
         echo "the private-networks warning this configuration always draws is not in $log:" >&2
         echo "this check cannot read the log, so it cannot judge it" >&2
         return 1
