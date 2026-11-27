@@ -868,8 +868,7 @@ async fn packets_to_a_silent_target_are_capped() {
 #[tokio::test]
 async fn a_churn_of_sessions_cannot_restore_the_unanswered_budget() {
     const BUDGET: u64 = 2;
-    // `tunnel::CONNECTION_UNANSWERED_MULTIPLIER` times the per-session budget.
-    const CONNECTION_TOTAL: u64 = BUDGET * 8;
+    let connection_total = BUDGET * u64::from(volto::tunnel::CONNECTION_UNANSWERED_MULTIPLIER);
     const SESSIONS: u64 = 20;
 
     let server = TestServer::start_with(&format!(
@@ -894,10 +893,10 @@ async fn a_churn_of_sessions_cannot_restore_the_unanswered_budget() {
     // Wait for the total to be spent, then keep waiting to catch any leak past
     // it. Without a connection-level total all 40 packets would arrive.
     let deadline = tokio::time::Instant::now() + TIMEOUT;
-    while received.load(std::sync::atomic::Ordering::Relaxed) < CONNECTION_TOTAL {
+    while received.load(std::sync::atomic::Ordering::Relaxed) < connection_total {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "only {} of the {CONNECTION_TOTAL} budgeted packets arrived",
+            "only {} of the {connection_total} budgeted packets arrived",
             received.load(std::sync::atomic::Ordering::Relaxed)
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -906,7 +905,7 @@ async fn a_churn_of_sessions_cannot_restore_the_unanswered_budget() {
 
     assert_eq!(
         received.load(std::sync::atomic::Ordering::Relaxed),
-        CONNECTION_TOTAL,
+        connection_total,
         "a new session must not restore what the connection has already spent"
     );
 
@@ -938,14 +937,13 @@ async fn a_churn_of_sessions_cannot_restore_the_unanswered_budget() {
 /// on the way there. Every session's first packet is sent into silence, so
 /// without the refund a long-lived connection that opens short answered sessions
 /// one after another, which is what a DNS query through the tunnel is, spends
-/// the connection total at session `CONNECTION_TOTAL + 1` and is reset with
+/// the connection total at session `connection_total + 1` and is reset with
 /// every target consenting.
 #[tokio::test]
 async fn answered_sessions_give_the_connection_total_back() {
     const BUDGET: u64 = 1;
-    // `tunnel::CONNECTION_UNANSWERED_MULTIPLIER` times the per-session budget.
-    const CONNECTION_TOTAL: u64 = BUDGET * 8;
-    const SESSIONS: u64 = CONNECTION_TOTAL + 4;
+    let connection_total = BUDGET * u64::from(volto::tunnel::CONNECTION_UNANSWERED_MULTIPLIER);
+    let sessions = connection_total + 4;
 
     let server = TestServer::start_with(&format!(
         "[security]\nallow_private_networks = true\nunanswered_packet_budget = {BUDGET}\n"
@@ -954,16 +952,16 @@ async fn answered_sessions_give_the_connection_total_back() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    for i in 0..SESSIONS {
+    for i in 0..sessions {
         let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
         let payload = format!("session {i}");
         let echoed = udp_round_trip(&client, qsid, payload.as_bytes()).await;
         assert_eq!(
             String::from_utf8_lossy(&echoed),
             payload,
-            "session {i} of {SESSIONS} must be answered: a target that answers \
+            "session {i} of {sessions} must be answered: a target that answers \
              refunds what its session spent, so a connection total of \
-             {CONNECTION_TOTAL} is never reached by answered sessions"
+             {connection_total} is never reached by answered sessions"
         );
         close_and_drain(&mut stream).await;
     }
