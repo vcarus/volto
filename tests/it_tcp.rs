@@ -16,9 +16,9 @@ use common::rawstream::{
 };
 use common::{
     ALLOW_PRIVATE, ConnectionEnd, DELIBERATE, H3Client, TIMEOUT, TestServer, assert_peer_reset,
-    closed_address, connect_request, echoes, finish_connect, h3_server_endpoint, open_tcp_tunnel,
-    proxy_status, read_at_least, read_to_end, respond_to, send_and_respond,
-    spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
+    closed_address, connect_request, connect_until_accepted, echoes, finish_connect,
+    h3_server_endpoint, open_tcp_tunnel, proxy_status, read_at_least, read_to_end, respond_to,
+    send_and_respond, spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
     spawn_flood_then_reset_target, spawn_reset_after_read_target, windowless_connection,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1031,23 +1031,7 @@ async fn a_tunnel_abandoned_after_its_own_fin_frees_its_slot() {
     // stops the response direction, in that order or the other.
     drop(open_tcp_tunnel(&mut client, &target.to_string()).await);
 
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    let mut refusals = 0u32;
-    loop {
-        let response = respond_to(&mut client, connect_request(&target.to_string())).await;
-        if response.status == Status::OK {
-            return;
-        }
-        refusals += 1;
-
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the abandoned tunnel never gave up its slot: {refusals} CONNECTs refused with \
-             {:?} in {TIMEOUT:?}",
-            response.status
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    connect_until_accepted(&mut client, &target.to_string(), TIMEOUT).await;
 }
 
 /// The counterpart, and the regression that stops the reset above from leaking

@@ -2019,3 +2019,37 @@ pub fn counted_at_least(counter: &AtomicU64, n: u64) -> impl Future<Output = ()>
         }
     }
 }
+
+/// Sends a CONNECT to `authority` until one is answered with a 200, for at most
+/// `within`.
+///
+/// For a tunnel slot the server gives back a moment after a tunnel ends: the
+/// slot returns when the server-side task does, which the client cannot see,
+/// so the request is repeated every 50 ms rather than sent once. A failure
+/// names the caller, the number of refusals and the last status.
+#[track_caller]
+pub fn connect_until_accepted<'a>(
+    client: &'a mut H3Client,
+    authority: &'a str,
+    within: Duration,
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        let deadline = Instant::now() + within;
+        let mut refusals = 0u32;
+        loop {
+            let (response, _) = exchange(client, connect_request(authority), caller).await;
+            if response.status == Status::OK {
+                return;
+            }
+            refusals += 1;
+            assert!(
+                Instant::now() < deadline,
+                "at {caller}: {refusals} CONNECTs to {authority} were refused in {within:?}, \
+                 the last with {:?}",
+                response.status
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}

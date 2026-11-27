@@ -15,9 +15,9 @@ use common::rawstream::H3_REQUEST_CANCELLED;
 use common::{
     ALLOW_PRIVATE, H3Client, TIMEOUT, TestServer, assert_peer_reset, auth_section, authorize,
     authorized_connect, basic_credentials, close_and_drain, connect_request, connect_udp_request,
-    counted_at_least, echoes, open_tcp_tunnel, open_udp_session, proxy_status, respond_to,
-    send_and_respond, send_udp_payload, spawn_echo_target, spawn_silent_udp_target,
-    spawn_udp_echo_target, udp_round_trip,
+    connect_until_accepted, counted_at_least, echoes, open_tcp_tunnel, open_udp_session,
+    proxy_status, respond_to, send_and_respond, send_udp_payload, spawn_echo_target,
+    spawn_silent_udp_target, spawn_udp_echo_target, udp_round_trip,
 };
 use volto::h3api::{FieldValue, Request, Status};
 
@@ -761,18 +761,8 @@ async fn a_finished_tunnel_returns_its_slot() {
     close_and_drain(&mut stream).await;
 
     // The slot is released when the server-side task ends, a moment after the
-    // stream closes, so allow it to catch up rather than racing it.
-    let mut last = None;
-    for _ in 0..40 {
-        let response = respond_to(&mut client, connect_request(&target.to_string())).await;
-        if response.status == Status::OK {
-            return;
-        }
-        last = Some(response.status);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    panic!("the slot was never released, last status was {last:?}");
+    // stream closes, so the request is repeated rather than raced.
+    connect_until_accepted(&mut client, &target.to_string(), TIMEOUT).await;
 }
 
 // ---------------------------------------------------------------------------
