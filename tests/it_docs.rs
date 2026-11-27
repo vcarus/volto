@@ -1132,8 +1132,8 @@ fn every_documentation_anchor_resolves() {
 
 /// Commands the manual installation must be written with, at the very least.
 ///
-/// Today both sides carry eight. The floor is what stops a heading renamed or a
-/// fence reflowed from comparing two empty lists and calling them equal.
+/// The floor is what stops a heading renamed or a fence reflowed from comparing
+/// two empty lists and calling them equal.
 const INSTALL_COMMAND_FLOOR: usize = 6;
 
 /// The `## systemd` section of `docs/deployment.md`.
@@ -1175,31 +1175,41 @@ fn install_comment(text: &str) -> &str {
     &rest[..end]
 }
 
-/// Every `sudo` line inside a fenced block of `section`, in order.
+/// Every line of the fenced blocks of `section` that hold a `sudo` command, in
+/// order.
+///
+/// A whole block, not only its `sudo` lines, so a step written without `sudo`
+/// or a line continued with a backslash is compared too. The section's other
+/// blocks, a drop-in or a `journalctl` query, hold no `sudo` and stay out.
 fn fenced_commands(section: &str) -> Vec<String> {
     let mut commands = Vec::new();
+    let mut block: Vec<String> = Vec::new();
     let mut fenced = false;
 
     for line in section.lines() {
         if line.trim_start().starts_with("```") {
+            if fenced && block.iter().any(|line| line.starts_with("sudo ")) {
+                commands.append(&mut block);
+            }
+            block.clear();
             fenced = !fenced;
             continue;
         }
-        if fenced && line.starts_with("sudo ") {
-            commands.push(line.to_owned());
+        if fenced && !line.trim().is_empty() {
+            block.push(line.to_owned());
         }
     }
 
     commands
 }
 
-/// Every `sudo` line of `comment`, in order, with the comment marker taken off.
+/// Every command line of `comment`, in order, with the comment marker taken off:
+/// the lines indented under the prose, which is written `# ` with one space.
 fn commented_commands(comment: &str) -> Vec<String> {
     comment
         .lines()
-        .filter_map(|line| line.strip_prefix('#'))
+        .filter_map(|line| line.strip_prefix("#   "))
         .map(str::trim)
-        .filter(|line| line.starts_with("sudo "))
         .map(str::to_owned)
         .collect()
 }
