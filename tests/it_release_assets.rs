@@ -1570,8 +1570,10 @@ fn unit_directives() -> Vec<String> {
 /// anywhere and resolve names through the system resolver; take `SIGHUP` as a
 /// reload, which `RestartForceExitStatus=SIGHUP` keeps from ending the service
 /// in its first milliseconds; write a keylog file only when a drop-in grants a
-/// path. `Type=exec` makes a start fail when the binary cannot be executed,
-/// `UMask=0077` keeps any file it creates to its user, `ProcSubset=pid` hides
+/// path. `Type=notify` makes a start done only when the server says its
+/// listener is bound, and `TimeoutStartSec=15` fails a start that never says
+/// so; `NotifyAccess=` stays unset because `Type=notify` already makes it
+/// `main`. `UMask=0077` keeps any file it creates to its user, `ProcSubset=pid` hides
 /// the `/proc` entries only `--diagnostics` reads, and `RemoveIPC=yes` removes
 /// IPC objects it never makes. `ReadOnlyPaths=/etc/volto` added nothing under
 /// `ProtectSystem=strict`. `SystemCallFilter=~@resources` removes the calls that
@@ -1585,7 +1587,8 @@ fn unit_directives() -> Vec<String> {
 fn the_unit_carries_the_safe_hardening_and_nothing_that_breaks_the_binary() {
     let directives = unit_directives();
     for expected in [
-        "Type=exec",
+        "Type=notify",
+        "TimeoutStartSec=15",
         "UMask=0077",
         "ProcSubset=pid",
         "RemoveIPC=yes",
@@ -1615,6 +1618,13 @@ fn the_unit_carries_the_safe_hardening_and_nothing_that_breaks_the_binary() {
         "IPAddressDeny=",
         "SocketBindDeny=",
         "Type=simple",
+        "Type=exec",
+        // `Type=notify` makes it `main`; `all` would let any process of the
+        // unit report readiness for the server.
+        "NotifyAccess=",
+        // It changes how `systemctl reload` reaches the server, and the
+        // server implements none of it (D124).
+        "Type=notify-reload",
     ] {
         assert!(
             !directives.iter().any(|line| line.starts_with(absent)),

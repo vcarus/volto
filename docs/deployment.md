@@ -266,9 +266,10 @@ three things the host needs:
   cannot (see [before the swap](#before-the-swap)); otherwise it keeps the
   current binary at `/usr/local/bin/volto.prev` and the current unit at
   `/etc/systemd/system/volto.service.prev`, swaps in the new one, refreshes the
-  systemd unit and restarts. If the service is not running a few seconds later,
-  both are restored, systemd is reloaded, the service is restarted, and the
-  script fails loudly. The unit is covered because it is refreshed on every
+  systemd unit and restarts. If the restart fails, which under `Type=notify`
+  includes a server that never reports ready, or if the service is not running
+  a few seconds later, both are restored, systemd is reloaded, the service is
+  restarted, and the script fails loudly. The unit is covered because it is refreshed on every
   update and carries the hardening directives an older host is most likely to
   reject.
 - **Already on that version**, with the config and the unit in place: it exits
@@ -436,6 +437,20 @@ not expecting it: when the newly installed binary is not running a few seconds
 later, the previous binary and the previous unit are both restored, which on a
 rollback is the release you were trying to leave.
 
+**The unit goes back with the binary.** A release from before `Type=notify`
+never reports ready, and under the current unit its start fails after
+`TimeoutStartSec=`. `volto-deploy` installs the unit of the release it installs,
+so a rollback through it is safe. A rollback by hand has to restore
+`/etc/systemd/system/volto.service.prev` together with `/usr/local/bin/volto.prev`
+and run `systemctl daemon-reload` before the restart:
+
+```sh
+sudo install -m 0755 /usr/local/bin/volto.prev /usr/local/bin/volto
+sudo install -m 0644 /etc/systemd/system/volto.service.prev /etc/systemd/system/volto.service
+sudo systemctl daemon-reload
+sudo systemctl restart volto
+```
+
 **`--tag` is not a pin.** The script carries no version pin of its own; a run
 without `--tag` moves the host forward to the newest *published* release. So a
 rollback left alone is undone by the next timer tick, within a day. Hold it
@@ -498,8 +513,23 @@ allows binding a low port without root, and the rest of the unit is standard
 systemd hardening — `ProtectSystem=strict` with no writable path, `UMask=0077`,
 `ProcSubset=pid`, a `@system-service` syscall filter without `@resources`, no
 new privileges.
-`Type=exec` makes `systemctl start` and `restart` fail at once when the binary
-cannot be executed.
+
+The unit is `Type=notify`. volto sends `READY=1` to the socket systemd names in
+`NOTIFY_SOCKET` once its UDP listener is bound, and systemd counts the start as
+done from that message on. So when `systemctl start` or `restart` returns 0, the
+port is bound and the accept loop is about to run. A binary that cannot be
+executed still fails the start at once, and so does a server that exits during
+startup. A start that has sent nothing after `TimeoutStartSec=15` fails, and
+systemd stops the process: startup reads a few files and binds one socket, so a
+start that takes that long will not finish. Outside systemd, with no
+`NOTIFY_SOCKET`, nothing is sent and nothing is logged. When the variable is set
+and the socket cannot be used, the server logs one warning (`log_id=wkj009dk`,
+`log_id=h6ro04gv` or `log_id=kyd7134y`) and serves without notifications.
+
+A volto from before `Type=notify` never sends `READY=1`. Under this unit its
+start fails after `TimeoutStartSec=`, so the unit goes back with the binary on
+every rollback. `volto-deploy` keeps and restores both, and
+[rolling back](#rolling-back) has the commands for a rollback by hand.
 
 The QUIC endpoint can stop while no shutdown was asked for: quinn ends it when
 the socket's receive call fails with an error other than a connection reset.

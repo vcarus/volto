@@ -21,6 +21,9 @@
 //! misreading that would turn "your volto is too old to check" into "your config
 //! is broken".
 
+// For the QUIC client that shows a server started under a notification socket
+// nobody listens on still serves.
+mod common;
 #[path = "common/scripts.rs"]
 mod scripts;
 
@@ -539,8 +542,10 @@ fn the_check_judges_rust_log_by_the_rule_startup_applies() {
 /// A `SIGHUP` that arrives while the server is still starting is a reload, not
 /// the end of the process.
 ///
-/// `systemctl reload` sends the signal as soon as the unit is active, which for
-/// `Type=exec` is as soon as the binary has been executed. Until a handler is installed
+/// Under `Type=notify` the unit is active only once the server has sent
+/// `READY=1`, which is after the handler exists. A `SIGHUP` sent by other means,
+/// such as `kill` or a renewal hook that does not go through systemd, can still
+/// arrive earlier. Until a handler is installed
 /// the signal's default action ends the process, and systemd does not restart a
 /// service that died by `SIGHUP` unless the unit says so. The first stdout line
 /// is the startup warning about authentication, written before `Server::bind`.
@@ -1362,4 +1367,194 @@ fn the_check_refuses_require_ech_without_an_ech_key() {
     add_ech_key(&path, &key);
     let checked = run(&["--check-config", "--config", path.to_str().unwrap()]);
     assert_eq!(checked.status.code(), Some(0), "{}", stderr_of(&checked));
+}
+
+/// A volto serving a real certificate on a loopback port of its own, with
+/// its stdout read line by line.
+///
+/// `JOURNAL_STREAM`, `RUST_LOG` and the three variables of the notification
+/// protocol are removed before `env` is set, so the run depends on none of
+/// the test runner's own.
+struct Serving {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    seen: Vec<String>,
+    addr: std::net::SocketAddr,
+    ca: rustls::pki_types::CertificateDer<'static>,
+}
+
+impl Serving {
+    /// Starts the binary on a configuration written into `dir`.
+    fn start(dir: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Self {
+        use std::io::{BufRead, BufReader};
+
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("a self-signed certificate must be generated");
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        fs::write(&cert, issued.cert.pem()).expect("the cert must be writable");
+        fs::write(&key, issued.signing_key.serialize_pem()).expect("the key must be writable");
+
+        // A port the kernel just handed out and this test let go of, so that
+        // the test knows which port to ask about afterwards.
+        let addr = std::net::UdpSocket::bind("127.0.0.1:0")
+            .and_then(|socket| socket.local_addr())
+            .expect("an ephemeral port must be free");
+        let path = dir.join("config.toml");
+        write_private(
+            &path,
+            &loadable_config_text(&cert, &key, &addr.to_string(), SECRET, ""),
+        );
+
+        let mut child = Command::new(real_binary())
+            .args(["--config", path.to_str().unwrap()])
+            .env_remove("JOURNAL_STREAM")
+            .env_remove("RUST_LOG")
+            .env_remove("NOTIFY_SOCKET")
+            .env_remove("WATCHDOG_USEC")
+            .env_remove("WATCHDOG_PID")
+            // Plain text, so a line can be matched on its fields.
+            .env("NO_COLOR", "1")
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the volto binary must be runnable");
+
+        let (sender, lines) = std::sync::mpsc::channel();
+        let stdout = child.stdout.take().expect("stdout is piped");
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            child,
+            lines,
+            seen: Vec::new(),
+            addr,
+            ca: issued.cert.der().clone(),
+        }
+    }
+
+    /// Reads stdout until a line contains `needle`, failing on an exit or
+    /// after 20 s.
+    #[track_caller]
+    fn wait_for(&mut self, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("the child must be waitable") {
+                panic!(
+                    "volto exited with {status} while waiting for {needle:?}; stdout so far:\n{}",
+                    self.seen.join("\n")
+                );
+            }
+            if let Ok(line) = self.lines.recv_timeout(Duration::from_millis(20)) {
+                let found = line.contains(needle);
+                self.seen.push(line);
+                if found {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no {needle:?} within 20 s; stdout so far:\n{}",
+                self.seen.join("\n")
+            );
+        }
+    }
+
+    /// Stops the server with `SIGTERM` and returns its exit status with
+    /// every stdout line it wrote.
+    fn stop(mut self) -> (std::process::ExitStatus, Vec<String>, String) {
+        use rustix::process::{Pid, Signal, kill_process};
+
+        kill_process(Pid::from_child(&self.child), Signal::TERM)
+            .expect("SIGTERM must be deliverable");
+        let output = self
+            .child
+            .wait_with_output()
+            .expect("the child's output must be readable");
+        // The reader thread ends at the pipe's end, which the exit closes.
+        self.seen.extend(self.lines.iter());
+        (output.status, self.seen, stderr_of(&output))
+    }
+}
+
+/// Under `Type=notify` the server says `READY=1` once its listener is bound,
+/// and not before.
+///
+/// The test owns the notification socket, as systemd does. When the message
+/// arrives the test tries to bind the server's port itself, and that bind has
+/// to fail: the server's socket already holds it.
+#[test]
+fn readiness_is_sent_once_the_listener_is_bound() {
+    use std::os::unix::net::UnixDatagram;
+
+    let dir = scratch_tree("cli", "ready", &[]);
+    let socket = dir.join("notify");
+    let receiver = UnixDatagram::bind(&socket).expect("the notification socket must bind");
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("a read timeout");
+    let serving = Serving::start(&dir, &[("NOTIFY_SOCKET", socket.as_os_str())]);
+
+    let mut buf = [0u8; 256];
+    let len = receiver
+        .recv(&mut buf)
+        .expect("READY=1 must arrive within 20 s");
+    assert_eq!(&buf[..len], b"READY=1");
+    let probe = std::net::UdpSocket::bind(serving.addr);
+    assert_eq!(
+        probe.as_ref().map_err(std::io::Error::kind).err(),
+        Some(std::io::ErrorKind::AddrInUse),
+        "the listener must be bound by the time READY=1 arrives: {probe:?}"
+    );
+
+    let (status, lines, stderr) = serving.stop();
+    assert!(
+        status.success(),
+        "volto must stop cleanly on SIGTERM: {status} {stderr}\n{}",
+        lines.join("\n")
+    );
+}
+
+/// A notification socket nobody listens on is one WARN line, and the server
+/// starts and serves without notifications.
+#[test]
+fn a_notification_socket_nobody_listens_on_is_one_warning_and_no_outage() {
+    let dir = scratch_tree("cli", "notify-absent", &[]);
+    let socket = dir.join("nobody");
+    let mut serving = Serving::start(&dir, &[("NOTIFY_SOCKET", socket.as_os_str())]);
+    serving.wait_for("accepting QUIC connections");
+
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime for the client");
+    runtime.block_on(async {
+        let endpoint = common::client_endpoint(&serving.ca, &["h3"]);
+        let connection = common::finish_connect(&endpoint, serving.addr)
+            .await
+            .expect("the server must complete a QUIC handshake");
+        connection.close(0u32.into(), b"done");
+        endpoint.wait_idle().await;
+    });
+
+    let (status, lines, stderr) = serving.stop();
+    assert!(status.success(), "{status} {stderr}\n{}", lines.join("\n"));
+    let warnings: Vec<&String> = lines.iter().filter(|line| line.contains("WARN")).collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "exactly one WARN line: {warnings:#?}\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        warnings[0].contains("log_id=\"h6ro04gv\""),
+        "the WARN line is the notification socket's: {}",
+        warnings[0]
+    );
 }

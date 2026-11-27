@@ -860,8 +860,9 @@ else
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
 
-    # Under Type=exec a start fails at once when the binary cannot be executed
-    # (a noexec mount, the wrong architecture). That failure must not end the
+    # Under Type=notify a start fails at once when the binary cannot be executed
+    # (a noexec mount, the wrong architecture), and when the server exits or
+    # never reports ready within TimeoutStartSec. That failure must not end the
     # run here: the report below prints the fingerprint and the policy line,
     # which are the point of a first install, and then fails the run on the
     # service's status.
