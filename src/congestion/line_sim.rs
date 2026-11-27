@@ -175,9 +175,9 @@ enum LossRule {
     /// `src/quic/transport.rs` and `LOSS_TIME_THRESHOLD` in
     /// `src/congestion/mod.rs`.
     Ours,
-    /// quinn's defaults, which release 1.8.1 ran: a packet is lost once a
-    /// packet numbered 3 or more above it has been acknowledged, or once its
-    /// age is 9/8 of the larger of the smoothed and the latest RTT.
+    /// quinn's defaults: a packet is lost once a packet numbered 3 or more
+    /// above it has been acknowledged, or once its age is 9/8 of the larger of
+    /// the smoothed and the latest RTT.
     QuinnDefault,
 }
 
@@ -706,7 +706,6 @@ fn describe(closed: Closed) -> String {
                 ratio(ppm),
                 ratio(sent)
             ),
-            (Some(ppm), None) => format!("unverified, ratio {:.3}", ratio(ppm)),
             _ => "unverified, nothing before".to_owned(),
         },
         Closed::Cleared {
