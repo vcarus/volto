@@ -295,11 +295,10 @@ jobs:
           # rustdoc renders tracing's blanket `WithSubscriber` and `Instrument`
           # impls onto this crate's own types, and those doc comments carry
           # tracing's own relative link `dispatcher#setting-the-default-subscriber`.
-          # It resolves inside tracing's documentation and nowhere else, so
-          # `cargo doc --no-deps` has always emitted it dangling -- 17 of them,
-          # the same 17 before the layout step and after it. Excused by name
-          # rather than ignored, and the excuse has to be used: if the link stops
-          # appearing, this fails and the allowance goes with it.
+          # It resolves only inside tracing's documentation, so `cargo doc
+          # --no-deps` leaves it dangling. Excused by name rather than ignored,
+          # and the excuse has to be used: if the link stops appearing, this
+          # fails and the allowance goes with it.
           allowed = ("/dispatcher",)
 
           failed = sorted(url for url, code in status.items() if code != 200)
