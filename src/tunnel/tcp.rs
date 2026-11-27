@@ -1527,12 +1527,28 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A connected loopback pair: this side's write half, and the other end.
+    ///
+    /// Both socket buffers are set small, which also turns off the kernel's
+    /// autotuning, so a batch of a few hundred kilobytes cannot fit in them
+    /// and a `writev` has to take part of it.
     async fn tcp_pair() -> (tokio::net::tcp::OwnedWriteHalf, TcpStream) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
+        const BUFFER: u32 = 8 * 1024;
+
+        let listening = tokio::net::TcpSocket::new_v4().expect("socket");
+        listening
+            .set_recv_buffer_size(BUFFER)
+            .expect("receive buffer");
+        listening
+            .bind("127.0.0.1:0".parse().expect("address"))
             .expect("bind");
+        let listener = listening.listen(1).expect("listen");
         let address = listener.local_addr().expect("address");
-        let (ours, theirs) = tokio::join!(TcpStream::connect(address), listener.accept());
+
+        let connecting = tokio::net::TcpSocket::new_v4().expect("socket");
+        connecting
+            .set_send_buffer_size(BUFFER)
+            .expect("send buffer");
+        let (ours, theirs) = tokio::join!(connecting.connect(address), listener.accept());
         let (_, write) = ours.expect("connect").into_split();
         (write, theirs.expect("accept").0)
     }
@@ -1607,7 +1623,11 @@ mod tests {
             assert!(batch.is_empty(), "a completed write leaves nothing behind");
         }
 
-        let received = reader.await.expect("the reader");
+        // Bounded, so a write that lost bytes fails here rather than hangs.
+        let received = tokio::time::timeout(Duration::from_secs(10), reader)
+            .await
+            .expect("the target reads everything")
+            .expect("the reader");
         assert!(
             received == sent,
             "the target read something other than what was sent"
