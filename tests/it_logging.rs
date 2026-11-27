@@ -12,7 +12,7 @@
 //!
 //! The second half of the test is about the other DEBUG line a request can
 //! produce -- the one naming an unimplemented `:protocol`. That token is the
-//! peer's bytes, and since audit L6 it must be an RFC 9110 §5.6.2 token, so a
+//! peer's bytes, and it must be an RFC 9110 §5.6.2 token, so a
 //! newline in one is refused before anything is logged. Both halves of that are
 //! asserted: the refusal, and the line the token that *is* a token still draws.
 
@@ -62,9 +62,8 @@ async fn inbound_requests_are_logged_with_every_header() {
     // rather than omitted: it is what distinguishes a TCP tunnel request.
     assert!(line.contains("protocol=None"), "line was:\n{line}");
 
-    // M6 reversed this assertion. The credential header still has to *appear* --
-    // establishing which header Surge uses is the whole point of this log, and
-    // decision D3 is still open -- but its value must not.
+    // The credential header still has to appear (D3 is open), but its value
+    // must not.
     assert!(
         line.contains("authorization: Basic <redacted 16 bytes>"),
         "the credential header must be logged with its scheme and a redacted \
@@ -81,15 +80,8 @@ async fn inbound_requests_are_logged_with_every_header() {
         "arbitrary headers must be logged; line was:\n{line}"
     );
 
-    // A token carrying a newline reaches no log line at all: it is not an
-    // RFC 9110 §5.6.2 token, so the request is malformed and the stream is reset
-    // before anything is logged (audit L6). It used to be accepted, classified
-    // as an unimplemented protocol and echoed into a DEBUG line of its own --
-    // and systemd splits a service's stdout on `\n`, so printed through
-    // `Display` it was a complete forged entry, stamped with volto's unit and a
-    // timestamp of its own (review M5). The escaping that answered M5 is still
-    // there and neither half is worth depending on alone, so what is asserted
-    // here is the outcome both of them exist for.
+    // A token carrying a newline is not an RFC 9110 §5.6.2 token, so the
+    // request is malformed and reset before anything is logged.
     let mut forgery = connect_request(&target.to_string());
     forgery.scheme = Some("https".into());
     forgery.path = Some("/".into());
@@ -107,10 +99,6 @@ async fn inbound_requests_are_logged_with_every_header() {
     assert_peer_reset(&error, H3_MESSAGE_ERROR);
 
     let logged = buffer.contents();
-    assert!(
-        !logged.lines().any(|line| line == "WARN volto - forged"),
-        "a newline in a peer's token must not buy it a journal entry; log was:\n{logged}"
-    );
     assert!(
         !logged.contains("forged"),
         "a refused :protocol reaches no log line at all; log was:\n{logged}"
