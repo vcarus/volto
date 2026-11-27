@@ -732,8 +732,7 @@ pub(crate) async fn resolve_within(
     let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
 
     let Some(preferred) = crate::net::Family::preferred(family) else {
-        let mut addresses = within_budget(resolver.lookup(host, port), budget).await?;
-        crate::net::prefer_family(&mut addresses, family);
+        let addresses = within_budget(resolver.lookup(host, port), budget).await?;
         return Ok(Resolved {
             addresses,
             other: None,
