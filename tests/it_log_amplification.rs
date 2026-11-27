@@ -160,14 +160,22 @@ async fn a_tunnel_limit_storm_is_sampled(buffer: &SharedBuffer) {
     }
 
     let warnings = buffer.lines_since(mark, &[" WARN ", "connection is at its tunnel limit"]);
-    assert!(
-        !warnings.is_empty(),
-        "a connection sitting on its limit is still worth telling an operator about"
+    // The same doubling schedule as the policy refusal: 1, 2, 4 and so on to 64.
+    let schedule = usize::try_from(STORM.ilog2()).expect("a small count") + 1;
+    assert_eq!(
+        warnings.len(),
+        schedule,
+        "{STORM} refused requests bought {} production warnings, where the doubling \
+         schedule allows {schedule}:\n{}",
+        warnings.len(),
+        warnings.join("\n")
     );
     assert!(
-        warnings.len() < STORM,
-        "{STORM} refused requests bought {} production warnings:\n{}",
-        warnings.len(),
+        warnings
+            .last()
+            .expect("a report")
+            .contains(&format!("refusals={STORM}")),
+        "the last report must carry the running total:\n{}",
         warnings.join("\n")
     );
 }
