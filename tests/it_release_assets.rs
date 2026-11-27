@@ -1,45 +1,7 @@
 //! The release plumbing, which otherwise only fails at tag time.
 //!
-//! Everything here reads a tracked file as text and asserts a relationship
-//! between two of them. They share a shape: each pins an agreement that is
-//! today held together by a comment asking the next reader to keep it, and each
-//! one's failure mode is a release that builds, publishes and then does not
-//! work — discovered on a host, days later, in one line of
-//! `journalctl -u volto-deploy`.
-//!
-//! * **Everything in `script/` is inside the tarball.** The four deployment
-//!   assets are siblings on purpose: `install-selfsigned.sh` resolves the other
-//!   two through `SCRIPT_DIR`, and `deploy.sh` runs the bundled installer
-//!   straight out of an unpacked release. `release.yml` copies them in by name,
-//!   so a new asset that nobody adds to that list — or a renamed one nobody
-//!   updates — produces a tarball that looks fine and fails on the host: the
-//!   first-install branch cannot find the installer, or the update branch
-//!   cannot find the unit file.
-//! * **`docs/` is inside it too.** Both scripts name `docs/configuration.md` or
-//!   `docs/deployment.md` in the message they print when they refuse to
-//!   install, which is precisely when a host has no browser open.
-//! * **cross.yml runs release.yml's build step, not one like it.** That
-//!   workflow exists so a dependency bump that breaks the musl cross-build
-//!   fails on the pull request rather than at tag time, and it is worth exactly
-//!   as much as the two steps are identical.
-//! * **Neither manifest patches `quinn-proto`, and both lockfiles take it from
-//!   the registry.** D60 redirected that crate to a git revision until 0.11.18
-//!   shipped the fixes it carried, and a `[patch.crates-io]` stanza costs two
-//!   things that report nothing when they stop working: Dependabot proposes no
-//!   bump for a git revision, and cargo-audit skips a lockfile entry whose
-//!   source is not the default registry. A patch reintroduced in either
-//!   workspace would take quinn-proto back out of both.
-//! * **`src/` cites quinn-proto by symbol, not by line number.** A line number
-//!   goes stale on every quinn-proto bump, and a stale one still points at
-//!   some line.
-//! * **One MSRV.** `fuzz/Cargo.toml`, the `msrv` job in `ci.yml`, `README.md`
-//!   and `docs/deployment.md` state the `rust-version` of `Cargo.toml`.
-//! * **The release binary checks integer overflow in this crate.** Debug
-//!   builds always do, so no other test notices when the release profile stops.
-//! * **The fuzz workflow runs every target.** ci.yml only compiles them, so a
-//!   target missing from fuzz.yml's matrix would compile and never run.
-//! * **The release build compiles no rustls.** Every test build does, for the
-//!   test clients, so no other test notices when the manifest puts it back.
+//! Each test reads tracked files as text and pins a relationship between two of
+//! them.
 
 #[path = "common/scripts.rs"]
 mod scripts;
@@ -263,9 +225,6 @@ fn the_documentation_the_scripts_point_at_is_packaged() {
         workflow.display()
     );
 
-    // The other half of that same sentence, which nothing checked: the copy is
-    // only worth having while the scripts still point at those pages. Renaming
-    // the directory in both scripts would leave the assertion above green.
     // Each page is asserted in the script that prints it. `deploy.sh` names the
     // configuration page when it refuses a config from the future, and
     // `install-selfsigned.sh` names the deployment page when it refuses the
@@ -414,9 +373,7 @@ fn cross_yml_runs_the_release_build_step_verbatim() {
 
 /// A green cross build is not evidence that the released binary runs.
 ///
-/// Nothing used to execute the musl artifact, so a binary that builds and then
-/// fails at startup, or a config the binary refuses, reached the release page
-/// with every job green. The smoke step runs the built binary with `--version`
+/// The smoke step runs the built binary with `--version`
 /// and with `--check-config` on a minimal planted configuration.
 ///
 /// The step is gated to `x86_64-unknown-linux-musl` because the aarch64 artifact
@@ -563,7 +520,7 @@ fn job_code(name: &str, job: &str) -> Vec<String> {
         .collect()
 }
 
-/// The release gate counts only a push run on `main` (R8-L1).
+/// The release gate counts only a push run on `main`.
 ///
 /// A `pull_request` run reports the pull request's head commit as its SHA, so
 /// a query by commit alone also finds it. That run tested the merge with the
@@ -653,7 +610,7 @@ fn step_uses(step: &[String]) -> Option<&str> {
     })
 }
 
-/// The cached packages are saved straight after apt wrote them (R8-L2).
+/// The cached packages are saved straight after apt wrote them.
 ///
 /// A later job installs what the cache restores with `sudo dpkg -i`, with no
 /// signature or hash check. `actions/cache` saves in its post step, at the end
@@ -710,7 +667,7 @@ fn the_cached_packages_are_saved_before_the_job_runs_anything_else() {
     );
 }
 
-/// The release binaries are built in images pinned by digest (R8-L3).
+/// The release binaries are built in images pinned by digest.
 ///
 /// Without `Cross.toml`, cross runs its default image for each target by tag,
 /// and a tag can be moved. Each target's image is named by tag and digest in a
@@ -937,10 +894,7 @@ fn opens_a_patch_table(line: &str) -> bool {
 /// in `Cargo.toml`, `fuzz/Cargo.toml` or a cargo configuration file either
 /// workspace reads; no lockfile entry in either workspace comes from git; and
 /// the `quinn-proto` entry in each lockfile names the crates.io registry as its
-/// source and carries a `checksum`. D60 pointed
-/// that crate at a git revision from 2026-08-18 until 0.11.18 shipped every fix
-/// it carried, and `fuzz/` held a second copy of the stanza because a patch does
-/// not cross a workspace boundary.
+/// source and carries a `checksum`. D60 records why the stanza went.
 ///
 /// Without this, a patch put back in either manifest costs two things and
 /// announces neither. Dependabot proposes no bump for a git revision, so
@@ -1130,12 +1084,6 @@ fn carries_a_line_number_recognizes_each_spelling() {
 /// name the symbol instead and do not weaken the lint.
 ///
 /// A line number goes stale on every quinn-proto bump and a symbol does not.
-/// The lock file moved from 0.11.18 to 0.11.19 with every line-number citation
-/// in `src/congestion.rs` and `src/quic.rs` left unchecked, and one of them,
-/// the call to `Controller::on_ack` in `src/connection/mod.rs`, had already
-/// moved by three lines. A stale line number still points at some line, so
-/// nothing reports it. A renamed symbol is not found at all, which the reader
-/// sees at once.
 #[test]
 fn no_source_comment_cites_quinn_proto_by_line_number() {
     let root = source_root();
@@ -1240,8 +1188,8 @@ fn package_version(manifest: &Path) -> String {
 /// `fuzz/Cargo.lock` names the root crate as a path dependency, version
 /// included, and the `fuzz` job in ci.yml checks that workspace with
 /// `--locked`. A release bump that touches only the root manifest therefore
-/// fails CI on the fuzz job with "cannot update the lock file", which is what
-/// happened at v0.8.0; this pins the two together where a bump is made.
+/// fails CI on the fuzz job with "cannot update the lock file"; this pins the
+/// two together where a bump is made.
 #[test]
 fn the_fuzz_lockfile_records_the_current_crate_version() {
     let root = repo_root();
@@ -1598,29 +1546,9 @@ fn unit_directives() -> Vec<String> {
         .collect()
 }
 
-/// The unit carries the hardening the 2026-11-21 review judged safe for what
-/// the binary needs, and not the directive that did nothing (R8-L11).
-///
-/// What the binary needs: bind one UDP port, possibly below 1024, through
-/// `CAP_NET_BIND_SERVICE`; read `/etc/volto`; open TCP and UDP sockets to
-/// anywhere and resolve names through the system resolver; take `SIGHUP` as a
-/// reload, which `RestartForceExitStatus=SIGHUP` keeps from ending the service
-/// in its first milliseconds; write a keylog file only when a drop-in grants a
-/// path. `Type=notify` makes a start done only when the server says its
-/// listener is bound, and `TimeoutStartSec=15` fails a start that never says
-/// so; `NotifyAccess=` stays unset because `Type=notify` already makes it
-/// `main`. `WatchdogSec=60` restarts a server that stopped sending its
-/// keep-alive, through `Restart=on-failure` and with systemd's own watchdog
-/// signal. `UMask=0077` keeps any file it creates to its user, `ProcSubset=pid` hides
-/// the `/proc` entries only `--diagnostics` reads, and `RemoveIPC=yes` removes
-/// IPC objects it never makes. `ReadOnlyPaths=/etc/volto` added nothing under
-/// `ProtectSystem=strict`. `SystemCallFilter=~@resources` removes the calls that
-/// set scheduling, affinity, memory policy and limits, which a trace of the
-/// release binary on systemd 255 and 259 showed it never makes; the
-/// `RLIMIT_NOFILE` read is `prlimit64`, which systemd keeps in `@default`.
-/// `SystemCallErrorNumber=EPERM` makes a refused call fail rather than kill the
-/// process. The directives that would break the binary (`PrivateUsers=`,
-/// `PrivateNetwork=`, `IPAddressDeny=`, `SocketBindDeny=`) stay out.
+/// The unit carries the hardening the binary tolerates and none of the
+/// directives that break it; the reason for each directive is beside it in
+/// `script/masque.service`.
 #[test]
 fn the_unit_carries_the_safe_hardening_and_nothing_that_breaks_the_binary() {
     let directives = unit_directives();
