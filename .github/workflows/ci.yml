@@ -311,6 +311,13 @@ jobs:
           # on a push to this repository the test fails instead, so a missing or
           # renamed secret cannot quietly disarm it.
           VOLTO_SCRUB_PATTERNS: ${{ secrets.VOLTO_SCRUB_PATTERNS }}
+      # The unit under a real systemd: the start waits for READY=1, a start
+      # without it fails at the start timeout, keep-alives pass the unit's
+      # sandbox, and a stopped process is restarted by the watchdog. No cargo
+      # test can reach these, and the dev host has no systemd. `cargo test`
+      # above has built target/debug/volto, so nothing is built again.
+      - name: The unit under systemd
+        run: tests/systemd-check.sh target/debug/volto
 
   interop:
     # Cross-implementation checks. `cargo test` has volto on both ends: since

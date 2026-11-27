@@ -608,6 +608,52 @@ every running volto process it finds. To read that by hand, `systemctl show -p
 MainPID volto` gives the pid. See [collecting a support
 bundle](configuration.md#collecting-a-support-bundle).
 
+### The watchdog
+
+The unit sets `WatchdogSec=60`, and systemd passes it to volto as
+`WATCHDOG_USEC`. volto sends `WATCHDOG=1` once right after `READY=1` and then
+every half of that, 30 s. When 60 s pass without one, systemd counts the
+service as failed, sends it `SIGABRT`, and `Restart=on-failure` starts it again
+after `RestartSec=`. So a server that has stopped is detected between 30 and
+60 s after it stopped, and every connection it still held is cut.
+
+The keep-alive is sent from the same future as the accept loop, on the thread
+that runs it, and its timer is turned by the runtime's worker threads. It
+therefore stops when the accept loop's thread is stuck, and when every worker
+is stuck. What it does not cover, on purpose: a blocking pool whose every thread
+waits on a name lookup, and one connection whose own tasks wait on each other.
+Both are partial failures that leave the other connections working, and a
+restart would cut all of them.
+
+Why 60 s: RFC 9000, section 10.1, closes a connection silently once it has been
+idle for longer than the smaller of the two endpoints' `max_idle_timeout`
+values, raised to three probe timeouts when those are longer. Surge advertises
+30 s. A server that stopped is detected no sooner than 30 s after its last
+packet. By then such a client has discarded its connections, unless three of
+its probe timeouts add up to more than 30 s, so the restart ends nothing that
+was still usable. A shorter value would cut connections that
+a brief stall of the host would have left alive.
+
+A watchdog timeout shows in the journal as systemd's own lines for the unit, a
+`Watchdog timeout` line and then the kill with `SIGABRT`:
+
+```sh
+journalctl -u volto --since -24h | grep -i watchdog
+```
+
+`SIGABRT` asks the kernel for a core dump. Whether a core file is written, and
+where, is the host's core-dump setting (`systemd-coredump`, `apport` or
+`kernel.core_pattern`), not the unit's. To change the interval, or to switch the
+watchdog off, use a drop-in, then `systemctl daemon-reload` and
+`systemctl restart volto`:
+
+```ini
+# /etc/systemd/system/volto.service.d/watchdog.conf
+[Service]
+# 0 switches the watchdog off; volto then sends no keep-alive.
+WatchdogSec=0
+```
+
 ## Firewall
 
 QUIC is UDP. This is the single most common reason for "it works locally but the
