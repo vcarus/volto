@@ -96,7 +96,7 @@ use common::rawstream::{
     H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_MISSING_SETTINGS, H3_NO_ERROR, H3_REQUEST_CANCELLED,
     H3_STREAM_CREATION_ERROR, SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL, STREAM_PUSH,
     STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER, announce_full_sized_headers, application_close,
-    assert_closed_with, authenticate, authenticated_connect_headers_frame, collect_refusals,
+    authenticate, authenticated_connect_headers_frame, close_reason, collect_refusals,
     connect_headers_frame, frame, grease_type, headers_frame, open_uni_stream, read_frame,
     settings_frame, status_of, status_of_response, still_serving, varint_frame,
 };
@@ -1206,7 +1206,7 @@ async fn an_unfinished_unknown_first_frame_is_refused_from_its_header() {
     let (_endpoint, unauthenticated) = silent_peer(&server).await;
     let _control =
         open_uni_stream(&unauthenticated, STREAM_CONTROL, &endless_unknown_frame()).await;
-    assert_closed_with(
+    close_reason(
         &unauthenticated,
         H3_MISSING_SETTINGS,
         Duration::from_secs(6),
@@ -1233,7 +1233,7 @@ async fn an_unfinished_unknown_first_frame_is_refused_from_its_header() {
     );
 
     let _control = open_uni_stream(&authenticated, STREAM_CONTROL, &endless_unknown_frame()).await;
-    assert_closed_with(&authenticated, H3_MISSING_SETTINGS, Duration::from_secs(6)).await;
+    close_reason(&authenticated, H3_MISSING_SETTINGS, Duration::from_secs(6)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,7 +1544,7 @@ async fn the_shipped_bound_closes_a_silent_peer() {
     let (_endpoint, connection) = silent_peer(&server).await;
 
     let started = Instant::now();
-    assert_closed_with(&connection, H3_NO_ERROR, Duration::from_secs(150)).await;
+    close_reason(&connection, H3_NO_ERROR, Duration::from_secs(150)).await;
 
     let elapsed = started.elapsed();
     assert!(
@@ -1581,7 +1581,7 @@ async fn the_shipped_bound_is_not_extended_by_new_streams() {
     });
 
     let started = Instant::now();
-    assert_closed_with(&connection, H3_NO_ERROR, Duration::from_secs(150)).await;
+    close_reason(&connection, H3_NO_ERROR, Duration::from_secs(150)).await;
     poking.abort();
 
     let elapsed = started.elapsed();

@@ -14,9 +14,8 @@
 //! whole off a stream is one HEADERS frame and nothing after it
 //! ([`status_of_response`]), a stream the server refuses to read is stopped
 //! ([`stopped_code`]), a connection the server ends is ended with a code the
-//! caller names ([`assert_closed_with`]), or with an application close at all,
-//! whose code or reason is handed back ([`application_close`],
-//! [`close_reason`]), a connection that needs more than the pre-authentication
+//! caller names ([`close_reason`]), or with an application close at all,
+//! whose code and reason are handed back ([`application_close`]), a connection that needs more than the pre-authentication
 //! stream allowance gets itself through the door first ([`authenticate`]), and
 //! a connection that survived whatever was done to it is still answering
 //! ([`still_serving`]).
@@ -641,6 +640,8 @@ pub fn application_close(
 }
 
 /// [`application_close`], asserting the code and handing back the reason phrase.
+///
+/// A caller with no use for the reason awaits this and drops it.
 #[track_caller]
 pub fn close_reason(
     connection: &quinn::Connection,
@@ -650,20 +651,7 @@ pub fn close_reason(
     closed_with(connection, expected, within, Location::caller())
 }
 
-/// Waits for the server to close `connection`, asserting the code it used.
-#[track_caller]
-pub fn assert_closed_with(
-    connection: &quinn::Connection,
-    expected: u64,
-    within: Duration,
-) -> impl Future<Output = ()> + '_ {
-    let close = closed_with(connection, expected, within, Location::caller());
-    async move {
-        close.await;
-    }
-}
-
-/// The body behind the two asserting helpers, with `caller` already captured.
+/// The body behind [`close_reason`], with `caller` already captured.
 async fn closed_with(
     connection: &quinn::Connection,
     expected: u64,

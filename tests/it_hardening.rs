@@ -16,7 +16,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use common::rawstream::{
     DENIED_TARGET, FRAME_HEADERS, H3_EXCESSIVE_LOAD, H3_REQUEST_CANCELLED,
-    H3_STREAM_CREATION_ERROR, announce_full_sized_headers, assert_closed_with, authenticate,
+    H3_STREAM_CREATION_ERROR, announce_full_sized_headers, authenticate, close_reason,
     collect_refusals, connect_headers_frame, read_frame, status_of, status_of_response,
     stopped_code,
 };
@@ -384,7 +384,7 @@ async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
     let started = std::time::Instant::now();
     // The code is the assertion: what ends this connection has to be the failure
     // budget rather than the D76 bound, and the two close with different codes.
-    assert_closed_with(
+    close_reason(
         &client.quic,
         volto::h3api::AUTH_FAILURE_LIMIT_CODE.value(),
         TIMEOUT,

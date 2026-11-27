@@ -11,8 +11,8 @@ use bytes::Bytes;
 use common::h3client::ends_with_no_body;
 use common::rawstream::{
     FRAME_DATA, FRAME_HEADERS, H3_CONNECT_ERROR, H3_FRAME_UNEXPECTED, H3_MESSAGE_ERROR,
-    H3_REQUEST_CANCELLED, assert_closed_with, connect_headers_frame, frame, headers_frame,
-    read_frame, status_of,
+    H3_REQUEST_CANCELLED, close_reason, connect_headers_frame, frame, headers_frame, read_frame,
+    status_of,
 };
 use common::{
     ALLOW_PRIVATE, ConnectionEnd, DELIBERATE, H3Client, TIMEOUT, TestServer, assert_peer_reset,
@@ -2058,7 +2058,7 @@ async fn a_trailer_section_on_a_live_tunnel_ends_the_connection() {
 
     // A trailer section must end the connection, with the code that tells the
     // peer which rule it broke.
-    assert_closed_with(&client.quic, H3_FRAME_UNEXPECTED, TIMEOUT).await;
+    close_reason(&client.quic, H3_FRAME_UNEXPECTED, TIMEOUT).await;
 }
 
 /// The same trailer section, put on the wire *before* the CONNECT is answered.
@@ -2109,7 +2109,7 @@ async fn a_trailer_section_sent_before_the_connect_is_answered_ends_the_connecti
         .await
         .expect("send a CONNECT with a trailer section behind it");
 
-    assert_closed_with(&client.quic, H3_FRAME_UNEXPECTED, TIMEOUT).await;
+    close_reason(&client.quic, H3_FRAME_UNEXPECTED, TIMEOUT).await;
 
     let end = tokio::time::timeout(TIMEOUT, ended.recv())
         .await

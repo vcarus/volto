@@ -27,9 +27,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::rawstream::{
-    FRAME_HEADERS, H3_NO_ERROR, H3_REQUEST_INCOMPLETE, H3_STREAM_CREATION_ERROR,
-    assert_closed_with, authenticate, authenticated_connect_headers_frame, read_frame, status_of,
-    still_serving,
+    FRAME_HEADERS, H3_NO_ERROR, H3_REQUEST_INCOMPLETE, H3_STREAM_CREATION_ERROR, authenticate,
+    authenticated_connect_headers_frame, close_reason, read_frame, status_of, still_serving,
 };
 use common::{
     ALLOW_PRIVATE, H3Client, IMPATIENT, Leg, Relayed, TIMEOUT, TestServer, auth_section,
@@ -98,7 +97,7 @@ async fn a_peer_that_permits_no_unidirectional_streams_is_hung_up_on() {
     // Generous against the server's 1s bound, and far short of forever. The
     // code is the assertion: the peer has to be told which half of the
     // handshake it failed, rather than merely dropped.
-    assert_closed_with(
+    close_reason(
         &connection,
         H3_STREAM_CREATION_ERROR,
         Duration::from_secs(5),
@@ -149,8 +148,8 @@ async fn a_peer_that_never_sends_a_request_is_closed_by_the_bound() {
 
     // Two idle timeouts later both are gone, with nothing to report: neither
     // peer broke a rule, they simply had nothing to say.
-    assert_closed_with(&first.1, H3_NO_ERROR, Duration::from_secs(8)).await;
-    assert_closed_with(&second.1, H3_NO_ERROR, Duration::from_secs(8)).await;
+    close_reason(&first.1, H3_NO_ERROR, Duration::from_secs(8)).await;
+    close_reason(&second.1, H3_NO_ERROR, Duration::from_secs(8)).await;
 
     // And the server is serving afterwards rather than merely reporting the two
     // as closed. This is not a slot check: at the cap a newcomer is admitted by
@@ -189,7 +188,7 @@ async fn a_peer_that_only_fails_authentication_is_closed_by_the_bound() {
     assert_eq!(frame_type, FRAME_HEADERS);
     assert_eq!(status_of(&payload), "407", "the guess must be refused");
 
-    assert_closed_with(&connection, H3_NO_ERROR, Duration::from_secs(8)).await;
+    close_reason(&connection, H3_NO_ERROR, Duration::from_secs(8)).await;
 }
 
 /// A connection that has authenticated once may idle for as long as it likes.
@@ -260,7 +259,7 @@ async fn opening_request_streams_does_not_extend_the_bound() {
     // Nobody else connects while this runs: at the cap a newcomer would take
     // this slot by eviction, which closes the connection with the same code the
     // bound does and would leave the two indistinguishable.
-    assert_closed_with(&connection, H3_NO_ERROR, Duration::from_secs(8)).await;
+    close_reason(&connection, H3_NO_ERROR, Duration::from_secs(8)).await;
     poking.abort();
 
     let (_endpoint, admitted) = common::connect_quic(&server).await;
@@ -602,7 +601,7 @@ async fn a_full_server_evicts_the_connection_that_never_authenticated() {
 
     // And the peer whose slot it took was told, with nothing to report: it broke
     // no rule, it simply had never asked this server for anything.
-    assert_closed_with(&parked.quic, H3_NO_ERROR, TIMEOUT).await;
+    close_reason(&parked.quic, H3_NO_ERROR, TIMEOUT).await;
 }
 
 /// A connection that has authenticated keeps its slot, and the newcomer is
@@ -656,7 +655,7 @@ async fn the_oldest_unauthenticated_connection_is_the_one_evicted() {
     let mut tunnel = open_tcp_tunnel(&mut client, &echo.to_string()).await;
     echoes(&mut tunnel, b"payload").await;
 
-    assert_closed_with(&older.quic, H3_NO_ERROR, TIMEOUT).await;
+    close_reason(&older.quic, H3_NO_ERROR, TIMEOUT).await;
     assert!(
         tokio::time::timeout(Duration::from_millis(200), younger.quic.closed())
             .await
@@ -718,7 +717,7 @@ async fn lowering_the_connection_cap_evicts_down_to_it() {
     echoes(&mut tunnel, b"payload").await;
 
     for victim in &parked[..3] {
-        assert_closed_with(&victim.quic, H3_NO_ERROR, TIMEOUT).await;
+        close_reason(&victim.quic, H3_NO_ERROR, TIMEOUT).await;
     }
     assert!(
         tokio::time::timeout(Duration::from_millis(200), parked[3].quic.closed())
@@ -765,7 +764,7 @@ async fn a_full_server_makes_a_newcomer_validate_its_address_before_it_evicts() 
     );
     // And the Retry really is a step on the way to eviction rather than a
     // substitute for it: the slot changed hands.
-    assert_closed_with(&parked.quic, H3_NO_ERROR, TIMEOUT).await;
+    close_reason(&parked.quic, H3_NO_ERROR, TIMEOUT).await;
 }
 
 /// Below the cap the extra round trip must not be charged to anybody.
@@ -854,7 +853,7 @@ async fn a_client_that_has_connected_before_evicts_without_a_retry() {
         "an address the server has already issued a token to must not be asked to prove \
          itself again"
     );
-    assert_closed_with(&parked.quic, H3_NO_ERROR, TIMEOUT).await;
+    close_reason(&parked.quic, H3_NO_ERROR, TIMEOUT).await;
 }
 
 /// The eviction signal reaches a connection still inside its QUIC handshake.
