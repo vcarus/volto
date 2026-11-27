@@ -121,14 +121,6 @@
 //!   client that commits no offence, and that is exactly the signal this
 //!   harness exists to catch. A close the peer decided on with a code the plan
 //!   never sends fails too, as the harness misreporting what it drove.
-//!
-//!   For that assertion to mean anything, the client must commit no offence,
-//!   and one of them is easy to commit by accident: dropping an `H3Client` on a
-//!   live connection finishes its control stream, which RFC 9114 §6.2.1 makes a
-//!   connection error. The lossy path found that -- on loopback a connection had
-//!   always ended before the drop, so the fault never fired and the assertion
-//!   was passing for the wrong reason. A client is therefore never let go until
-//!   its connection is over; `still live at hand-off` counts how many needed it.
 //! * **No dropped datagrams.** Every UDP session's datagrams must reach it. A
 //!   datagram for a Quarter Stream ID no session claims, or one a full queue
 //!   could not take, shows up here. A Quarter-Stream-ID mix-up does not: a
@@ -142,53 +134,8 @@
 //!   packet it gets away after the server's `udp_session_timeout` has reclaimed
 //!   the session. A shaped run is therefore held to one drop per session where
 //!   an unshaped one is still held to zero. Production's own 0.038 drops per
-//!   connection are this phenomenon; the replay could not reproduce them until
-//!   it had a path.
+//!   connection are this phenomenon.
 //! * **No cross-talk.** Every tunnel's echo carries that tunnel's own tag.
-//!
-//! The first two are read off the server's own log, and both are satisfied by a
-//! log the reader made nothing of, so a floor comes before them: the scan must
-//! have found connections established and connections closed. Without it a
-//! reworded message or a changed field syntax turns the whole set green while
-//! the run measures nothing, and nothing else would notice, `it_log_lines`
-//! being keyed by `log_id` rather than by the message.
-//!
-//! What is deliberately *not* asserted is the transport ending a client's own
-//! churn produces: this replay opens an endpoint per connection and lets it go,
-//! so an ephemeral port comes back round to a fresh endpoint that answers a
-//! straggling packet with a stateless reset, and the server logs the connection
-//! as reset by its peer. One shows up every few hundred connections. It is
-//! counted and printed, because a rise in it would be worth knowing about, and
-//! it is not a failure because nothing in the server produced it.
-//!
-//! # Connections that do not happen
-//!
-//! Nor is a handshake that produces no client. On loopback every one of them
-//! succeeds, so for a long time the harness simply assumed it: the connect
-//! helper panicked on anything else, and at the severe tier's 42% loss that
-//! panic was the whole result of the run. Three things can end a handshake
-//! there, and none of them is a fault:
-//!
-//! * **The path.** Several flights, most of which do not arrive, against a
-//!   ten-second bound. Reported as `no handshake within 10s`.
-//! * **A refusal.** At `max_connections` the server refuses what it has no slot
-//!   for, after asking an unvalidated address to prove itself first (RFC 9000
-//!   §8.1). Reported as a transport close carrying CONNECTION_REFUSED.
-//! * **An eviction.** At the same cap, a connection that has never
-//!   authenticated may have its slot taken by a newcomer (D76) -- and a
-//!   connection between its QUIC handshake and its first CONNECT is exactly
-//!   that. Reported as the application close the eviction sends.
-//!
-//! All three are counted by kind and printed. The last two are also the ones
-//! this harness must not *cause*, because a run that drove the server into its
-//! own admission control would be measuring its own scheduling: the connections
-//! it failed to open would look like a shortfall of the tier, and the closes it
-//! provoked would sit in the log beside the ones a real fault would write. So
-//! the harness holds itself to a ceiling below the server's cap, waits for a
-//! slot rather than stacking arrivals on top of one another, and prints how
-//! often it had to -- see `CONNECTION_CEILING_SHARE`. The ceiling is far above
-//! the concurrency the plan asks for, so on any path that can execute the plan
-//! it never binds and every tier runs the plan it was given.
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the capture arithmetic is over numbers this file counted itself.
@@ -638,11 +585,6 @@ static CREDENTIALS: LazyLock<String> = LazyLock::new(|| basic_credentials(USER, 
 
 /// A CONNECT-UDP request for `target`, carrying this run's credentials.
 ///
-/// `common::connect_udp_request` percent-encodes the host per RFC 9298 §3,
-/// which the copy this replaced did not. Both replay profiles name an IPv4
-/// loopback target, whose textual form has nothing to escape, so the two agree
-/// byte for byte here; an IPv6 target would arrive with escaped colons, which
-/// is what the template asks for.
 fn connect_udp_request(proxy: SocketAddr, target: SocketAddr) -> Request {
     let mut request = common::connect_udp_request(proxy, &target.ip().to_string(), target.port());
     common::authorize(&mut request, &CREDENTIALS);
@@ -654,9 +596,7 @@ fn connect_udp_request(proxy: SocketAddr, target: SocketAddr) -> Request {
 /// The two failures are kept apart deliberately. A connection torn down under a
 /// transfer is a *result* of this run -- restart bursts do exactly that, several
 /// times a run, on purpose -- while a tunnel handed the wrong bytes is a fault
-/// of the server, and the only one of the two worth failing the run over. An
-/// earlier version of this file counted them as one thing and reported six
-/// abortions as six mix-ups.
+/// of the server, and the only one of the two worth failing the run over.
 enum Transferred {
     /// The echo came back, all of it this tunnel's own bytes.
     Echoed(u64),
@@ -935,9 +875,8 @@ async fn run_connection(
 
     // Not a panic, on any path. A handshake the server refused because it was
     // full, one it evicted to make room (D76), and one whose packets never got
-    // there are all outcomes a lossy run is entitled to produce, and all three
-    // used to end the run instead of appearing in it. Which one it was is kept,
-    // because only the last of the three is the path.
+    // there are all outcomes a lossy run is entitled to produce. Which one it
+    // was is kept, because only the last of the three is the path.
     let mut client = match H3Client::try_connect_within(&server, HANDSHAKE_TIMEOUT).await {
         Ok(client) => client,
         Err(error) => {
@@ -1082,14 +1021,8 @@ async fn run_connection(
     // H3_CLOSED_CRITICAL_STREAM. A client that has merely gone quiet sends no
     // such thing; it stops sending, and nothing else.
     //
-    // Whether the drop lands on a live connection is a question of timing, and
-    // that is why this was invisible until the path had a round trip in it. The
-    // releases above are absolute instants in the run, not offsets into this
-    // connection's life, so a connection that arrives near the end of the window
-    // reaches them with work still in flight. On loopback it had always
-    // finished and idled out first, so the drop fell on an already-dead
-    // connection and said nothing. At 90 ms with loss it has not, and the run
-    // accused the server of a fault it was right to report.
+    // On a path with a round trip the release instants above can come while
+    // the connection still works.
     //
     // So the client is handed to a task that lets go of it only once the
     // connection is genuinely over, however it ends -- the close above, the
@@ -1656,8 +1589,7 @@ async fn production_shapes_are_replayed() {
     // recognises a line by three free-text substrings and `number` answers zero
     // for a field it cannot find, so a reworded message or a changed field
     // syntax is enough to empty it -- and `it_log_lines` does not notice,
-    // because since batch 7 that gate is keyed by `log_id` rather than by the
-    // message.
+    // which is keyed by `log_id`.
     assert!(
         summary.established > 0 && summary.closed > 0,
         "the scan of {} found {} established and {} closed connections, which \
@@ -1679,12 +1611,8 @@ async fn production_shapes_are_replayed() {
         Vec::<String>::new(),
         "a connection was closed with an application code this run never sends"
     );
-    // Inbound datagram drops. Zero was assertable for as long as the lab had no
-    // path, and this file said so at the time: production drops 0.038 of them
-    // per connection and the profile attributes those to its 80-95 ms lossy
-    // link, which loopback has no way to reproduce.
-    //
-    // A shaped lab does reproduce it, and the shape is precise enough to bound.
+    // Inbound datagram drops. A shaped lab reproduces them, and the shape is
+    // precise enough to bound.
     // A CONNECT-UDP session here sends its next packet only once the last one
     // has been answered, and gives up on the first answer that does not come
     // back -- so a session gets at most one packet away after the server's own
