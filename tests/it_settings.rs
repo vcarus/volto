@@ -31,8 +31,13 @@ use volto::varint;
 /// The value the server must advertise, matching `h3api::MAX_FIELD_SECTION_SIZE`.
 const EXPECTED_MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 
+/// The server's SETTINGS carry extended CONNECT, HTTP Datagrams and a
+/// header-size limit, and the limit is a real one.
+///
+/// Advertise no limit and an unauthenticated peer's header block is buffered
+/// and decoded in full before the server can look at it.
 #[tokio::test]
-async fn server_advertises_extended_connect_and_h3_datagram() {
+async fn server_advertises_extended_connect_datagrams_and_a_header_limit() {
     let server = TestServer::start().await;
     let (_endpoint, connection) = connect_quic(&server).await;
 
@@ -50,21 +55,6 @@ async fn server_advertises_extended_connect_and_h3_datagram() {
         "SETTINGS_H3_DATAGRAM (0x33) must be 1 or Surge refuses the connection; \
          received settings: {settings:?}"
     );
-}
-
-/// A header-size limit must be advertised, and it must be a real one.
-///
-/// Advertise none and an unauthenticated peer's header block is buffered and
-/// decoded in full before the server can look at it, which is the state this
-/// server was in until audit 2026-08, finding 1.1b. Asserting the advertised
-/// value on the wire is what keeps it from coming back.
-#[tokio::test]
-async fn server_advertises_a_header_size_limit() {
-    let server = TestServer::start().await;
-    let (_endpoint, connection) = connect_quic(&server).await;
-
-    let settings = read_settings(&connection).await;
-
     let advertised = settings
         .get(&SETTINGS_MAX_FIELD_SECTION_SIZE)
         .copied()
