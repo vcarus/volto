@@ -173,11 +173,12 @@ fn truncated(head: &str, whole: usize) -> String {
 /// attack, and a peer needs no privilege to run it: a refusal is a request that
 /// went nowhere, so the refusals are the cheapest lines there are.
 ///
-/// Silencing the repeats is not the answer either. The two refusal lines this
-/// guards are read as evidence (a client probing the private side of the host,
-/// an INFO line, and a client sitting on its tunnel limit, a WARN line), and
-/// evidence that reports "it happened" while hiding "it happened sixty thousand
-/// times" is misleading.
+/// It is used for every production line a peer can repeat at will: refusals,
+/// protocol errors on a connection, a stream or a session, and failures that
+/// recur on a timer. Silencing the repeats is not the answer either. Such a
+/// line is often read as evidence (a client probing the private side of the
+/// host, a client sitting on its tunnel limit), and evidence that reports "it
+/// happened" while hiding "it happened sixty thousand times" is misleading.
 ///
 /// So the schedule doubles: occurrence 1 is reported, then 2, 4, 8, and so on,
 /// each carrying the running total. A scan of every port on a host is 16 lines
@@ -187,9 +188,10 @@ fn truncated(head: &str, whole: usize) -> String {
 /// that the count between reports is only known to within a factor of two
 /// until the next one arrives.
 ///
-/// One of these per connection, so a peer cannot use a quiet neighbour's
-/// allowance, and nothing here is ever reset: the schedule is about a
-/// connection's whole life.
+/// The owner of a `Sampler` picks its scope, so a caller gives each source a
+/// peer controls a sampler of its own, and one peer cannot spend another's
+/// allowance. Nothing here is ever reset: the schedule covers the sampler's
+/// whole life.
 #[derive(Debug, Default)]
 pub struct Sampler(AtomicU64);
 
