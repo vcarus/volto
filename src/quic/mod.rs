@@ -1005,77 +1005,19 @@ impl CloseReason {
 /// The line one connection ends on: INFO with the reason it stopped, WARN with
 /// the error that stopped it.
 ///
-/// Written here rather than at the end of [`Server::serve`] so the two field
-/// lists cannot drift apart. They carry the same eleven fields and differ in
-/// two, `log_id` and `reason` against `error`, which lets an operator grep one
-/// journal for both. With a second copy of a list this long, a new field such
-/// as D72's traffic counters could land on only one of them.
+/// The two lines share 23 fields: 11 transport and count fields, 9 controller
+/// readings ([`crate::congestion::Record`]) and 3 failed-setup counts
+/// ([`tunnel::FailedSetups`]). They differ in the value of `log_id` and in
+/// `reason` against `error`, so an operator can grep one journal for both.
+/// Each statement spells its field list out, because `it_log_lines` reads log
+/// statements out of the source text and does not see through a wrapper. So a
+/// field added to one list has to be added to the other by hand. `it_close_log`
+/// requires every field on the INFO line.
 ///
 /// `closed` is graded from the error *value* rather than from
 /// `Connection::close_reason()`, for the reason [`graded`] gives.
 ///
-/// # What the fields report
-///
-/// `mtu` is the packet size DPLPMTUD settled on in this direction. It is a
-/// report, not a setting: it is here so an operator can see whether discovery
-/// ever got past `initial_mtu` on their path. On a connection that lived long
-/// enough to probe, a value still at the floor means the probes went
-/// unanswered (the shape a path that black-holes large packets has) or a black
-/// hole was detected later and discovery fell back. Anything above it means
-/// discovery worked.
-///
-/// `mtu_black_holes` counts how often quinn's black-hole detector fired and
-/// pushed the packet size back to the floor for its cooldown. It tells those
-/// two apart when `mtu` alone cannot: discovery may have climbed back by the
-/// time the connection ends, hiding a fall-back that cost a bulk transfer in
-/// the middle. quinn's detector is a heuristic over loss bursts, and a burst of
-/// full-size packets lost to ordinary congestion looks the same to it as a
-/// path that stopped carrying them. So a non-zero count on a path that other
-/// connections probe fine points to a false positive rather than to the path.
-///
-/// `tunnels` is how many requests on this connection were granted a tunnel slot
-/// (TCP CONNECT and CONNECT-UDP alike), so a connection that only ever failed
-/// authentication reports zero.
-///
-/// `dropped_datagrams` is how many inbound HTTP Datagrams the connection's
-/// router dropped instead of delivering: an unknown Context ID, a Quarter
-/// Stream ID no session claims, a session whose inbound queue was full, or a
-/// datagram cut short of its Context ID. Each drop is silent where it happens,
-/// because the RFCs ask for exactly that, so this total is the only trace a
-/// misdirected or over-fast sender leaves in production. Distinct from
-/// `lost_packets`, which is the QUIC path losing what was sent; these arrived
-/// fine and were dropped on purpose.
-///
-/// `tx_bytes` and `rx_bytes` are UDP-level byte counts: everything this
-/// endpoint put on or took off the wire for this connection, QUIC and HTTP/3
-/// framing, retransmissions, ACKs and padding included. They are neither tunnel
-/// payload (always smaller) nor bytes the peer acknowledged, since a packet
-/// is counted when it is sent whether or not it arrived, so they answer "how
-/// much did this connection move through this host" and nothing finer.
-/// `sent_packets` and `lost_packets` are reported together because a loss rate
-/// needs both: either number alone says nothing about the path (D72).
-///
-/// Nine fields are the controller's own readings
-/// ([`crate::congestion::Record`]). `window_limited_ms` is the time the
-/// window held the sender after its startup, `window_floor_ms` the part of it
-/// with the window at its 240 kB floor, `window_floor_lossless_ms` the part
-/// of that in which nothing was lost, and `peak_bytes_per_sec` the highest
-/// delivery rate of that time. A connection that sat at the floor without
-/// loss, after it had delivered several times what the floor carries, is one
-/// the controller may have held there. The other five are means over the
-/// same time and print `-` when there was none: `window_turnover_permille`,
-/// how many minimum RTTs the window took to deliver its own size, where the
-/// steady gain allows 1250; `flight_over_min_rtt_permille`, how long the
-/// acknowledged bytes had been in flight, in minimum RTTs;
-/// `base_loss_mean_ppm` and `base_loss_peak_ppm`, the base loss in force; and
-/// `gain_mean_permille`, the steady gain. Under a controller other than `bbr`
-/// all nine print `-`. They are read from quinn's copy of the controller,
-/// taken once here like the snapshot above.
-///
-/// `failed_resolves`, `failed_connects` and `failed_setup_ms` are the tunnel
-/// setups that failed at the lookup or at the target, and the time they took
-/// in sum ([`tunnel::FailedSetups`]). A failed setup prints no line of its
-/// own at the production level, so these are its only trace there.
+/// Each field is described for operators in `docs/configuration.md`.
 fn log_connection_closed(
     remote: SocketAddr,
     quic: &quinn::Connection,
