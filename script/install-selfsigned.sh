@@ -47,13 +47,9 @@ REPLACE_BINARY=0
 PRINT_CONFIG=0
 CHECK_CONFIG=0
 
-# volto's own bound on a user-id, repeated here only so the refusal arrives
-# before anything is installed rather than out of the service's first log line.
-# The binary is the authority: it is `logfmt::MAX_TOKEN`, and since the generated
-# config now goes past `volto --check-config` before it is installed, a copy that
-# has drifted from it can no longer let a config through that the service would
-# refuse -- it only makes the message worse. `it_installer.rs` pins the two
-# together by asking the server for its limit and this script for its verdict.
+# volto's bound on a user-id (`logfmt::MAX_TOKEN`), repeated so the refusal
+# comes before anything is installed. `tests/it_installer.rs` pins the two
+# together.
 MAX_USERNAME_BYTES=32
 
 # Empty in every real run, so the paths below are the absolute ones; a test sets
@@ -157,12 +153,6 @@ check_credentials() {
         *:*) die "username must not contain a colon (RFC 7617)" ;;
         '')  die "username must not be empty" ;;
     esac
-    # volto refuses a longer username at startup (that is the length a user-id
-    # is carried at in the logs and the authentication failure counters). The
-    # generated config is now put to the binary before it is installed, so this
-    # is no longer the only thing between a too-long name and a service that
-    # loops under Restart=on-failure -- it is the copy that can say so in one
-    # line, and say it before the certificate is generated.
     # Bytes, not characters: ${#var} counts characters in some shells, and the
     # limit volto enforces is a byte length.
     if [ "$(printf %s "$USERNAME" | wc -c)" -gt "$MAX_USERNAME_BYTES" ]; then
@@ -484,7 +474,7 @@ if [ "$PRINT_CONFIG" -eq 1 ] || [ "$CHECK_CONFIG" -eq 1 ]; then
     if [ "$CHECK_CONFIG" -eq 1 ]; then
         # The binary is needed here and only here: --print-config never runs it,
         # which is why it works in a checkout with nothing built.
-        [ -f "$BINARY" ] || die "no volto binary at $BINARY — pass --binary PATH (a release tarball unpacks it as ./volto) or build it first: cargo build --release"
+        [ -f "$BINARY" ] || die "no volto binary at $BINARY -- pass --binary PATH (a release tarball unpacks it as ./volto) or build it first: cargo build --release"
         [ -x "$BINARY" ] || die "$BINARY is not executable"
         check_generated_config "$tmp"
     fi
@@ -505,7 +495,7 @@ command -v openssl >/dev/null 2>&1 || die "openssl is required (apt install open
 # after generating a config, so the check cannot wait until here.
 check_credentials
 
-[ -f "$BINARY" ] || die "no volto binary at $BINARY — pass --binary PATH (a release tarball unpacks it as ./volto) or build it first: cargo build --release"
+[ -f "$BINARY" ] || die "no volto binary at $BINARY -- pass --binary PATH (a release tarball unpacks it as ./volto) or build it first: cargo build --release"
 [ -x "$BINARY" ] || die "$BINARY is not executable"
 
 [ -f "$UNIT_SRC" ] || die "missing $UNIT_SRC"
@@ -580,8 +570,8 @@ fi
 # root:volto 0750 for the directory, 0640 for the config and the key, 0644 for
 # the certificate. The service user can then add, rename or remove nothing in
 # it, so a name this script checks below still names the same file when root
-# writes, renames, chowns or chmods it. Releases before this one made the
-# directory and its files the service user's; the chown and chmod here move a
+# writes, renames, chowns or chmods it. Older releases made the directory
+# and its files the service user's; the chown and chmod here move a
 # directory from that layout, and deploy.sh moves the rest of its files.
 install -d -m 0750 "$CONF_DIR"
 chown root:volto "$CONF_DIR"
@@ -905,7 +895,7 @@ if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: 
     ufw allow "$PORT/udp" >/dev/null
     note "ufw: allowed $PORT/udp"
 else
-    note "no active ufw detected — open UDP $PORT yourself if a firewall is in the way"
+    note "no active ufw detected -- open UDP $PORT yourself if a firewall is in the way"
 fi
 
 # --- report -----------------------------------------------------------------
