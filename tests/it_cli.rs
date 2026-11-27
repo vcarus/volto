@@ -83,29 +83,11 @@ fn run_in(args: &[&str], env: &[(&str, &str)]) -> Output {
         .expect("the volto binary must be runnable")
 }
 
-/// [`run`] for a command line that would start the server if it accepted the
-/// file: the process is killed, and the test fails, if it is still running
-/// after `limit`.
-#[track_caller]
-fn run_expecting_exit(args: &[&str], limit: Duration) -> Output {
-    run_expecting_exit_with(args, None, limit)
-}
-
-/// [`run_expecting_exit`] with `JOURNAL_STREAM` set to `journal_stream`, or
-/// removed when it is `None`, so the result does not depend on whether the test
-/// runner itself runs under systemd.
-#[track_caller]
-fn run_expecting_exit_with(args: &[&str], journal_stream: Option<&str>, limit: Duration) -> Output {
-    let journal: Vec<(&str, &str)> = journal_stream
-        .map(|value| ("JOURNAL_STREAM", value))
-        .into_iter()
-        .collect();
-    run_expecting_exit_in(args, &journal, limit)
-}
-
-/// [`run_expecting_exit`] with `JOURNAL_STREAM` and `RUST_LOG` removed from
-/// the environment, then `env` set, so the result depends on neither variable
-/// of the test runner's own.
+/// [`run_in`] for a command line that would start the server if it accepted
+/// the file: the process is killed, and the test fails, if it is still running
+/// after `limit`. `JOURNAL_STREAM` and `RUST_LOG` are removed from the
+/// environment, then `env` set, so the result depends on neither variable of
+/// the test runner's own.
 #[track_caller]
 fn run_expecting_exit_in(args: &[&str], env: &[(&str, &str)], limit: Duration) -> Output {
     let mut command = Command::new(real_binary());
@@ -129,8 +111,8 @@ fn run_expecting_exit_in(args: &[&str], env: &[(&str, &str)], limit: Duration) -
                 .wait_with_output()
                 .expect("the killed child must be reaped");
             panic!(
-                "volto {args:?} was still running after {limit:?}, so it started on a \
-                 file the check refuses: {}",
+                "volto {args:?} was still running after {limit:?}, so it did not stop \
+                 on its own: {}",
                 stderr_of(&output)
             );
         }
@@ -352,7 +334,7 @@ fn the_check_refuses_exactly_what_the_server_refuses_to_start_on() {
     let path = path.to_str().unwrap();
 
     let checked = run(&["--check-config", "--config", path]);
-    let started = run_expecting_exit(&["--config", path], Duration::from_secs(20));
+    let started = run_expecting_exit_in(&["--config", path], &[], Duration::from_secs(20));
 
     assert_eq!(
         checked.status.code(),
@@ -420,7 +402,11 @@ fn a_failed_start_is_filed_as_an_error_in_the_journal() {
     ] {
         let args = ["--config", path.to_str().unwrap()];
 
-        let journal = run_expecting_exit_with(&args, Some("8:12345"), Duration::from_secs(20));
+        let journal = run_expecting_exit_in(
+            &args,
+            &[("JOURNAL_STREAM", "8:12345")],
+            Duration::from_secs(20),
+        );
         let stderr = stderr_of(&journal);
         assert_eq!(journal.status.code(), Some(1), "{case}: {stderr}");
         assert!(
@@ -435,7 +421,7 @@ fn a_failed_start_is_filed_as_an_error_in_the_journal() {
             );
         }
 
-        let plain = run_expecting_exit_with(&args, None, Duration::from_secs(20));
+        let plain = run_expecting_exit_in(&args, &[], Duration::from_secs(20));
         let stderr = stderr_of(&plain);
         assert_eq!(plain.status.code(), Some(1), "{case}: {stderr}");
         assert!(
@@ -736,8 +722,6 @@ fn the_support_bundle_names_the_version_and_redacts_the_password() {
 
     // The descriptor limits are read with `getrlimit` on the process running
     // the command, which from an SSH shell is that shell and not the service.
-    // Two hosts were reported with the shell's figures because the bundle did
-    // not say so, so the line that says so is part of the bundle.
     assert!(
         stdout.contains("not the service's"),
         "the bundle must say whose descriptor limits those two lines are: {stdout}"
@@ -949,17 +933,14 @@ fn the_ech_subcommands_write_a_key_and_print_its_list_again() {
     let text = fs::read_to_string(&key).expect("the key file was written");
     assert!(text.starts_with("-----BEGIN PRIVATE KEY-----\n"), "{text}");
     assert!(text.contains("-----BEGIN ECHCONFIG-----\n"));
-    assert!(!list.is_empty() && !stderr_of(&written).contains(text.lines().nth(1).unwrap()));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = fs::metadata(&key).expect("metadata").permissions().mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "the key file is readable by its owner only"
-        );
-    }
+    assert!(!stderr_of(&written).contains(text.lines().nth(1).unwrap()));
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = fs::metadata(&key).expect("metadata").permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "the key file is readable by its owner only"
+    );
 
     let printed = run(&["ech-config", key_arg]);
     assert_eq!(printed.status.code(), Some(0), "{}", stderr_of(&printed));
@@ -1007,14 +988,6 @@ fn add_ech_previous_key(config: &Path, key: &Path) {
         "the config has an ech_key to put the key beside"
     );
     fs::write(config, with).expect("rewrite the config");
-}
-
-/// The config_id of the key file at `key`, read from the list `ech-config`
-/// prints for it.
-fn config_id_of(key: &Path) -> u8 {
-    let printed = run(&["ech-config", key.to_str().unwrap()]);
-    assert_eq!(printed.status.code(), Some(0), "{}", stderr_of(&printed));
-    base64_decode(stdout_of(&printed).trim())[6]
 }
 
 /// `ech-keygen --replaces` gives the new key a config_id other than the
@@ -1143,7 +1116,8 @@ fn the_check_holds_the_previous_ech_key_to_the_rules_of_startup() {
     let current = dir.join("ech.pem");
     let written = keygen(&current);
     assert_eq!(written.status.code(), Some(0), "{}", stderr_of(&written));
-    let id = config_id_of(&current);
+    // The config_id, read from the list `ech-keygen` printed.
+    let id = base64_decode(stdout_of(&written).trim())[6];
     let check = |path: &Path| run(&["--check-config", "--config", path.to_str().unwrap()]);
 
     let previous = dir.join("ech-old.pem");
@@ -1478,11 +1452,10 @@ impl Drop for Reaped {
 /// The test closes the reading ends of the server's stdout and stderr, so every
 /// write to either fails with a broken pipe. tracing-subscriber's default is to
 /// report a log line it could not write with `eprintln!`, and `eprintln!`
-/// panics when stderr cannot be written. The panic ended whichever task had
-/// logged. For the main future that was the process, at its first line. For the
-/// signal watcher it came before the shutdown trigger was fired, so a server
-/// whose pipes broke later ran on after `SIGTERM`. `READY=1` on a notification
-/// socket is how the test knows the server is up without reading its output.
+/// panics when stderr cannot be written. The server turns that report off
+/// (`log_internal_errors(false)`), so a broken pipe costs the line and nothing
+/// else. `READY=1` on a notification socket is how the test knows the server is
+/// up without reading its output.
 #[test]
 fn a_server_that_cannot_write_its_log_still_starts_and_stops() {
     use std::os::unix::net::UnixDatagram;
