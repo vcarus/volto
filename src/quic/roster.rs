@@ -133,14 +133,8 @@ impl Roster {
     /// live connection has authenticated. The remainder is read under the guard
     /// the loop already holds, so the caller need not take the lock again.
     ///
-    /// A method rather than the loop written out at the accept path, so that
-    /// what the unit tests run is what the server runs.
-    ///
-    /// One guard for the whole loop rather than two acquisitions per pass. With
-    /// the lock taken and released between the length read and the eviction, a
-    /// connection ending on another thread in that window would leave the
-    /// roster below the cap, and the next pass would evict a connection that no
-    /// longer had to go (F2 of D96).
+    /// One guard for the whole loop, so a connection that ends on another
+    /// thread mid-loop cannot make a pass evict one connection too many (D96).
     pub(super) fn evict_until_below(&self, cap: usize) -> (Vec<SocketAddr>, usize) {
         let mut victims = Vec::new();
         let mut slots = self.slots();
@@ -367,7 +361,7 @@ mod tests {
     ///
     /// The guard is what makes the cap survive the several ways a connection
     /// task can end, and sequence numbers are never reused, so a late drop can
-    /// only ever remove its own entry — including after an eviction has already
+    /// only ever remove its own entry, including after an eviction has already
     /// removed it.
     #[test]
     fn a_registration_gives_back_only_its_own_slot() {
