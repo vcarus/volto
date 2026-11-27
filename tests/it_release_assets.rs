@@ -354,11 +354,6 @@ fn mirrored_block(name: &str, open: &str, close: &str) -> String {
     block.join("\n")
 }
 
-/// The build step both workflow files run.
-fn mirrored_build_step(name: &str) -> String {
-    mirrored_block(name, MIRROR_OPEN, MIRROR_CLOSE)
-}
-
 /// The `target:` list under `matrix:` in `.github/workflows/<name>`, in order.
 fn matrix_targets(name: &str) -> Vec<String> {
     let path = repo_root().join(".github/workflows").join(name);
@@ -390,17 +385,12 @@ fn matrix_targets(name: &str) -> Vec<String> {
     targets
 }
 
-/// The smoke step both workflow files run.
-fn mirrored_smoke_step(name: &str) -> String {
-    mirrored_block(name, SMOKE_OPEN, SMOKE_CLOSE)
-}
-
 /// A green cross build is only evidence about the release build if it *is* the
 /// release build.
 #[test]
 fn cross_yml_runs_the_release_build_step_verbatim() {
-    let release = mirrored_build_step("release.yml");
-    let cross = mirrored_build_step("cross.yml");
+    let release = mirrored_block("release.yml", MIRROR_OPEN, MIRROR_CLOSE);
+    let cross = mirrored_block("cross.yml", MIRROR_OPEN, MIRROR_CLOSE);
 
     assert_eq!(
         release, cross,
@@ -435,8 +425,8 @@ fn cross_yml_runs_the_release_build_step_verbatim() {
 /// release.yml.
 #[test]
 fn the_released_binary_is_executed_before_publishing() {
-    let release = mirrored_smoke_step("release.yml");
-    let cross = mirrored_smoke_step("cross.yml");
+    let release = mirrored_block("release.yml", SMOKE_OPEN, SMOKE_CLOSE);
+    let cross = mirrored_block("cross.yml", SMOKE_OPEN, SMOKE_CLOSE);
 
     assert_eq!(
         release, cross,
@@ -517,20 +507,20 @@ fn the_release_workflow_attests_its_tarballs_and_leaves_a_draft() {
 /// describes: a pull request that only the `push` filter named would run the
 /// check after the merge that needed it. Exact counts rather than minima here,
 /// because "one on each side" is the whole property.
+/// `.github/workflows/cross.yml` split at its `pull_request:` trigger: the
+/// `push` half, then the `pull_request` half.
+fn cross_trigger_halves() -> (String, String) {
+    let text = read_text(&repo_root().join(".github/workflows/cross.yml"));
+    let (push, pull_request) = text
+        .split_once("\n  pull_request:")
+        .expect("cross.yml carries no `pull_request:` trigger");
+    (push.to_owned(), pull_request.to_owned())
+}
+
 #[test]
 fn editing_release_yml_triggers_the_cross_workflow() {
-    let path = repo_root().join(".github/workflows/cross.yml");
-    let text = read_text(&path);
-
     let entry = "- .github/workflows/release.yml";
-    let (under_push, under_pull_request) =
-        text.split_once("\n  pull_request:").unwrap_or_else(|| {
-            panic!(
-                "{} carries no `pull_request:` trigger, so half the filter this test \
-             is about does not exist",
-                path.display()
-            )
-        });
+    let (under_push, under_pull_request) = cross_trigger_halves();
 
     for (half, key, text) in [
         ("push", "push", under_push),
@@ -539,11 +529,10 @@ fn editing_release_yml_triggers_the_cross_workflow() {
         assert_eq!(
             text.matches(entry).count(),
             1,
-            "{} must list `.github/workflows/release.yml` in its `{key}` paths \
+            "cross.yml must list `.github/workflows/release.yml` in its `{key}` paths \
              filter exactly once, and the {half} half does not. Without it, the \
              one change this workflow most needs to react to, an edit to the \
-             build step it mirrors, is the one change that runs nothing.",
-            path.display()
+             build step it mirrors, is the one change that runs nothing."
         );
     }
 }
@@ -721,11 +710,6 @@ fn the_cached_packages_are_saved_before_the_job_runs_anything_else() {
     );
 }
 
-/// Where the Dockerfile that pins the build image of `target` lives.
-fn cross_dockerfile(target: &str) -> String {
-    format!(".github/cross/{target}.Dockerfile")
-}
-
 /// The release binaries are built in images pinned by digest (R8-L3).
 ///
 /// Without `Cross.toml`, cross runs its default image for each target by tag,
@@ -742,7 +726,8 @@ fn every_release_target_is_built_in_an_image_pinned_by_digest() {
         .unwrap_or_else(|error| panic!("Cross.toml does not parse: {error}"));
 
     for target in matrix_targets("release.yml") {
-        let dockerfile = cross_dockerfile(&target);
+        // Where the Dockerfile that pins the build image of `target` lives.
+        let dockerfile = format!(".github/cross/{target}.Dockerfile");
         let table = cross_toml
             .get("target")
             .and_then(|targets| targets.get(&target))
@@ -814,12 +799,9 @@ fn every_release_target_is_built_in_an_image_pinned_by_digest() {
 
     // An image bump changes only these two paths, so cross.yml has to run on
     // them to build the release targets in the new image.
-    let cross_yml = read_text(&root.join(".github/workflows/cross.yml"));
-    let (under_push, under_pull_request) = cross_yml
-        .split_once("\n  pull_request:")
-        .expect("cross.yml carries no `pull_request:` trigger");
+    let (under_push, under_pull_request) = cross_trigger_halves();
     for entry in ["- Cross.toml", "- .github/cross/**"] {
-        for (key, half) in [("push", under_push), ("pull_request", under_pull_request)] {
+        for (key, half) in [("push", &under_push), ("pull_request", &under_pull_request)] {
             assert_eq!(
                 half.matches(entry).count(),
                 1,
@@ -1233,20 +1215,11 @@ fn no_source_comment_cites_quinn_proto_by_line_number() {
 
 /// The `version` a `[[package]]` block records in a lockfile, by package name.
 fn locked_version(lockfile: &Path, package: &str) -> String {
-    let text = read_text(lockfile);
-    let needle = format!("name = \"{package}\"\n");
-    let start = text
-        .find(&needle)
-        .unwrap_or_else(|| panic!("{} records no package named {package}", lockfile.display()));
-    let block = &text[start..];
-    block
+    locked_package(lockfile, package)
         .lines()
-        .skip(1)
-        .take_while(|line| !line.starts_with("[[package]]"))
-        .find_map(|line| line.strip_prefix("version = \""))
-        .and_then(|rest| rest.strip_suffix('"'))
+        .find_map(|line| line.strip_prefix("version = \"")?.strip_suffix('"'))
+        .map(str::to_owned)
         .unwrap_or_else(|| panic!("{} has no version line for {package}", lockfile.display()))
-        .to_owned()
 }
 
 /// The `version` under `[package]` in a manifest.
