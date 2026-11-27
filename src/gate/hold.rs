@@ -20,7 +20,7 @@ use quinn::udp::RecvMeta;
 use crate::hello::{self, Ech, Message};
 
 use super::initial::{Refused, Stream};
-use super::{Policy, Screened};
+use super::{Policy, Screened, by_name};
 
 /// How long a first flight is held for its ClientHello to complete.
 ///
@@ -668,11 +668,7 @@ fn judge(
         Ech::Malformed => Err(Dropped::EchNotOpened),
         Ech::Absent if policy.require_ech => Err(Dropped::EchRequired),
         Ech::Absent if policy.names.is_empty() => Ok(()),
-        Ech::Absent => match hello::server_name(body) {
-            None => Err(Dropped::Anonymous),
-            Some(name) if policy.names.accepts_bytes(name) => Ok(()),
-            Some(name) => Err(Dropped::OtherName(name.to_vec())),
-        },
+        Ech::Absent => by_name(&policy.names, hello::server_name(body)).map_err(Dropped::from),
     })
 }
 

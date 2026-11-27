@@ -896,18 +896,56 @@ fn judge(datagram: &[u8], expected: &Names) -> Verdict {
         return Verdict::Pass;
     }
 
-    match first_flight(crypto) {
+    let name = match first_flight(crypto) {
         // A ClientHello that does not fit in this packet is judged by the
         // second gate in the TLS layer instead; see the module
         // documentation.
-        FirstFlight::Truncated => Verdict::Pass,
-        FirstFlight::NotAClientHello => Verdict::Refuse(Refusal::NotClientHello),
-        FirstFlight::Anonymous => Verdict::Refuse(Refusal::Anonymous),
-        FirstFlight::Named(name) if expected.accepts_bytes(name) => Verdict::Pass,
-        // The name is borrowed from the frames this function decrypted and
-        // drops on return, so the refusal takes the copy the pass path
-        // does not need.
-        FirstFlight::Named(name) => Verdict::Refuse(Refusal::OtherName(name.to_vec())),
+        FirstFlight::Truncated => return Verdict::Pass,
+        FirstFlight::NotAClientHello => return Verdict::Refuse(Refusal::NotClientHello),
+        FirstFlight::Anonymous => None,
+        FirstFlight::Named(name) => Some(name),
+    };
+    match by_name(expected, name) {
+        Ok(()) => Verdict::Pass,
+        Err(refusal) => Verdict::Refuse(refusal.into()),
+    }
+}
+
+/// Why [`by_name`] refused a ClientHello.
+enum NameRefusal {
+    /// It carries no `server_name`.
+    Anonymous,
+    /// It names a host off the list, carried as it arrived.
+    OtherName(Vec<u8>),
+}
+
+/// The name rule both judgements apply to a whole ClientHello without ECH:
+/// `name` is its `server_name`, or `None` for none, and it has to be on
+/// `names`. The refusal copies the name, because it outlives the CRYPTO bytes
+/// the name is borrowed from.
+fn by_name(names: &Names, name: Option<&[u8]>) -> Result<(), NameRefusal> {
+    match name {
+        None => Err(NameRefusal::Anonymous),
+        Some(name) if names.accepts_bytes(name) => Ok(()),
+        Some(name) => Err(NameRefusal::OtherName(name.to_vec())),
+    }
+}
+
+impl From<NameRefusal> for Refusal {
+    fn from(refusal: NameRefusal) -> Self {
+        match refusal {
+            NameRefusal::Anonymous => Self::Anonymous,
+            NameRefusal::OtherName(name) => Self::OtherName(name),
+        }
+    }
+}
+
+impl From<NameRefusal> for Dropped {
+    fn from(refusal: NameRefusal) -> Self {
+        match refusal {
+            NameRefusal::Anonymous => Self::Anonymous,
+            NameRefusal::OtherName(name) => Self::OtherName(name),
+        }
     }
 }
 
