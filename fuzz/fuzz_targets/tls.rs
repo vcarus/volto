@@ -246,11 +246,15 @@ impl Checked {
     }
 
     /// Reads, writes, checks. `false` once the session refused the bytes.
+    ///
+    /// What the session holds is checked between the read and the write,
+    /// while the handshake bytes libssl queued are still in the session, and
+    /// again after the write, which leaves only the outer ClientHello copy.
     fn step(&mut self, bytes: &[u8]) -> (bool, Vec<(u8, Vec<u8>)>) {
         let ok = self.session.read(bytes);
+        self.check_held();
         let out = if ok { self.session.write() } else { Vec::new() };
-        let held = self.session.held_bytes();
-        assert!(held <= PROBE_HELD_LIMIT, "the provider holds {held} bytes");
+        self.check_held();
         let level = self.session.level();
         assert!(
             level >= self.level,
@@ -259,6 +263,11 @@ impl Checked {
         );
         self.level = level;
         (ok, out)
+    }
+
+    fn check_held(&self) {
+        let held = self.session.held_bytes();
+        assert!(held <= PROBE_HELD_LIMIT, "the provider holds {held} bytes");
     }
 }
 
