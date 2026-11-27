@@ -56,10 +56,9 @@ pub(super) struct Router {
     /// lookup and its hold, which would leave the held datagram behind the
     /// claim that should have taken it.
     routes: Mutex<Routes>,
-    /// Inbound HTTP Datagrams dropped instead of delivered, all three ways at
-    /// once: an unknown Context ID, a Quarter Stream ID no session claims, and
-    /// a session whose inbound queue was full. A datagram held for a session
-    /// that never claimed it counts with the second, when it is let go.
+    /// Inbound HTTP Datagrams dropped instead of delivered, every [`DropKind`]
+    /// at once. A datagram held for a session that never claimed it counts as
+    /// [`DropKind::Unroutable`], when it is let go.
     ///
     /// RFC 9298 §5 and RFC 9297 §2.1 ask for silent drops, so this counter is
     /// the only trace they leave in production. It is read once, by the
