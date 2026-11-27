@@ -680,8 +680,8 @@ async fn closed(
             close.error_code.into_inner(),
             String::from_utf8_lossy(&close.reason).into_owned(),
         ),
-        // An idle timeout here would mean the keep-alive stopped working and
-        // the test stopped testing what it says it does.
+        // Any other ending, an idle timeout included, means the server did
+        // not send the close this test is about.
         other => panic!("at {caller}: expected the server to close, got {other}"),
     }
 }
