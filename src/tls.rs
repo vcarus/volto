@@ -17,8 +17,7 @@ use rustls_pki_types::pem::{self, PemObject};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use zeroize::{Zeroize as _, Zeroizing};
 
-// The one module of the crate allowed `unsafe` code: the binding to libssl.
-// `crate` says why the rest of the crate denies it.
+// The crate's one exception to `deny(unsafe_code)`; `crate` says why.
 #[allow(unsafe_code)]
 mod awslc;
 
@@ -30,13 +29,12 @@ pub use awslc::{
 
 /// What an operator is told when the two configured files do not pair up.
 ///
-/// The wording the rustls server used, kept so that a reload log reads the
-/// same as before the provider changed.
+/// Kept word for word: it is the text of the startup, reload and
+/// `--check-config` error.
 pub(crate) const UNUSABLE_PAIR: &str =
     "server.cert and server.key do not form a usable certificate/key pair";
 
-/// Refuses a leaf certificate webpki cannot parse, as the rustls server did:
-/// rustls's `ParsedCertificate::try_from` is this same webpki parse.
+/// Refuses a leaf certificate webpki cannot parse.
 ///
 /// AWS-LC's `d2i_X509` reads certificates webpki refuses, an X.509
 /// version 1 certificate for one, so without this such a certificate would
