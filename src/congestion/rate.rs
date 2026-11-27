@@ -34,7 +34,7 @@ pub(super) const SAMPLES: usize = 10;
 /// delivery-rate estimation draft
 /// (draft-cheng-iccrg-delivery-rate-estimation), which keeps these times per
 /// packet. If nothing had been acknowledged before the interval started, the
-/// send interval starts at the first packet acknowledged in it.
+/// send interval starts at the earliest packet acknowledged in it.
 #[derive(Debug, Clone, Default)]
 pub(super) struct DeliveryRate {
     /// When the current interval started; `None` until the first ACK batch.
