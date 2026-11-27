@@ -65,10 +65,11 @@ async fn a_rejected_password_is_never_logged(buffer: &SharedBuffer) {
         .unwrap_or_else(|| panic!("the failure must be logged; log was:\n{logged}"));
     assert!(failure.contains("credentials rejected"), "{failure}");
 
-    // But it carries nothing derived from the secret.
+    // No line carries the attempted password, at the debug level where a
+    // forensic dump would put it.
     assert!(
-        !failure.contains("wrong-guess"),
-        "the attempted password must not be logged: {failure}"
+        !logged.contains("wrong-guess"),
+        "the attempted password must not be logged; log was:\n{logged}"
     );
 
     // And the real password appears nowhere at all, in any form.
