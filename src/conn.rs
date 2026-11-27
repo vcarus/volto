@@ -746,28 +746,32 @@ fn log_request(req: &Request, stream_id: u64) {
         .fields
         .iter()
         .map(|(name, value)| {
-            if auth::is_credential_field(name) {
+            let name = bounded(name);
+            if auth::is_credential_field(&name) {
                 return format!("{name}: {}", redact_credentials(value));
             }
             match value.to_str() {
-                Some(value) => format!("{name}: {value}"),
+                Some(value) => format!("{name}: {}", bounded(value)),
                 None => format!("{name}: <{} non-utf8 bytes>", value.len()),
             }
         })
         .collect();
 
-    // Cut by `bounded` and escaped by `?`, as the 501 line in `route` does.
+    // Every value below is the peer's, chosen before it has authenticated, so
+    // `bounded` cuts each one. Those printed with `?` are escaped as well, as
+    // the 501 line in `route` does.
     let protocol = req.protocol.as_deref().map(bounded);
+    let authority = req.authority.as_deref().map(bounded);
+    let scheme = req.scheme.as_deref().map(bounded);
 
     // `:method` is a token and `:path` is pchar, `/` and `?` only, so `%`
-    // cannot forge a line with either; `bounded` cuts their length, which the
-    // peer chooses before it has authenticated.
+    // cannot forge a line with either.
     debug!(
         stream_id,
         method = %bounded(req.method.as_str()),
         path = %bounded(req.path.as_deref().unwrap_or_default()),
-        authority = ?req.authority.as_deref(),
-        scheme = ?req.scheme.as_deref(),
+        authority = ?authority,
+        scheme = ?scheme,
         protocol = ?protocol,
         headers = ?headers,
         "inbound request"
@@ -970,6 +974,59 @@ mod tests {
     /// carries.
     #[test]
     fn the_request_dump_bounds_the_peer_path_and_method() {
+        let long_path = format!("/{}", "p".repeat(4096));
+        let long_method = "M".repeat(4096);
+        let mut request = Request::new(h3api::Method::Other(long_method.as_str().into()));
+        request.path = Some(long_path.as_str().into());
+
+        let logged = dump(&request);
+        assert!(logged.contains("inbound request"), "{logged}");
+        assert!(logged.contains(bounded(&long_path).as_ref()), "{logged}");
+        assert!(logged.contains(bounded(&long_method).as_ref()), "{logged}");
+        assert!(
+            !logged.contains(&"p".repeat(64)),
+            "an unbounded :path: {logged}"
+        );
+        assert!(
+            !logged.contains(&"M".repeat(64)),
+            "an unbounded :method: {logged}"
+        );
+    }
+
+    /// The rest of the dump is the peer's too: `:authority`, `:scheme` and
+    /// every header name and value are cut to what [`bounded`] keeps.
+    #[test]
+    fn the_request_dump_bounds_the_authority_scheme_and_headers() {
+        let long_authority = format!("{}:443", "a".repeat(4096));
+        let long_scheme = "s".repeat(4096);
+        let long_name = "n".repeat(4096);
+        let long_value = "v".repeat(4096);
+        let mut request = request_with(&[
+            ("user-agent", long_value.as_str()),
+            (long_name.as_str(), "x"),
+        ]);
+        request.authority = Some(long_authority.as_str().into());
+        request.scheme = Some(long_scheme.as_str().into());
+
+        let logged = dump(&request);
+        assert!(logged.contains("inbound request"), "{logged}");
+        for (field, filler) in [
+            (":authority", 'a'),
+            (":scheme", 's'),
+            ("a header name", 'n'),
+            ("a header value", 'v'),
+        ] {
+            assert!(
+                !logged.contains(&filler.to_string().repeat(64)),
+                "an unbounded {field}: {logged}"
+            );
+        }
+        assert!(logged.contains("<truncated from 4100 bytes>"), "{logged}");
+        assert!(logged.contains("<truncated from 4096 bytes>"), "{logged}");
+    }
+
+    /// What [`log_request`] writes for `request` at DEBUG.
+    fn dump(request: &Request) -> String {
         use std::sync::Mutex;
 
         #[derive(Clone, Default)]
@@ -986,11 +1043,6 @@ mod tests {
             }
         }
 
-        let long_path = format!("/{}", "p".repeat(4096));
-        let long_method = "M".repeat(4096);
-        let mut request = Request::new(h3api::Method::Other(long_method.as_str().into()));
-        request.path = Some(long_path.as_str().into());
-
         let buffer = Buffer::default();
         let writer = buffer.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -998,20 +1050,9 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
-        tracing::subscriber::with_default(subscriber, || log_request(&request, 0));
+        tracing::subscriber::with_default(subscriber, || log_request(request, 0));
 
-        let logged = String::from_utf8_lossy(&buffer.0.lock().expect("buffer lock")).into_owned();
-        assert!(logged.contains("inbound request"), "{logged}");
-        assert!(logged.contains(bounded(&long_path).as_ref()), "{logged}");
-        assert!(logged.contains(bounded(&long_method).as_ref()), "{logged}");
-        assert!(
-            !logged.contains(&"p".repeat(64)),
-            "an unbounded :path: {logged}"
-        );
-        assert!(
-            !logged.contains(&"M".repeat(64)),
-            "an unbounded :method: {logged}"
-        );
+        String::from_utf8_lossy(&buffer.0.lock().expect("buffer lock")).into_owned()
     }
 
     /// A non-UTF-8 value cannot be split into scheme and secret, so all of it goes.
