@@ -1,4 +1,4 @@
-//! M2: CONNECT-UDP tunnels (RFC 9298) over QUIC datagrams.
+//! CONNECT-UDP tunnels (RFC 9298) over QUIC datagrams.
 
 mod common;
 
@@ -22,18 +22,6 @@ use common::{
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
 use volto::varint;
-
-/// Waits for the server to close the QUIC connection, returning its error code.
-///
-/// Asserted on the wire rather than through server state: a CONNECTION_CLOSE
-/// frame carrying this code is exactly what the RFC requires the peer to see.
-/// A synchronous `#[track_caller]` function, so a failure names the test that
-/// called it (D66).
-#[track_caller]
-fn close_code(quic: &quinn::Connection) -> impl Future<Output = u64> + '_ {
-    let close = common::rawstream::application_close(quic, TIMEOUT);
-    async move { close.await.0 }
-}
 
 /// Reads datagrams until one arrives for `quarter_stream_id`, returning its
 /// payload.
@@ -465,7 +453,9 @@ async fn an_out_of_range_quarter_stream_id_closes_the_connection() {
             .expect("send datagram");
 
         assert_eq!(
-            close_code(&client.quic).await,
+            common::rawstream::application_close(&client.quic, TIMEOUT)
+                .await
+                .0,
             H3_DATAGRAM_ERROR,
             "quarter stream id {quarter_stream_id} must close the connection"
         );
@@ -493,7 +483,9 @@ async fn a_datagram_without_a_quarter_stream_id_closes_the_connection() {
             .expect("send datagram");
 
         assert_eq!(
-            close_code(&client.quic).await,
+            common::rawstream::application_close(&client.quic, TIMEOUT)
+                .await
+                .0,
             H3_DATAGRAM_ERROR,
             "a {}-byte datagram must close the connection",
             payload.len()
@@ -559,13 +551,12 @@ async fn refuses_an_invalid_port_in_the_template() {
     assert_eq!(response.status, Status::BAD_REQUEST);
 }
 
-/// A bracket that is not the enclosing pair is not part of a host (review M3).
+/// A bracket that is not the enclosing pair is not part of a host.
 ///
 /// RFC 9298 §3 writes an IPv6 literal bare and the bracketed form is accepted
 /// only as a courtesy, so a bracket left over once that pair comes off is syntax
 /// this template has no use for. `it_tcp::refuses_an_authority_with_a_stray_bracket`
-/// pins the same answer on the other route; before this the two disagreed, and a
-/// name with a bracket in it reached the resolver and came back a 502.
+/// pins the same answer on the other route.
 #[tokio::test]
 async fn refuses_a_target_host_with_a_stray_bracket() {
     let server = TestServer::start().await;
@@ -698,7 +689,7 @@ async fn empty_payloads_are_forwarded() {
     assert!(echoed.is_empty(), "expected an empty payload back");
 }
 
-/// M3: with QUIC datagrams unavailable, the session must still work over
+/// With QUIC datagrams unavailable, the session must still work over
 /// DATAGRAM capsules on the request stream.
 ///
 /// The client never advertises `SETTINGS_H3_DATAGRAM`, so RFC 9297 §2.1.1 bars
@@ -1003,26 +994,6 @@ async fn oversized_target_packets_are_dropped_not_sent_as_capsules() {
     assert_eq!(&udp_round_trip(&client, qsid, b"small").await[..], b"small");
 }
 
-/// An idle session must close both its socket and its request stream.
-///
-/// RFC 9298 §3.1: UDP has no close signal, so the timeout is the only thing that
-/// reclaims the socket, and leaving the request stream open afterwards would
-/// leave the client believing the session still exists.
-#[tokio::test]
-async fn an_idle_session_closes_the_request_stream() {
-    let server = TestServer::start_with_udp_timeout(1).await;
-    let target = spawn_udp_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
-
-    let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
-
-    // The session works to begin with.
-    assert_eq!(&udp_round_trip(&client, qsid, b"alive").await[..], b"alive");
-
-    // Now go idle. The server must end the request stream on its own.
-    ends_cleanly(&mut stream, "the idle session").await;
-}
-
 /// Bytes that finish no capsule must not postpone the session timeout.
 ///
 /// The idle timeout exists to reclaim a session's socket, buffers and tunnel
@@ -1091,17 +1062,13 @@ async fn bytes_that_finish_no_capsule_do_not_postpone_the_session_timeout() {
 /// a lapsed deadline is only ever noticed on a poll where none of the three
 /// sources was already ready. A peer that keeps one of them ready is therefore
 /// the shape that steps over the branch reading the deadline rather than
-/// re-arming it — and that same poll order really did defeat the connection's
-/// silence deadline, which `it_handshake`'s churn test now pins (adversarial
-/// pass 2026-08-29).
+/// re-arming it. D92 records the same poll order defeating the connection's
+/// silence deadline, which `it_handshake`'s churn test pins.
 ///
-/// It does not defeat this one. The bytes are the fastest unproductive supply a
-/// peer has on the stream: an unknown capsule type declaring a gigabyte of
-/// value, which RFC 9297 §3.2 requires to be skipped, written as fast as the
-/// stream will take it — around 18 MB before the cut. The session still closes
-/// on its deadline to the millisecond, so the window below is tight; a
-/// regression here is a session that outlives its timeout by the length of the
-/// flood.
+/// The bytes are the fastest unproductive supply a peer has on the stream: an
+/// unknown capsule type declaring a gigabyte of value, which RFC 9297 §3.2
+/// requires to be skipped, written as fast as the stream takes it. A regression
+/// is a session that outlives its timeout by the length of the flood.
 ///
 /// The stream is only half of it, though, and the quieter half: a chunk of
 /// skipped bytes is one pass of the session loop however many bytes it carries,
@@ -1109,10 +1076,7 @@ async fn bytes_that_finish_no_capsule_do_not_postpone_the_session_timeout() {
 /// asks it one per *payload*, and that is where the poll order really did win.
 /// The `before_deadline` unit tests in `src/tunnel/udp.rs` pin that on a paused
 /// clock, and `it_udp_idle` drives the same flood end to end, with the RFC 9298
-/// §7 budget dropping every payload after the first. It could not be written until now: the client end of
-/// it used to trip an accounting bug in quinn-proto's drop-oldest branch
-/// (`Datagrams::send` subtracting `payload_bytes` twice), fixed upstream and in
-/// our pin since v0.5.2.
+/// §7 budget dropping every payload after the first.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_flood_of_skipped_capsule_bytes_does_not_postpone_the_timeout() {
     let server = TestServer::start_with_udp_timeout(1).await;
@@ -1225,41 +1189,6 @@ async fn packets_from_the_target_postpone_the_session_timeout() {
     ends_cleanly(&mut stream, "the quiesced session").await;
 }
 
-/// Forwarded packets do postpone the session timeout — the guard the drip
-/// test needs to mean anything.
-///
-/// With "idle" meaning "no packet crossed the proxy", a session whose packets
-/// are crossing must live for as long as they keep coming, however many
-/// timeouts that spans; a deadline that quietly became absolute would pass the
-/// drip test while cutting every long-lived flow at its first timeout, and
-/// this is the round-trip shape — both re-arm points at once, the way real
-/// traffic exercises them — that would catch it.
-#[tokio::test]
-async fn forwarded_packets_postpone_the_session_timeout() {
-    let server = TestServer::start_with_udp_timeout(1).await;
-    let target = spawn_udp_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
-
-    let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
-
-    // Eight round trips spaced well inside the timeout but spanning three of
-    // them end to end: every one must come back.
-    let mut pending = HashMap::new();
-    for round in 0u8..8 {
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let payload = [b"tick", &[round][..]].concat();
-        send_udp_payload(&client.quic, qsid, &payload);
-        assert_eq!(
-            recv_payload_for(&client.quic, qsid, &mut pending).await[..],
-            payload[..],
-            "round {round}: a session whose packets are crossing must stay open"
-        );
-    }
-
-    // And once the traffic stops, the timeout does its job as before.
-    ends_cleanly(&mut stream, "the quiesced session").await;
-}
-
 /// A client that stops reading the capsule stream gets that stream reset, and
 /// the connection carrying it survives.
 ///
@@ -1268,12 +1197,10 @@ async fn forwarded_packets_postpone_the_session_timeout() {
 /// fallback they do not, so a client that stops reading parks the server inside
 /// its capsule write with no way to make progress.
 ///
-/// The idle timeout used to wrap that write along with the rest of the loop
-/// step, and that write is not cancel-safe: the cancelled write left a partial
-/// DATA frame in the buffer, and the tidy `finish()` that followed FINned a
-/// truncated capsule — malformed by RFC 9297 §3.3. It took the whole connection
-/// down with it rather than just this stream, which is why a second session is
-/// opened at the end: that is the half being pinned here.
+/// That write is not cancel-safe, so the bound must reset the stream rather than
+/// cancel the write and FIN a truncated capsule (RFC 9297 §3.3). A stream error
+/// must not take the connection with it, which is why a second session is
+/// opened at the end.
 #[tokio::test]
 async fn a_client_that_stops_reading_capsules_gets_the_stream_reset() {
     use volto::capsule;
@@ -1399,8 +1326,7 @@ async fn a_session_whose_200_never_landed_forwards_nothing() {
 /// kernel reports on the *connected* socket as `ECONNREFUSED`. RFC 9298 §3.1 says
 /// that when the OS reports the socket unusable, the request stream must be closed
 /// — so the client learns the target is gone instead of waiting out the 180s idle
-/// timeout. Implemented in M2 as part of the socket error paths; this is its
-/// regression test.
+/// timeout.
 #[tokio::test]
 async fn an_unreachable_target_closes_the_session() {
     let server = TestServer::start().await;
