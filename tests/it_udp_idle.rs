@@ -37,8 +37,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::{
-    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, counted_at_least, open_udp_session,
-    spawn_silent_udp_target,
+    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, open_udp_session, spawn_silent_udp_target,
 };
 use tokio::time::Instant;
 use volto::datagram;
@@ -122,7 +121,33 @@ async fn a_flooded_session_closes_once_the_flood_stops_and_the_flood_crosses_not
     // Waited for at the target, so the deadline is known to be armed — and
     // armed by the flood's first packet, the only one the budget forwards —
     // with the flood already at full rate behind it.
-    counted_at_least(&received, 1).await;
+    let forwarded = tokio::time::timeout(common::TIMEOUT, async {
+        while received.load(Ordering::Relaxed) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if forwarded.is_err() {
+        // What the server did with the flood decides what this failure means, so
+        // its own lines go into the message: how many payloads the budget
+        // dropped, and every other line it wrote for the session.
+        let log = buffer.since(mark);
+        let dropped = log
+            .lines()
+            .filter(|line| line.contains("unanswered packet budget exhausted"))
+            .count();
+        let other: Vec<&str> = log
+            .lines()
+            .filter(|line| !line.contains("unanswered packet budget exhausted"))
+            .take(40)
+            .collect();
+        panic!(
+            "the target heard nothing in {:?} of flood: the server dropped {dropped} payloads \
+             for the budget and wrote these other lines:\n{}",
+            common::TIMEOUT,
+            other.join("\n")
+        );
+    }
     let armed = Instant::now();
 
     // Hold the flood over the whole deadline window and past it, then stop it
