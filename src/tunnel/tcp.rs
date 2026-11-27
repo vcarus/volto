@@ -388,12 +388,9 @@ async fn establish(authority: &str, stream: &mut Stream, ctx: &Context) -> Optio
     )
     .await;
 
-    // A 200 that does not land leaves a target connection that will now carry
-    // nothing. A write that failed outright is an error with the stream and a
-    // lapse is a client that stopped reading; RFC 9114 §4.4 (quoted at
-    // [`abort_target`]) asks for the TCP connection to be closed with a reset
-    // in both cases. Returning drops `tcp`; arming the reset first makes that
-    // close abortive. One check covers both cases, so they cannot differ.
+    // A 200 that did not land, by failure or by lapse, leaves a target
+    // connection that will carry nothing: reset it (RFC 9114 §4.4, quoted at
+    // [`abort_target`]).
     if !sent {
         abort_target(&tcp);
         return None;
@@ -568,15 +565,7 @@ async fn client_to_target(
     // The other direction ended the tunnel abnormally. The reason is put on
     // this half too. Leaving it to the `Reader` drop would stop the client with
     // code 0, and the two halves would carry different verdicts on one event.
-    //
-    // [`Teardown::code`] chooses the code, so that the two pumps cannot answer
-    // the same event differently.
-    //
-    // The STOP_SENDING reaches the wire here and not later: `stop_receiving` is
-    // `quinn::RecvStream::stop`, which queues it at the point of call. On the
-    // half a client has already closed it is a no-op: quinn answers
-    // `ClosedStream`, which `FrameReader::stop` discards, because a stream that
-    // is already over has nothing left to stop.
+    // On a half the client has already closed this is a no-op.
     reader.stop_receiving(reason.code());
 }
 
@@ -741,20 +730,8 @@ async fn target_to_client(
     let mut half_close_rx = state.subscribe();
     let mut buf = BytesMut::with_capacity(RELAY_BUF_SIZE);
 
-    // Built once and kept, which is what makes it affordable: it borrows
-    // nothing, registers on its first poll and is a bare wake-up check
-    // afterwards, where one per iteration would take the connection's lock on
-    // every read. [`Writer::stopped`] says why keeping it is sound.
-    //
-    // Its cost outlives the tunnel. The first poll that waits makes quinn
-    // insert an entry for this stream in its per-connection `stopped` map
-    // (quinn 0.11.12), and quinn removes it only on the peer's STOP_SENDING,
-    // on a finished stream being fully acknowledged, or when the connection
-    // closes. A tunnel this server ends with a reset and no STOP_SENDING from
-    // the client keeps its entry, about 100 bytes, until the connection
-    // closes, and nothing bounds how many accumulate on one connection
-    // (R3-M1 of the 2026-11-21 audit; the 2026-11-15 ruling on B2-M1 keeps
-    // the code as it is).
+    // Built once and kept: [`Writer::stopped`] says why that is sound, and
+    // what quinn keeps per stream for it until the connection closes.
     let stopped = writer.stopped();
     tokio::pin!(stopped);
 
@@ -822,13 +799,9 @@ async fn target_to_client(
                 // so this write parks until the connection ends, and a teardown
                 // raised by the other pump would wait behind it.
                 //
-                // `send_data_in_place` is not cancel-safe, and its rustdoc
-                // carries the rule: the frame is one chunk, but quinn may have
-                // taken only a prefix of it, so abandoning the write can leave
-                // a truncated DATA frame, which is legal only behind a reset.
-                // The teardown arm below resets the writer before anything else
-                // can be written, so this stream never ends cleanly on a
-                // partial frame.
+                // `send_data_in_place` is not cancel-safe: an abandoned write
+                // can leave a truncated DATA frame, so every arm that abandons
+                // it resets the writer before anything else is written.
                 let sent = tokio::select! {
                     biased;
                     reason = torn_down(&mut teardown_rx) => break reason,
@@ -841,13 +814,8 @@ async fn target_to_client(
                             timeout_secs = budget.as_secs(),
                             "client stopped reading after its own FIN, cutting the tunnel"
                         );
-                        // Reset rather than left to a FIN, for the reason the
-                        // teardown arm below is: this write was abandoned
-                        // part-way, so the DATA frame on the wire is truncated
-                        // and only a RESET_STREAM behind it stops that
-                        // truncation reading as a complete response.
-                        // `Writer::send_data_in_place` quotes RFC 9114 §7.1 on
-                        // this.
+                        // Reset, because the abandoned write may have left a
+                        // truncated DATA frame.
                         writer.reset(h3api::Code::H3_REQUEST_CANCELLED);
                         abort_target(tcp_read.as_ref());
                         // Nobody reads this: the other pump returned when the
@@ -883,11 +851,7 @@ async fn target_to_client(
     };
 
     // Returning without a reset would drop the `Writer`, and a dropped
-    // `quinn::SendStream` finishes rather than resets, so whatever of the
-    // target's answer had not been sent would reach the client as a complete
-    // response. Both reasons therefore reset here; only the code differs.
-    //
-    // [`Teardown::code`] chooses the code, the same table the read pump uses.
+    // `quinn::SendStream` finishes rather than resets.
     writer.reset(reason.code());
 }
 
@@ -932,18 +896,10 @@ fn ensure_window(buf: &mut BytesMut) {
 /// Setting the option has no effect until the socket is closed, so arming it on
 /// the way out cannot disturb anything still in flight.
 ///
-/// **Every ending but a clean one resets.** `UploadHalf`'s drop arms it for
-/// every ending of the upload pump but the client's FIN (D45). The three arms
-/// of `target_to_client` that see a client abort arm it for the case where
-/// the upload pump has already finished, and `establish` arms it for a 200 that did
-/// not land. A clean client FIN and a target EOF keep their FIN semantics: the
-/// half-close table at the top of this module is the behaviour this proxy
-/// exists to get right, and a reset is not a substitute for any of it. The
-/// bounds are on the abortive side because they leave a transfer unfinished: a
-/// FIN would tell the target the tunnel was seen through. A target that resets
-/// or fails is reset too while the upload is open, so that the upload pump's
-/// rule has no exception; its socket has already failed, so nothing different
-/// reaches it.
+/// Armed by `UploadHalf`'s drop for every ending of the upload pump but the
+/// client's FIN (D45), by the three client-abort arms of `target_to_client`,
+/// and by `establish` for a 200 that did not land. The two clean endings never
+/// arm it.
 ///
 /// On the FIN-then-stalled-client path the kernel decides whether the reset is
 /// sent. The clean FIN went to the target when the client half-closed, so the
@@ -1037,8 +993,6 @@ mod tests {
         CONNECT_FAILED, RELAY_BLOCK_SIZE, RELAY_BUF_SIZE, State, Teardown, WRITE_BATCH_PIECES,
         ensure_window, split_authority, stalled, write_batch,
     };
-    // The deadlines here and the resolver's are asserted the same way; the
-    // helper lives beside the first of them rather than in both files.
     use crate::h3api::DATA_HEADER_ROOM;
     use crate::tunnel::tests::poll_once;
     use bytes::{Bytes, BytesMut};
@@ -1072,7 +1026,7 @@ mod tests {
     ///
     /// On a paused clock, so the deadline is asserted rather than approximated:
     /// the budget is the shipped default, the whole of it is spent without a
-    /// real second passing, and both sides of it are pinned — nothing one
+    /// real second passing, and both sides of it are pinned: nothing one
     /// millisecond short, the timeout on the millisecond itself.
     #[tokio::test(start_paused = true)]
     async fn the_connect_budget_bounds_a_target_that_never_answers() {
@@ -1108,9 +1062,7 @@ mod tests {
     /// The dual-stack case the walk tries every address for: a name whose
     /// first address drops SYNs and whose second works. Each attempt gets an
     /// equal share of what is left of the budget, so the first is given up on
-    /// at half of it and the second connects at once. With one deadline for
-    /// every attempt, the first spent the whole budget and the second was never
-    /// dialled.
+    /// at half of it and the second connects at once.
     #[tokio::test(start_paused = true)]
     async fn a_silent_first_address_leaves_time_for_the_next() {
         let addresses = [address("192.0.2.1:443"), address("192.0.2.2:443")];
@@ -1234,8 +1186,7 @@ mod tests {
     /// means fewer addresses are tried, and the walk still ends on the budget.
     ///
     /// Eight addresses that never answer. At two seconds, less than the floor,
-    /// the first address gets the whole budget, as it did before the budget
-    /// was shared. At the default ten seconds the shares are 3, 3, 3 and the
+    /// the first address gets the whole budget. At the default ten seconds the shares are 3, 3, 3 and the
     /// last second, so four addresses are tried. The paused clock moves only
     /// to the next timer, so the time the walk took is exact: the budget, to
     /// the nanosecond.
@@ -1275,7 +1226,7 @@ mod tests {
     /// meets on a live migration: `Instant::now()` is hours ahead of where the
     /// deadline was armed, and every timer in the process fires in the same
     /// instant. What the connect loop must not do is read one jump as several
-    /// expiries — one per address left in the list — and either name a hop that
+    /// expiries, one per address left in the list, and either name a hop that
     /// was never dialled or walk the rest of the list on a budget long gone.
     #[tokio::test(start_paused = true)]
     async fn a_clock_that_jumps_hours_expires_the_budget_exactly_once() {
@@ -1316,8 +1267,8 @@ mod tests {
         );
     }
 
-    /// With the budget disabled the loop behaves exactly as it did before it
-    /// existed: every address is tried, and the last failure is what travels out.
+    /// With the budget disabled every address is tried, and the last failure is
+    /// what travels out.
     #[tokio::test]
     async fn a_disabled_budget_tries_every_address() {
         let addresses = [address("192.0.2.1:443"), address("192.0.2.2:443")];
@@ -1358,7 +1309,7 @@ mod tests {
     //
     // `stalled` is the only timer in this file the pumps arm themselves, and it
     // is armed on the path where one direction has already ended cleanly and
-    // the other's write is parked -- so the pump that would have noticed is
+    // the other's write is parked, so the pump that would have noticed is
     // gone and this is all that is left. Its two claims are that it never
     // fires while both directions are running, and that it fires a whole
     // budget after the *later* of the other direction ending and this write
@@ -1440,7 +1391,7 @@ mod tests {
     /// Every write gets its own budget, because every write builds its own
     /// `stalled()`.
     ///
-    /// What the pumps rely on and no test held: the future is rebuilt inside
+    /// The future is rebuilt inside
     /// the `select!` for each write, so a write that completes resets the bound
     /// for the next one. Two writes of nine tenths of a budget apiece must cut
     /// nothing, where a bound shared across writes would cut on the second.
@@ -1825,11 +1776,8 @@ mod tests {
         assert!(split_authority("[2001:db8::1]443").is_err());
     }
 
-    /// RFC 3986 §3.2.3 spells a port `*DIGIT`, and `u16::from_str` is more
-    /// generous than that: it takes a leading sign, so without the digit rule
-    /// `+443` would be dialled as 443. Two spellings of one target is a normalisation defect rather than
-    /// a bypass, since the policy judges the number that was parsed, but the
-    /// authority that is logged and the port that is dialled must not disagree.
+    /// RFC 3986 §3.2.3 spells a port `*DIGIT`, and `u16::from_str` also takes a
+    /// sign; see `tunnel::parse_port`.
     #[test]
     fn rejects_a_port_that_is_not_digits() {
         for authority in [
@@ -1884,7 +1832,7 @@ mod tests {
     /// A bracket anywhere but around the whole host is not part of a host.
     ///
     /// `uri_authority` passes them through wherever RFC 3986 allows the
-    /// character, so this is where the shape is judged -- and `example.com]`
+    /// character, so this is where the shape is judged, and `example.com]`
     /// must not become `example.com` on the way to the resolver.
     #[test]
     fn rejects_a_stray_bracket_in_a_host() {
@@ -1910,8 +1858,8 @@ mod tests {
     /// written, and the read lands behind it. The sizes are the ones a relay
     /// meets: a one-byte push, a small record, an MTU-sized segment, and a read
     /// that fills the window exactly. The frozen pieces are held for the whole
-    /// run because that is what a tunnel does -- quinn keeps each until the
-    /// segment carrying it is acknowledged -- and holding them is what stops
+    /// run because that is what a tunnel does (quinn keeps each until the
+    /// segment carrying it is acknowledged), and holding them is what stops
     /// `reserve` from quietly reusing the block they came out of.
     #[test]
     fn every_read_is_offered_a_full_window() {
