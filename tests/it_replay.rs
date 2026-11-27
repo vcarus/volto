@@ -842,19 +842,32 @@ fn skip_remaining(tally: &Tally, plan: &shape::ConnectionPlan, done: usize) {
         .fetch_add((plan.tunnels.len() - done) as u64, Ordering::Relaxed);
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_connection(
+/// What every connection driver shares: the server, its targets, the counters,
+/// the connections a burst may abort, the slots, and the run's three instants.
+#[derive(Clone)]
+struct Run {
     server: Arc<TestServer>,
     targets: Arc<Targets>,
-    plan: shape::ConnectionPlan,
     tally: Arc<Tally>,
     live: Live,
     slots: Slots,
     run_end: Instant,
     idle_release: Instant,
     outlive_release: Instant,
-    connection_tag: u64,
-) {
+}
+
+async fn run_connection(run: Run, plan: shape::ConnectionPlan, connection_tag: u64) {
+    let Run {
+        server,
+        targets,
+        tally,
+        live,
+        slots,
+        run_end,
+        idle_release,
+        outlive_release,
+    } = run;
+
     // A restart burst is a client that came back: whatever it was holding is
     // gone. Aborting a predecessor here rather than at plan time is what puts a
     // transfer genuinely in flight when the abort lands. Before the slot is
@@ -971,7 +984,7 @@ async fn run_connection(
     let deadline = started + Duration::from_millis(plan.active_ms);
     let finished = timeout(
         deadline.saturating_duration_since(Instant::now()),
-        futures_join(bodies),
+        join_all(bodies, false),
     )
     .await;
     if finished.is_err() {
@@ -1039,29 +1052,19 @@ async fn run_connection(
     });
 }
 
-/// Awaits every handle, ignoring what they returned.
+/// Awaits every handle in order, so all of them are finished before the caller
+/// moves on: `futures::future::join_all` without the dependency.
 ///
-/// `futures::future::join_all` without the dependency: the handles are awaited
-/// in order, which is enough because the point is only that all of them are
-/// finished before the caller moves on.
-async fn futures_join(handles: Vec<tokio::task::JoinHandle<()>>) {
-    for handle in handles {
-        let _ = handle.await;
-    }
-}
-
-/// [`futures_join`] for the connection drivers, where a panic must not be lost.
-///
-/// A panic inside a spawned task is caught by tokio and left in the
-/// `JoinHandle`; awaiting it with `let _ =` swallows it, and the only trace is a
-/// message on stderr and a run that quietly did less than it planned. That is
-/// exactly the failure this harness must not have, because "did less than it
-/// planned" is indistinguishable from a finding. The tunnel bodies stay silent
-/// -- they are supposed to be torn down mid-flight -- but a driver that panicked
-/// takes the run down with it.
-async fn join_drivers(handles: Vec<tokio::task::JoinHandle<()>>) {
+/// With `resume_panics`, a task's panic is resumed here. tokio catches a panic
+/// inside a spawned task and leaves it in the `JoinHandle`, so without this the
+/// only trace is a message on stderr and a run that quietly did less than it
+/// planned, which is indistinguishable from a finding. The connection drivers
+/// are joined that way. The tunnel bodies are not: they are supposed to be
+/// torn down mid-flight.
+async fn join_all(handles: Vec<tokio::task::JoinHandle<()>>, resume_panics: bool) {
     for handle in handles {
         if let Err(error) = handle.await
+            && resume_panics
             && let Ok(panic) = error.try_into_panic()
         {
             std::panic::resume_unwind(panic);
@@ -1347,26 +1350,30 @@ async fn production_shapes_are_replayed() {
     let idle_release = run_end + Duration::from_secs(settings.idle_seconds + 3);
     let outlive_release = idle_release + Duration::from_secs(5);
 
+    let run = Run {
+        server: server.clone(),
+        targets: targets.clone(),
+        tally: tally.clone(),
+        live: live.clone(),
+        slots: slots.clone(),
+        run_end,
+        idle_release,
+        outlive_release,
+    };
     let mut drivers = Vec::with_capacity(plan.connections.len());
     for (index, connection) in plan.connections.into_iter().enumerate() {
         sleep_until(start + Duration::from_millis(connection.start_ms)).await;
         drivers.push(tokio::spawn(run_connection(
-            server.clone(),
-            targets.clone(),
+            run.clone(),
             connection,
-            tally.clone(),
-            live.clone(),
-            slots.clone(),
-            run_end,
-            idle_release,
-            outlive_release,
             index as u64,
         )));
     }
+    drop(run);
 
     // Every driver returns once its connection has ended the way its plan said,
     // which for an idle ending is after the server's timer has had time to fire.
-    join_drivers(drivers).await;
+    join_all(drivers, true).await;
 
     // Nothing is left driving; give the last closing lines time to be written,
     // then take the server down so anything still open is logged as drained.
