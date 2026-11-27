@@ -26,14 +26,13 @@ pub(super) struct DatagramPath {
     /// How many oversized drops this session has had, on a doubling schedule.
     ///
     /// The drops themselves are per packet and can arrive at line rate, so a
-    /// line each would be the flood [`crate::logfmt::Sampler`] exists to stop;
-    /// see [`grade`]. One sampler per session, so a session cannot
-    /// spend a quiet neighbour's allowance.
+    /// line each would be the flood [`crate::logfmt::Sampler`] exists to stop.
+    /// One sampler per session, so a session cannot spend a quiet neighbour's
+    /// allowance.
     oversize_drops: crate::logfmt::Sampler,
     /// How many send-buffer evictions this session has had, likewise.
     ///
-    /// The same shape and the same reason as `oversize_drops`: see
-    /// [`grade`].
+    /// The same shape and the same reason as `oversize_drops`.
     evictions: crate::logfmt::Sampler,
 }
 
@@ -75,11 +74,10 @@ impl DatagramPath {
             // What is negotiable is how loudly it is said; see
             // [`Self::report_oversize`].
             self.refresh_limit(ctx);
-            let graded = grade(encoded_len, self.limit, &self.oversize_drops);
-            if graded != Graded::Clear {
+            if encoded_len > self.limit {
                 // Dropped before it is cut off the block, so its bytes go to
                 // the next packet.
-                self.report_oversize(ctx, graded, encoded_len);
+                self.report_oversize(ctx, self.oversize_drops.record(), encoded_len);
                 return;
             }
         }
@@ -111,27 +109,27 @@ impl DatagramPath {
             // only how loudly to say so is graded.
             let space = ctx.quic.datagram_send_buffer_space();
             ctx.datagram_room.reset(space, encoded_len);
-            let len = encoded_len;
-            match grade(len, space, &self.evictions) {
-                Graded::Clear => {}
-                Graded::Report(evictions) => info!(
-                    log_id = "zh8bm6bi",
-                    stream_id = self.stream_id,
-                    quarter_stream_id = self.quarter_stream_id,
-                    space,
-                    len,
-                    evictions,
-                    "QUIC datagram send buffer full, older datagrams evicted; further \
-                     evictions on this session are logged at debug level until the count \
-                     doubles"
-                ),
-                Graded::Quiet => debug!(
-                    stream_id = self.stream_id,
-                    quarter_stream_id = self.quarter_stream_id,
-                    space,
-                    len,
-                    "QUIC datagram send buffer full, older datagrams evicted"
-                ),
+            if encoded_len > space {
+                match self.evictions.record() {
+                    Some(evictions) => info!(
+                        log_id = "zh8bm6bi",
+                        stream_id = self.stream_id,
+                        quarter_stream_id = self.quarter_stream_id,
+                        space,
+                        len = encoded_len,
+                        evictions,
+                        "QUIC datagram send buffer full, older datagrams evicted; further \
+                         evictions on this session are logged at debug level until the \
+                         count doubles"
+                    ),
+                    None => debug!(
+                        stream_id = self.stream_id,
+                        quarter_stream_id = self.quarter_stream_id,
+                        space,
+                        len = encoded_len,
+                        "QUIC datagram send buffer full, older datagrams evicted"
+                    ),
+                }
             }
         }
 
@@ -142,7 +140,7 @@ impl DatagramPath {
             // block, which only this case does to a packet that is not sent.
             Err(quinn::SendDatagramError::TooLarge) => {
                 self.refresh_limit(ctx);
-                self.report_oversize(ctx, occurrence(&self.oversize_drops), encoded_len);
+                self.report_oversize(ctx, self.oversize_drops.record(), encoded_len);
             }
             Err(error) => debug!(%error, "failed to send a QUIC datagram"),
         }
@@ -156,8 +154,9 @@ impl DatagramPath {
         self.limit = ctx.quic.max_datagram_size().unwrap_or(0);
     }
 
-    /// Says that a packet of `encoded_len` bytes was dropped as too large, as
-    /// loudly as `graded` says.
+    /// Says that a packet of `encoded_len` bytes was dropped as too large: at
+    /// `info!` with the count when the session's doubling schedule gives one
+    /// in `drops`, at `debug!` otherwise.
     ///
     /// A drop logged only at `debug!` is invisible in production, and the
     /// condition is not hypothetical: a large EDNS0 or DNSSEC answer and any
@@ -176,11 +175,10 @@ impl DatagramPath {
     /// a low limit cannot be told from a path that shrank (D81). It is read
     /// from the connection statistics on a reported drop only, never per
     /// packet.
-    fn report_oversize(&self, ctx: &Context, graded: Graded, encoded_len: usize) {
+    fn report_oversize(&self, ctx: &Context, drops: Option<u64>, encoded_len: usize) {
         let limit = self.limit;
-        match graded {
-            Graded::Clear => {}
-            Graded::Report(drops) => info!(
+        match drops {
+            Some(drops) => info!(
                 log_id = "ybux2nd9",
                 quarter_stream_id = self.quarter_stream_id,
                 encoded_len,
@@ -191,7 +189,7 @@ impl DatagramPath {
                  drops on this session are logged at debug level until the count \
                  doubles"
             ),
-            Graded::Quiet => debug!(
+            None => debug!(
                 quarter_stream_id = self.quarter_stream_id,
                 encoded_len, limit, "target packet too large for a QUIC datagram, dropping"
             ),
@@ -199,62 +197,11 @@ impl DatagramPath {
     }
 }
 
-/// How loudly one occurrence of a per-packet condition is worth saying.
-///
-/// Shared by the two conditions the outbound path grades, a packet too large
-/// for a QUIC datagram and a send queue with no room left. Neither condition is
-/// decided here and neither is negotiable; what this carries is only how loudly
-/// to say it, which is the same question with the same answer for both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Graded {
-    /// The condition did not arise. The sampler is left untouched, so the
-    /// schedule counts real occurrences and nothing else.
-    Clear,
-    /// It did, and the schedule reports this one: worth an `info!`, carrying
-    /// how many this session has had.
-    Report(u64),
-    /// It did, and this one falls between reports: `debug!` only.
-    Quiet,
-}
-
-/// Grades `value` against `limit` on `sampler`'s doubling schedule.
-///
-/// Both conditions are the same comparison: `value <= limit` is
-/// [`Graded::Clear`] and anything past it is the condition. Exactly the limit is
-/// clear, in both cases and for the same reason, which is why the comparison is
-/// here rather than at the call sites. What the two numbers *are*, and why the
-/// condition is worth a production line at all, stays with the caller: the two
-/// call sites carry an argument each and they are different arguments.
-///
-/// [`crate::logfmt::Sampler`] is the doubling schedule this crate bounds every
-/// peer-repeatable line with: the first occurrence of a session is reported at
-/// once, and the reports after it are 2, 4, 8 and so on rather than silence.
-/// `sampler` is the session's own, so one session cannot quieten another. It is
-/// advanced only where the condition arose, and that is the whole cost: no
-/// allocation, no lock, one atomic increment on the forwarding path.
-fn grade(value: usize, limit: usize, sampler: &crate::logfmt::Sampler) -> Graded {
-    if value <= limit {
-        return Graded::Clear;
-    }
-
-    occurrence(sampler)
-}
-
-/// Records one occurrence on `sampler` and says how loudly to report it.
-///
-/// [`grade`] without the comparison, for a caller that already knows the
-/// condition arose: quinn refusing a datagram as too large is that verdict
-/// made under its own lock.
-fn occurrence(sampler: &crate::logfmt::Sampler) -> Graded {
-    sampler.record().map_or(Graded::Quiet, Graded::Report)
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::datagram;
     use crate::tunnel::quota::QUEUED_DATAGRAM_COST;
     use crate::tunnel::udp::block::landed;
 
@@ -424,112 +371,5 @@ mod tests {
             after_first - cost,
             "the second packet read the room although the bound covered it"
         );
-    }
-
-    /// The `max_datagram_frame_size` an older Surge advertises (D48).
-    const SURGE_MAX_DATAGRAM_FRAME_SIZE: usize = 1300;
-
-    /// An `info!` on the doubling schedule, and the running total in it, for
-    /// both conditions the outbound path grades.
-    ///
-    /// RFC 9298 §6.1 fixes what happens to an oversized packet (it is dropped,
-    /// never downgraded to a capsule), and quinn decides an eviction, so only
-    /// their visibility is in question here. At `debug!` alone neither could be
-    /// seen in production, and a line per packet would be the flood D44
-    /// removed elsewhere.
-    ///
-    /// Eight occurrences, because the schedule is the assertion: reports land
-    /// on the 1st, 2nd, 4th and 8th and on none of the others, and each says
-    /// how many there have been. Asserting the whole sequence at once rather
-    /// than "the first one only" is what tells the schedule apart from the two
-    /// mutations next to it: reporting always, and reporting on everything but
-    /// the first.
-    ///
-    /// Pure arithmetic and a sampler: a live session would need a QUIC
-    /// connection whose path is too small, or whose send queue is a megabyte
-    /// behind, while the decision being asserted lives entirely in [`grade`].
-    #[test]
-    fn a_per_packet_condition_is_reported_on_a_doubling_schedule() {
-        // A 4 KiB answer, which an EDNS0/DNSSEC response routinely is, against
-        // an older Surge's limit; and a datagram against a queue with no room.
-        let oversize = datagram::encoded_len(9, datagram::CONTEXT_ID_UDP_PAYLOAD, 4096);
-        assert!(oversize > SURGE_MAX_DATAGRAM_FRAME_SIZE);
-
-        for (value, limit) in [(oversize, SURGE_MAX_DATAGRAM_FRAME_SIZE), (1200, 0)] {
-            let sampler = crate::logfmt::Sampler::new();
-            let verdicts: Vec<Graded> = (0..8).map(|_| grade(value, limit, &sampler)).collect();
-
-            assert_eq!(
-                verdicts,
-                vec![
-                    Graded::Report(1),
-                    Graded::Report(2),
-                    Graded::Quiet,
-                    Graded::Report(4),
-                    Graded::Quiet,
-                    Graded::Quiet,
-                    Graded::Quiet,
-                    Graded::Report(8),
-                ],
-                "{value} over {limit}: an operator must be told at once that this is \
-                 happening, and then how far it has got, without a line per packet"
-            );
-        }
-    }
-
-    /// The other half: an ordinary packet is sent untouched and does not advance
-    /// the session's schedule.
-    #[test]
-    fn a_packet_within_the_limit_is_sent_and_costs_no_report() {
-        let fits = datagram::encoded_len(9, datagram::CONTEXT_ID_UDP_PAYLOAD, 512);
-        assert!(fits <= SURGE_MAX_DATAGRAM_FRAME_SIZE);
-
-        let drops = crate::logfmt::Sampler::new();
-        for _ in 0..3 {
-            assert_eq!(
-                grade(fits, SURGE_MAX_DATAGRAM_FRAME_SIZE, &drops),
-                Graded::Clear
-            );
-        }
-        assert_eq!(drops.seen(), 0, "a packet that fits is not a drop");
-
-        // Exactly the limit still fits; one byte past it does not, and that is the
-        // first drop of the session, so it is the first thing reported.
-        assert_eq!(
-            grade(
-                SURGE_MAX_DATAGRAM_FRAME_SIZE,
-                SURGE_MAX_DATAGRAM_FRAME_SIZE,
-                &drops
-            ),
-            Graded::Clear
-        );
-        assert_eq!(
-            grade(
-                SURGE_MAX_DATAGRAM_FRAME_SIZE + 1,
-                SURGE_MAX_DATAGRAM_FRAME_SIZE,
-                &drops
-            ),
-            Graded::Report(1)
-        );
-    }
-
-    /// The other half: room is room, and exactly enough of it is still room.
-    #[test]
-    fn a_datagram_the_queue_has_room_for_costs_no_report() {
-        let evictions = crate::logfmt::Sampler::new();
-        for _ in 0..3 {
-            assert_eq!(grade(1200, 1_048_576, &evictions), Graded::Clear);
-        }
-        assert_eq!(
-            evictions.seen(),
-            0,
-            "a datagram that fits displaces nothing"
-        );
-
-        // The boundary quinn itself draws: `datagram_send_buffer_space()` has the
-        // per-datagram overhead subtracted already, so a datagram of exactly that
-        // many bytes is the last one that fits.
-        assert_eq!(grade(1200, 1200, &evictions), Graded::Clear);
-        assert_eq!(grade(1201, 1200, &evictions), Graded::Report(1));
     }
 }
