@@ -160,13 +160,20 @@ impl Config {
         }
 
         if self.limits.keep_alive_interval == 0 {
-            warnings.push(format!(
-                "limits.keep_alive_interval = 0 disables QUIC keep-alives: behind a relay \
-                 doing UDP DNAT, an idle connection will be dropped when the relay's \
-                 conntrack entry expires (30s by default) even though both ends still \
-                 believe it is alive, since limits.max_idle_timeout is {}s",
-                self.limits.max_idle_timeout
-            ));
+            let mut warning = "limits.keep_alive_interval = 0 disables QUIC keep-alives: \
+                               behind a relay doing UDP DNAT, an idle connection will be \
+                               dropped when the relay's conntrack entry expires (30s by \
+                               default)"
+                .to_owned();
+            // At 30 or below the idle timeout fires first, and both ends know.
+            if self.limits.max_idle_timeout > 30 {
+                warning.push_str(&format!(
+                    " even though both ends still believe it is alive, since \
+                     limits.max_idle_timeout is {}s",
+                    self.limits.max_idle_timeout
+                ));
+            }
+            warnings.push(warning);
         }
 
         if !self.limits.mtu_discovery {
@@ -242,6 +249,41 @@ mod tests {
             "{:?}",
             cfg.warnings()
         );
+    }
+
+    /// The reason the keep-alive warning gives holds only when the idle timeout
+    /// outlasts the relay's 30 s conntrack expiry. At 30 or below the idle
+    /// timeout fires first and both ends know the connection is gone, so the
+    /// warning stops before the reason; above 30 it is the whole text.
+    #[test]
+    fn the_keep_alive_warning_gives_its_reason_only_where_it_holds() {
+        const WARNING: &str = "limits.keep_alive_interval = 0 disables QUIC keep-alives: \
+                               behind a relay doing UDP DNAT, an idle connection will be \
+                               dropped when the relay's conntrack entry expires (30s by \
+                               default)";
+        let warning_for = |idle: u64| {
+            parse(&format!(
+                "[limits]\nkeep_alive_interval = 0\nmax_idle_timeout = {idle}"
+            ))
+            .warnings()
+            .into_iter()
+            .find(|w| w.starts_with("limits.keep_alive_interval"))
+            .unwrap_or_else(|| panic!("no keep-alive warning at max_idle_timeout = {idle}"))
+        };
+
+        for idle in [1, 30] {
+            assert_eq!(warning_for(idle), WARNING, "max_idle_timeout = {idle}");
+        }
+        for idle in [31, 60] {
+            assert_eq!(
+                warning_for(idle),
+                format!(
+                    "{WARNING} even though both ends still believe it is alive, since \
+                     limits.max_idle_timeout is {idle}s"
+                ),
+                "max_idle_timeout = {idle}"
+            );
+        }
     }
 
     /// With discovery off there is no search to bound, and a key the operator
