@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use scripts::{
     Scratch, loadable_config_text, plant_placeholder_certificates, real_binary, scratch_tree,
-    stderr_of, stdout_of, write_private,
+    server_section, stderr_of, stdout_of, write_private,
 };
 
 /// A directory of this test's own, standing in for `/etc/volto`.
@@ -292,10 +292,12 @@ fn a_malformed_credential_line_is_refused_without_the_secret() {
     write_private(
         &path,
         &format!(
-            "[server]\nlisten = \"127.0.0.1:4433\"\ncert = \"{}\"\nkey = \"{}\"\n\n\
-             [auth]\nusers = [\"user1:{SECRET}\"]\n",
-            dir.join("cert.pem").display(),
-            dir.join("key.pem").display(),
+            "{}\n[auth]\nusers = [\"user1:{SECRET}\"]\n",
+            server_section(
+                &dir.join("cert.pem"),
+                &dir.join("key.pem"),
+                "127.0.0.1:4433"
+            ),
         ),
     );
 
@@ -590,14 +592,7 @@ fn a_sighup_during_startup_is_taken_as_a_reload() {
     fs::write(&key, issued.signing_key.serialize_pem()).expect("the key must be writable");
     // No `[auth]`, so the startup warning about it is the first line written.
     let path = dir.join("config.toml");
-    write_private(
-        &path,
-        &format!(
-            "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n",
-            cert.display(),
-            key.display(),
-        ),
-    );
+    write_private(&path, &server_section(&cert, &key, "127.0.0.1:0"));
 
     let mut child = Command::new(real_binary())
         .args(["--config", path.to_str().unwrap()])
@@ -685,10 +680,10 @@ fn a_warning_is_reported_without_failing_the_check() {
     let path = dir.join("config.toml");
     write_private(
         &path,
-        &format!(
-            "[server]\nlisten = \"127.0.0.1:4433\"\ncert = \"{}\"\nkey = \"{}\"\n",
-            dir.join("cert.pem").display(),
-            dir.join("key.pem").display(),
+        &server_section(
+            &dir.join("cert.pem"),
+            &dir.join("key.pem"),
+            "127.0.0.1:4433",
         ),
     );
 

@@ -17,6 +17,8 @@
 #![allow(clippy::as_conversions)]
 
 mod common;
+#[path = "common/scripts.rs"]
+mod scripts;
 
 use std::assert_matches;
 use std::net::SocketAddr;
@@ -409,20 +411,14 @@ async fn a_broken_configuration_changes_nothing() {
         // Valid TOML, unknown key.
         (
             "unknown key",
-            format!(
-                "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\nlisen = 1\n",
-                server.dir().join("cert.pem").display(),
-                server.dir().join("key.pem").display()
-            ),
+            format!("{}lisen = 1\n", server.server_section()),
         ),
         // Valid TOML, fails validation: a username with a colon in it.
         (
             "invalid user",
             format!(
-                "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n\
-                 [auth]\nusers = [{{ username = \"a:b\", password = \"p\" }}]\n",
-                server.dir().join("cert.pem").display(),
-                server.dir().join("key.pem").display()
+                "{}[auth]\nusers = [{{ username = \"a:b\", password = \"p\" }}]\n",
+                server.server_section()
             ),
         ),
         // Valid TOML whose integers are out of range. TOML deserializes across
@@ -434,19 +430,15 @@ async fn a_broken_configuration_changes_nothing() {
         (
             "keep-alive past what its own check could double",
             format!(
-                "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n\
-                 [limits]\nkeep_alive_interval = 18446744073709551615\n",
-                server.dir().join("cert.pem").display(),
-                server.dir().join("key.pem").display()
+                "{}[limits]\nkeep_alive_interval = 18446744073709551615\n",
+                server.server_section()
             ),
         ),
         (
             "unbounded shutdown grace",
             format!(
-                "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n\
-                 shutdown_grace = 18446744073709551615\n",
-                server.dir().join("cert.pem").display(),
-                server.dir().join("key.pem").display()
+                "{}shutdown_grace = 18446744073709551615\n",
+                server.server_section()
             ),
         ),
         // Valid and internally consistent, but the certificate is missing.
@@ -463,11 +455,7 @@ async fn a_broken_configuration_changes_nothing() {
             let truncated = server.dir().join("truncated.pem");
             std::fs::write(&truncated, "-----BEGIN CERTIFICATE-----\nnot base64 yet")
                 .expect("write truncated cert");
-            format!(
-                "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n",
-                truncated.display(),
-                server.dir().join("key.pem").display()
-            )
+            scripts::server_section(&truncated, &server.dir().join("key.pem"), "127.0.0.1:0")
         }),
         // A certificate and a key that are individually fine but do not match --
         // what a deploy hook that copies one file and not the other produces.
@@ -476,11 +464,7 @@ async fn a_broken_configuration_changes_nothing() {
                 .expect("generate an unrelated key");
             let stray = server.dir().join("stray-key.pem");
             std::fs::write(&stray, other.signing_key.serialize_pem()).expect("write stray key");
-            format!(
-                "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n",
-                server.dir().join("cert.pem").display(),
-                stray.display()
-            )
+            scripts::server_section(&server.dir().join("cert.pem"), &stray, "127.0.0.1:0")
         }),
     ];
 
@@ -575,10 +559,8 @@ async fn reloading_swaps_the_certificate() {
     std::fs::write(&key, reissued.signing_key.serialize_pem()).expect("write key");
 
     server.write_invalid_config(&format!(
-        "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n\
-         [security]\nallow_private_networks = true\n[log]\nlevel = \"debug\"\n",
-        cert.display(),
-        key.display()
+        "{}[security]\nallow_private_networks = true\n[log]\nlevel = \"debug\"\n",
+        scripts::server_section(&cert, &key, "127.0.0.1:0")
     ));
     server
         .reload()
@@ -722,8 +704,6 @@ async fn a_storm_of_failed_reloads_changes_nothing_and_leaves_the_next_one_worki
     let mut tunnel = open_tcp_tunnel(&mut client, &tcp.to_string()).await;
     let (qsid, _session) = open_udp_session(&mut client, &server, udp).await;
 
-    let cert = server.dir().join("cert.pem");
-    let key = server.dir().join("key.pem");
     let broken: Vec<(&str, String)> = vec![
         ("malformed TOML", "[limits\nmax_streams_bidi = ".to_owned()),
         (
@@ -731,10 +711,8 @@ async fn a_storm_of_failed_reloads_changes_nothing_and_leaves_the_next_one_worki
             // has to be strictly under half the idle timeout.
             "a keep-alive longer than the idle timeout allows",
             format!(
-                "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n\
-                 [limits]\nmax_idle_timeout = 10\nkeep_alive_interval = 9\n",
-                cert.display(),
-                key.display()
+                "{}[limits]\nmax_idle_timeout = 10\nkeep_alive_interval = 9\n",
+                server.server_section()
             ),
         ),
         (
@@ -870,11 +848,13 @@ async fn a_reload_cannot_move_the_listening_socket() {
     let elsewhere = common::closed_udp_address().await;
 
     server.write_invalid_config(&format!(
-        "[server]\nlisten = \"{elsewhere}\"\ncert = \"{}\"\nkey = \"{}\"\n\
-         [limits]\nsocket_recv_buffer = 1048576\nsocket_send_buffer = 1048576\n\
+        "{}[limits]\nsocket_recv_buffer = 1048576\nsocket_send_buffer = 1048576\n\
          [security]\nallow_private_networks = false\n",
-        server.dir().join("cert.pem").display(),
-        server.dir().join("key.pem").display(),
+        scripts::server_section(
+            &server.dir().join("cert.pem"),
+            &server.dir().join("key.pem"),
+            &elsewhere.to_string()
+        ),
     ));
     let (reloaded, logs) = reload_capturing_logs(&server);
     reloaded.expect("a startup-only key is not a reason to refuse a whole reload");

@@ -2073,3 +2073,16 @@ pub fn field_names(line: &str) -> Vec<&str> {
         })
         .collect()
 }
+
+impl TestServer {
+    /// The `[server]` table of this server's own file: loopback on any port,
+    /// and its certificate pair. For a test that writes a whole file with
+    /// [`Self::write_invalid_config`].
+    pub fn server_section(&self) -> String {
+        format!(
+            "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n",
+            self.cert.display(),
+            self.key.display(),
+        )
+    }
+}

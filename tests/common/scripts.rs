@@ -503,14 +503,19 @@ pub fn loadable_config_text(
     body: &str,
 ) -> String {
     format!(
-        "[server]\n\
-         listen = \"{listen}\"\n\
-         cert = \"{}\"\n\
-         key = \"{}\"\n\
-         \n\
+        "{}\n\
          [auth]\n\
          users = [{{ username = \"user1\", password = \"{password}\" }}]\n\
          {body}",
+        server_section(cert, key, listen),
+    )
+}
+
+/// The `[server]` table naming `listen` and the certificate pair, which every
+/// configuration file a test writes starts with.
+pub fn server_section(cert: &Path, key: &Path, listen: &str) -> String {
+    format!(
+        "[server]\nlisten = \"{listen}\"\ncert = \"{}\"\nkey = \"{}\"\n",
         cert.display(),
         key.display(),
     )
