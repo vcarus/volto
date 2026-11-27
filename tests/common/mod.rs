@@ -1,12 +1,13 @@
 //! Shared test harness: a self-signed Volto instance, HTTP/3 clients and
 //! cooperating TCP targets.
 //!
-//! The HTTP/3 client lives in [`h3client`] and is built on the same codec as the
-//! server -- `volto::h3` -- so the two ends of every test here share a reading
-//! of the framing and of QPACK. What that costs, and why the cross-implementation
-//! check now belongs entirely to the `interop` CI job (a real `volto` process
-//! driven by Go's masque-go for CONNECT-UDP and by aioquic for CONNECT-UDP and
-//! classic CONNECT), is spelled out in that module's documentation.
+//! The HTTP/3 client, [`h3client`], is built on `volto::h3`; its module
+//! documentation says what that costs.
+//!
+//! Helpers that assert are synchronous `#[track_caller]` functions returning a
+//! future, so a failure names the test rather than the helper (D66). A public
+//! `*_at` variant takes the caller already captured, for a test file's own
+//! asserting helper.
 
 #![allow(dead_code)]
 // Each integration test binary uses a subset of this.
@@ -56,9 +57,6 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 pub const ALLOW_PRIVATE: &str = "[security]\nallow_private_networks = true\n";
 
 /// The SNI gate on, naming only `localhost`, with loopback targets reachable.
-///
-/// Shared by the two binaries about the gate: `it_sni_gate` asks whether it
-/// admits the right names, `it_gate_shapes` what still answers with it on.
 pub const GATE_LOCALHOST: &str =
     "[security]\nallow_private_networks = true\nexpected_sni = [\"localhost\"]\n";
 
@@ -88,10 +86,8 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 /// path; `name` is what tells one caller's scratch from another's in a directory
 /// listing after a crash.
 ///
-/// The harness side of `tests/common/scripts.rs`'s `scratch_dir`. There are two
-/// because the leaf modules and this one cannot see each other by construction
-/// (D66): a binary that only runs `bash` reaches the leaf without linking any of
-/// what is below, and everything here would come with it.
+/// Leaf modules have their own (`scripts::scratch_tree`), since they may not
+/// use this module (D66).
 pub fn scratch_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("volto-{name}-{}", std::process::id()))
 }
@@ -263,11 +259,8 @@ impl TestServer {
         std::fs::write(&key, issued.signing_key.serialize_pem()).expect("write key");
         let ca = issued.cert.der().clone();
 
-        // Built through the real TOML path so the tests exercise config
-        // parsing and stay unaffected by newly added optional sections.
-        // Written to disk rather than parsed from a string, so the tests go
-        // through the same `Config::load` path production does -- and so `reload`
-        // has a file to re-read.
+        // Written to disk and read with `Config::load`, as production does, so
+        // `reload` has a file to re-read.
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, config_text(&cert, &key, extra, log_extra))
             .expect("write config");
@@ -400,9 +393,7 @@ pub fn basic_credentials(username: &str, password: &str) -> String {
 
 /// Renders a test configuration file.
 ///
-/// `extra` is inserted directly after the `[server]` keys, so bare keys land in
-/// `[server]` and anything starting with a table header opens its own section.
-/// Written unindented: a TOML table header must start its own line.
+/// See [`TestServer::start_with`] for where `extra` lands. Written unindented: a TOML table header must start its own line.
 fn config_text(cert: &Path, key: &Path, extra: &str, log_extra: &str) -> String {
     format!(
         "[server]\n\
@@ -476,17 +467,10 @@ pub fn h3_server_endpoint() -> (quinn::Endpoint, CertificateDer<'static>) {
 ///
 /// Initial keys depend on the client's Destination Connection ID alone
 /// (RFC 9001 §5.2), never on the server's certificate. So a configuration
-/// carrying no certificate derives exactly the keys the running server
-/// derives, and the tests that spell Initial packets need no key material, no
-/// file and no clock to build the packets the gate opens. The resolver is
-/// never asked for anything: nothing here starts a TLS session. The keys come
-/// from rustls's code, and the gate opens the packets with the server's own
-/// (`tls::awslc::keys`), so a packet is built by one implementation and
-/// judged by the other.
-///
-/// The two `expect`s cannot fail: rustls's aws-lc-rs provider supports TLS
-/// 1.3, and a TLS 1.3 configuration carries the initial cipher suite quinn
-/// asks for.
+/// with no certificate derives the keys the server derives. The resolver is
+/// never asked for anything: nothing here starts a TLS session. The packets
+/// are built by rustls and opened by the server's own code
+/// (`tls::awslc::keys`).
 pub fn nameless_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
     /// A resolver with nothing to present.
     #[derive(Debug)]
@@ -516,19 +500,11 @@ pub fn nameless_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
 
 /// How long a probing socket stays bound after its probe has returned.
 ///
-/// A server that answered a probe has a connection whose handshake never
-/// completes, and it sends its flight again to the probe's port until it gives
-/// the connection up. Measured on loopback against a server with the default
-/// limits: two datagrams at 1 s, two at 2 s and one at 5 s after the probe.
-/// The operating system hands out ephemeral ports at random, so a later probe
-/// socket can be given the port of an earlier one, and it then hears those
-/// datagrams. A test of silence counted them as an answer once, on 2026-11-26:
-/// "must draw nothing, and drew 2 datagrams".
-///
-/// Twelve times the last of those, so a probe's port is not used again while
-/// the server it probed still has anything to send to it. The socket is held
-/// by a task of the test's runtime, so it goes when the test ends, as the
-/// test's server does.
+/// A server that answered a probe retransmits its flight to the probe's port
+/// for several seconds (the last at about 5 s with the default limits). The
+/// operating system may hand that port to a later probe, which would then hear
+/// those datagrams, so the port is held twelve times as long. The task holding
+/// it belongs to the test's runtime and ends with the test.
 const PROBE_PORT_HELD: Duration = Duration::from_secs(60);
 
 /// Keeps `socket` bound for [`PROBE_PORT_HELD`] and reads nothing from it.
@@ -875,9 +851,6 @@ pub async fn connect_quic(server: &TestServer) -> (quinn::Endpoint, quinn::Conne
 /// client left trusting a certificate that has been replaced. Only taking longer
 /// than [`TIMEOUT`] is a failure of the test rather than a result, and that is
 /// what panics.
-///
-/// Written as a synchronous function returning a future so that
-/// `#[track_caller]` survives to the poll that panics (D66).
 #[track_caller]
 pub fn finish_connect(
     endpoint: &quinn::Endpoint,
@@ -917,9 +890,6 @@ pub fn finish_connect_as<'a>(
 /// rather than about the transport's: with it, every ACK restarts the server's
 /// idle timer, so the transport can never be the thing that closes the
 /// connection and only an application bound can be.
-///
-/// Written as a synchronous function returning a future so `#[track_caller]`
-/// survives to the poll that panics (D66).
 #[track_caller]
 pub fn silent_peer(
     server: &TestServer,
@@ -942,11 +912,6 @@ pub fn silent_peer(
 }
 
 /// Asserts that `error` is the peer resetting the stream, with `code`.
-///
-/// The failure worth describing is the one where a stream ended the wrong way
-/// altogether — cleanly, or with a local error — which is why this reports what
-/// arrived rather than only that the code differed. Which code a reset carries
-/// is what most of the tests reaching for this are about.
 #[track_caller]
 pub fn assert_peer_reset(error: &volto::h3api::StreamError, code: u64) {
     assert_eq!(
@@ -965,14 +930,10 @@ pub fn connect_request(authority: &str) -> Request {
 
 /// A hostname no resolver anywhere can answer for.
 ///
-/// Five sixty-octet labels and a `.invalid` suffix, which is longer than the 255
-/// octets DNS permits, so the stub resolver refuses it before a query leaves the
-/// host. That is D16: a merely nonexistent name would not do, because a resolver
-/// that hijacks NXDOMAIN resolves it (Surge does, from a fake-IP range), and a
-/// test built on such a name would assert on the environment rather than on the
-/// server, which is what D16 replaced. It is also the trick `volto::net`'s own
-/// unit test uses, and the only way to get a deterministic resolution failure
-/// without a network.
+/// Five 60-octet labels and `.invalid`: 5*60 + 4 dots + 8 = 312 octets, past
+/// the 255 DNS allows, so the stub resolver refuses it locally and no
+/// NXDOMAIN-hijacking resolver can answer it (D16). `volto::net`'s unit test
+/// uses the same name.
 pub fn unresolvable_host() -> String {
     let label = "a".repeat(60);
     vec![label; 5].join(".") + ".invalid"
@@ -1091,13 +1052,6 @@ pub fn proxy_status(response: &Response) -> Option<&str> {
 }
 
 /// Opens a CONNECT tunnel to `authority` and asserts it was accepted.
-///
-/// Written as a synchronous function returning a future rather than as an `async
-/// fn` so that `#[track_caller]` works: on an `async fn` the attribute applies to
-/// the call that builds the future, not to the poll that panics, and rustc warns
-/// that it is a no-op there. Taking the location up front and putting it in the
-/// message is what keeps a failure attributable to the test that opened the
-/// tunnel rather than to this line.
 #[track_caller]
 pub fn open_tcp_tunnel<'a>(
     client: &'a mut H3Client,
@@ -1107,9 +1061,6 @@ pub fn open_tcp_tunnel<'a>(
 }
 
 /// The body behind [`open_tcp_tunnel`], with `caller` already captured.
-///
-/// Public for a test file's own assertion helper that captures its caller and
-/// does this on its behalf (D66).
 pub async fn open_tcp_tunnel_at(
     client: &mut H3Client,
     authority: &str,
@@ -1129,12 +1080,7 @@ pub async fn open_tcp_tunnel_at(
 ///
 /// The same judgement, on a request built by [`authorized_connect`]: a server
 /// with `[auth]` users answers an anonymous CONNECT with a 407, so a test that
-/// wants a tunnel there has to present the pair it configured. Kept apart from
-/// [`open_tcp_tunnel`] rather than folded into it with an `Option`, because the
-/// tests that open a tunnel without credentials are about being let through
-/// without them.
-///
-/// Same shape as [`open_tcp_tunnel`], and for the same reason (D66).
+/// wants a tunnel there has to present the pair it configured.
 #[track_caller]
 pub fn open_tcp_tunnel_as<'a>(
     client: &'a mut H3Client,
@@ -1158,8 +1104,6 @@ pub fn open_tcp_tunnel_as<'a>(
 }
 
 /// Opens a CONNECT-UDP session to `target` and returns its Quarter Stream ID.
-///
-/// Same shape as [`open_tcp_tunnel`], and for the same reason.
 #[track_caller]
 pub fn open_udp_session<'a>(
     client: &'a mut H3Client,
@@ -1179,8 +1123,8 @@ pub fn open_udp_session<'a>(
 /// [`open_udp_session`] for a target named rather than addressed.
 ///
 /// The RFC 9298 template carries a host, so a name is as legitimate a target as
-/// an address — and the only way to reach one whose family the proxy is left to
-/// choose (`it_family`) or one the resolver blackholes (`it_udp`).
+/// an address, and the only way to let the proxy choose the family or to reach
+/// a name the resolver refuses.
 #[track_caller]
 pub fn open_udp_session_to<'a>(
     client: &'a mut H3Client,
@@ -1193,9 +1137,6 @@ pub fn open_udp_session_to<'a>(
 }
 
 /// The body behind both session helpers, with `caller` already captured.
-///
-/// Public for a test file's own assertion helper that captures its caller and
-/// does this on its behalf (D66).
 pub async fn udp_session(
     client: &mut H3Client,
     server: &TestServer,
@@ -1246,8 +1187,7 @@ pub async fn udp_session(
 
 /// Queues one UDP payload for `quarter_stream_id` as an HTTP/3 datagram.
 ///
-/// The outbound half of every CONNECT-UDP exchange, written out at ~40 sites
-/// before it was gathered here. Queuing is asserted rather than the round trip:
+/// The outbound half of a CONNECT-UDP exchange. Queuing is asserted rather than the round trip:
 /// what comes back — a reply, nothing, a drop counted somewhere — is what each
 /// caller is about, and only failing to hand the datagram to quinn at all is a
 /// failure of the test rather than a result.
@@ -1269,9 +1209,6 @@ pub fn send_udp_payload(quic: &quinn::Connection, quarter_stream_id: u64, payloa
 /// caller -- a payload delivered under another session's id is the Quarter
 /// Stream ID class of bug this suite exists to catch, and no caller means to
 /// allow it.
-///
-/// Written as a synchronous function returning a future so `#[track_caller]`
-/// survives to the poll that panics (D66).
 #[track_caller]
 pub fn udp_round_trip<'a>(
     client: &'a H3Client,
@@ -1282,9 +1219,6 @@ pub fn udp_round_trip<'a>(
 }
 
 /// The body behind [`udp_round_trip`], with `caller` already captured.
-///
-/// Public for a test file's own assertion helper that captures its caller and
-/// does this on its behalf (D66).
 pub async fn udp_round_trip_at(
     client: &H3Client,
     quarter_stream_id: u64,
@@ -1316,9 +1250,6 @@ pub fn recv_datagram(quic: &quinn::Connection) -> impl Future<Output = datagram:
 }
 
 /// The body behind both, with `caller` already captured.
-///
-/// Public for a test file's own assertion helper that captures its caller and
-/// reads datagrams on its behalf (D66).
 pub async fn read_datagram(
     quic: &quinn::Connection,
     caller: &'static Location<'static>,
@@ -1345,14 +1276,11 @@ pub async fn read_datagram(
 /// The capsule fallback's counterpart to [`recv_datagram`], and it checks the
 /// same thing for the same reason: RFC 9298 §4 reserves Context ID 0 for UDP
 /// payloads and §5 encodes them under it, so a capsule under any other context
-/// is not a packet from the target. That assertion is a protocol requirement rather than scaffolding, which
-/// is the class D66 says travels up with the helper.
+/// is not a packet from the target.
 ///
 /// `None` means the decoder needs more bytes, not that the stream ended, so a
-/// caller reads more and asks again. The reading itself is deliberately left
-/// with the caller: the four tests reaching for this do not share a stream, two
-/// holding a [`ClientStream`] and two having already taken the DATA frame off a
-/// raw `quinn::RecvStream`, and the decoder is what they do share.
+/// caller reads more and asks again. Reading is left to the caller, which reads
+/// from a [`ClientStream`] or from a raw `quinn::RecvStream`.
 #[track_caller]
 pub fn next_udp_payload(decoder: &mut volto::capsule::CapsuleDecoder) -> Option<Bytes> {
     let capsule = decoder.next_capsule().expect("well-formed capsules")?;
@@ -1584,9 +1512,6 @@ pub fn read_at_least(stream: &mut ClientStream, n: usize) -> impl Future<Output 
 
 /// The body behind [`read_at_least`] and [`echoes`], with `caller` already
 /// captured.
-///
-/// Public for a test file's own assertion helper that captures its caller and
-/// does this on its behalf (D66).
 pub async fn at_least(
     stream: &mut ClientStream,
     n: usize,
@@ -1610,15 +1535,8 @@ pub fn read_to_end(stream: &mut ClientStream) -> impl Future<Output = Vec<u8>> +
 
 /// Sends `payload` through an open tunnel and asserts the target echoes it.
 ///
-/// The exchange that proves a tunnel is *established* rather than merely
-/// answered, written out at some forty sites before it was gathered here.
-/// Every one of them sent a short payload to a target spawned by
-/// [`spawn_echo_target`] and compared what came back with what went out; that
-/// pair of steps is all this is.
-///
-/// Written as a synchronous function returning a future so `#[track_caller]`
-/// survives to the poll that panics (D66) — which is what replaces the
-/// bespoke `expect` text each call site used to carry.
+/// Proves a tunnel is established rather than only answered, against a target
+/// spawned by [`spawn_echo_target`].
 #[track_caller]
 pub fn echoes<'a>(
     stream: &'a mut ClientStream,
@@ -1628,9 +1546,6 @@ pub fn echoes<'a>(
 }
 
 /// The body behind [`echoes`], with `caller` already captured.
-///
-/// Public for a test file's own assertion helper that captures its caller and
-/// does this on its behalf (D66).
 pub async fn echoes_at(
     stream: &mut ClientStream,
     payload: &[u8],
@@ -1666,9 +1581,6 @@ pub fn close_and_drain(stream: &mut ClientStream) -> impl Future<Output = Vec<u8
 }
 
 /// The body behind [`close_and_drain`], with `caller` already captured.
-///
-/// Public for a test file's own assertion helper that captures its caller and
-/// does this on its behalf (D66).
 pub async fn close_and_drain_at(
     stream: &mut ClientStream,
     caller: &'static Location<'static>,
@@ -1914,8 +1826,7 @@ pub async fn closed_address() -> SocketAddr {
 /// A writer that accumulates everything logged into a shared buffer.
 ///
 /// Installed as the subscriber's `MakeWriter` by the test binaries that assert on
-/// log output. Each of those is a binary of its own because
-/// `tracing_subscriber::fmt().init()` may run once per process.
+/// log output.
 #[derive(Clone, Default)]
 pub struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -1996,19 +1907,10 @@ impl SharedBuffer {
 
 /// Reads a numeric field's value off a formatted log line.
 ///
-/// Most assertions on a log line pin a field's presence, which is enough for a
-/// counter whose value the test cannot arrange. The ones a test *can* arrange —
-/// this connection did send packets — are read instead, because a field wired
-/// to the wrong source is present and zero rather than absent, and presence
-/// alone would pass.
-///
 /// The field is found by its whole name: `name=` at the start of the line or
 /// after whitespace, the rule `tests/replay/shape_extract.py` reads fields by.
 /// A field whose name merely ends with `name`, `udp_tx_bytes=` for
 /// `tx_bytes`, is not it.
-///
-/// Beside [`SharedBuffer::lines_since`] and [`SharedBuffer::wait_for_line`],
-/// which produce the lines this parses.
 #[track_caller]
 pub fn numeric_field(line: &str, name: &str) -> u64 {
     field_text(line, name)
