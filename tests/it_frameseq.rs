@@ -69,11 +69,12 @@ use props::{config, pattern};
 use common::rawstream::{
     DENIED_TARGET, FRAME_CANCEL_PUSH, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_MAX_PUSH_ID,
     FRAME_PUSH_PROMISE, FRAME_SETTINGS, H3_CLOSED_CRITICAL_STREAM, H3_FRAME_ERROR,
-    H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_MISSING_SETTINGS, H3_REQUEST_INCOMPLETE,
-    H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR, RESERVED_HTTP2_TYPES, SETTINGS_H3_DATAGRAM,
-    SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER,
-    STREAM_QPACK_ENCODER, application_close, connect_headers_frame, expect_reset, frame,
-    grease_type, read_frame, settings_frame, status_of, still_serving, varint_frame,
+    H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_MISSING_SETTINGS, H3_REQUEST_CANCELLED,
+    H3_REQUEST_INCOMPLETE, H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR, RESERVED_HTTP2_TYPES,
+    SETTINGS_H3_DATAGRAM, SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL, STREAM_PUSH,
+    STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER, application_close, connect_headers_frame,
+    expect_reset, frame, grease_type, read_frame, settings_frame, status_of, still_serving,
+    varint_frame,
 };
 use common::{TIMEOUT, TestServer, connect_quic, spawn_echo_target};
 use volto::varint;
@@ -301,9 +302,9 @@ fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
 /// `None` if every event is legal.
 ///
 /// Written against the RFC rather than against the server's tables, except the
-/// arm for setting identifier 0x00, which says why. Where two
-/// MUST-close rules apply to one frame, the model follows the layering the
-/// server evaluates them in, because the RFC ranks neither and the code on the
+/// arm for setting identifier 0x00, which says why. Where two MUST-close rules
+/// apply to one frame, the model follows the layering the server evaluates them
+/// in, because the RFC ranks neither and the code on the
 /// wire is deterministic: reserved HTTP/2 types first; then §6.2.1's first-frame
 /// rule, which the frame header decides at every length for every buffered type
 /// but SETTINGS, so a malformed first GOAWAY or MAX_PUSH_ID is
@@ -1106,10 +1107,6 @@ impl RequestFatal {
 }
 
 /// A held-open tunnel: the two halves of its request stream, and nothing else.
-///
-/// The tag its payloads carry is not in here. It is a parameter of [`run_plan`],
-/// which writes it into each payload as it goes, so a tunnel handed back to the
-/// schedule carries no identity of its own.
 struct LiveTunnel {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
@@ -1253,7 +1250,9 @@ async fn run_plan(
                     // the response side is `it_tcp`'s to pin; here it only has
                     // to leave the rest of the connection standing, which the
                     // steps after this prove.
-                    let _ = tunnel.send.reset(quinn::VarInt::from_u32(0x10c));
+                    let _ = tunnel
+                        .send
+                        .reset(quinn::VarInt::from_u64(H3_REQUEST_CANCELLED).expect("a varint"));
                     None
                 }
                 TunnelEnd::LeaveOpen => Some(tunnel),
@@ -1297,12 +1296,12 @@ async fn commit_fatal(
     live: &mut Vec<LiveTunnel>,
     control: &mut Option<quinn::SendStream>,
 ) -> u64 {
-    /// A fresh stream carrying `bytes`, with a write failure tolerated: the
-    /// close it is racing is the one the case asserts.
-    async fn fresh(connection: &quinn::Connection, bytes: &[u8]) -> Option<quinn::SendStream> {
-        let (mut send, _recv) = connection.open_bi().await.ok()?;
-        let _ = send.write_all(bytes).await;
-        Some(send)
+    /// A fresh stream carrying `bytes` and then finished, with a failure
+    /// tolerated: the close it is racing is the one the case asserts.
+    async fn fresh(connection: &quinn::Connection, bytes: &[u8]) {
+        if let Ok((mut send, _recv)) = connection.open_bi().await {
+            let _ = send.write_all(bytes).await;
+        }
     }
 
     /// The last tunnel still open, or a fresh one against the echo target: the
@@ -1323,8 +1322,7 @@ async fn commit_fatal(
     match fatal {
         RequestFatal::DataFirst { empty } => {
             let payload = if empty { Vec::new() } else { pattern(9, FILL) };
-            let held = fresh(connection, &frame(FRAME_DATA, &payload)).await;
-            drop(held);
+            fresh(connection, &frame(FRAME_DATA, &payload)).await;
         }
         RequestFatal::ControlFrame(index) => {
             // A complete frame, payload and all: `it_hostile` pins the verdict
@@ -1337,16 +1335,14 @@ async fn commit_fatal(
             } else {
                 varint_frame(kind, 4)
             };
-            let held = fresh(connection, &bytes).await;
-            drop(held);
+            fresh(connection, &bytes).await;
         }
         RequestFatal::Reserved(index) => {
-            let held = fresh(
+            fresh(
                 connection,
                 &frame(RESERVED_HTTP2_TYPES[index], b"as HTTP/2"),
             )
             .await;
-            drop(held);
         }
         RequestFatal::FinMidHeaders => {
             if let Ok((mut send, _recv)) = connection.open_bi().await {
