@@ -684,8 +684,9 @@ impl Reader {
     /// the waiting read at once. Bytes in the read-ahead do not count either
     /// way (see `FrameReader::readable`).
     ///
-    /// 250 ms is an order of magnitude under the bound the regression test
-    /// holds the target's close to. Without a bound, a client that reset its
+    /// 250 ms is an order of magnitude under the 2 s in which
+    /// `tests/it_tcp.rs::a_client_reset_closes_a_target_that_stopped_reading`
+    /// requires the target's close. Without a bound, a client that reset its
     /// request stream while its target had stopped reading would hold the
     /// target socket, its file descriptor and the tunnel slot for the life of
     /// the QUIC connection. A peer cannot stretch it: the timer is this
@@ -708,29 +709,13 @@ impl Reader {
     ///
     /// # Why not `quinn::RecvStream::received_reset`
     ///
-    /// Because it takes a slot it never gives back, and quinn asserts on that
-    /// slot being empty. quinn keeps **one** waker per stream for whoever is
-    /// waiting to read, and on a live connection three things take an entry
-    /// out of it: a `StreamEvent::Readable` for that stream, a
-    /// `RecvStream::stop` while the stream still exists at the protocol layer,
-    /// and `RecvStream::drop` while `all_data_read` is still false. The end of
-    /// the connection empties every slot. A read that *succeeds* takes nothing
-    /// out, so an entry outlives every later read of the bytes it was waiting
-    /// for. That call writes into the slot on every poll that finds no reset,
-    /// and a `select!` which drops the arm leaves it behind.
-    ///
-    /// In release builds that is a leak of one waker per tunnel until the
-    /// connection closes. In debug builds it is a panic, because
-    /// `RecvStream::drop` debug-asserts the slot is empty once the stream has
-    /// been read to its end, and an ordinary upload, whose pump waits in a
-    /// write while later chunks and the FIN are already buffered, leaves such
-    /// an entry behind.
-    ///
-    /// So the wait is built on the zero-length read alone, which registers only
-    /// through quinn's own read path. That kind of entry is safe to abandon:
-    /// quinn takes it out again when the stream becomes readable, and a stream
-    /// cannot reach its end without becoming readable first, so there is never
-    /// one left when the reading half meets the FIN.
+    /// `received_reset` registers a waker in quinn's single read slot on every
+    /// poll that finds no reset, and a `select!` that drops the arm leaves the
+    /// entry behind: a leak per tunnel in release builds, and a failed
+    /// `debug_assert` in `RecvStream::drop` in debug builds once the stream was
+    /// read to its end. A zero-length read registers only through quinn's read
+    /// path, and quinn removes that entry when the stream becomes readable, so
+    /// it is safe to abandon.
     ///
     /// # What that costs
     ///
@@ -857,15 +842,8 @@ fn body_piece(item: Item) -> Result<Option<Bytes>, frame::Error> {
 
         Item::Data(data) => Ok(Some(data)),
 
-        // RFC 9114 §4.4's rule that only DATA may follow a completed CONNECT is
-        // applied a layer down, by `frame::misplaced`, so that it is decided
-        // from a frame's header rather than after its payload has been buffered
-        // and charged for. [`Stream::split`] puts a reader's decoder into that
-        // mode, and a [`Reader`] exists only through it.
-        //
-        // So nothing reaches this arm. It repeats the verdict rather than
-        // relaying an unexpected frame into a tunnel, because the type system
-        // does not know which mode a decoder is in.
+        // Unreachable: `frame::misplaced` refuses it from the header once
+        // `split` has run. The verdict is repeated rather than relayed.
         Item::Frame(_) => Err(Violation::connection(
             Code::H3_FRAME_UNEXPECTED,
             frame::NON_DATA_FRAME_ON_A_TUNNEL,
