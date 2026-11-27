@@ -12,8 +12,8 @@
 use std::assert_matches;
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use volto::capsule::{self, Capsule, CapsuleDecoder};
-use volto::datagram::VARINT_MAX;
+use volto::capsule::{self, Capsule, CapsuleDecoder, MAX_DATAGRAM_CAPSULE_VALUE};
+use volto::datagram::{VARINT_MAX, varint_len};
 
 fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else {
@@ -50,6 +50,11 @@ fuzz_target!(|data: &[u8]| {
     };
     let context_id = u64::from_le_bytes(id_bytes.try_into().unwrap()) % (VARINT_MAX + 1);
     let payload = &rest[8..];
+    // A value past the decoder's bound is refused by design, so it is no round
+    // trip to check.
+    if u64::try_from(varint_len(context_id) + payload.len()).unwrap() > MAX_DATAGRAM_CAPSULE_VALUE {
+        return;
+    }
 
     let encoded = capsule::encode_datagram(context_id, payload);
     let split = usize::from(mode >> 1) % (encoded.len() + 1);
