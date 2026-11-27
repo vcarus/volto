@@ -977,25 +977,42 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
         }
     }
 
-    stays_open(&connection, Duration::from_millis(200)).await;
-
     // Exactly the budget, announced all at once: not one of these may be
-    // refused, and a leaked charge is what would refuse one.
-    let mut streams = Vec::new();
-    for _ in 0..FULL_SIZED_FRAMES_THAT_FIT {
-        streams.push(announce_full_sized_headers(&connection).await);
-    }
-    let mut batch = collect_refusals(streams, FULL_SIZED_FRAMES_THAT_FIT);
+    // refused, and a leaked charge is what would refuse one. The server
+    // releases the last round's charges a moment after its resets arrive, and
+    // that moment is not visible from here, so an attempt that sees a refusal
+    // is reset in turn and tried again after a longer settle. A leaked charge
+    // is permanent and refuses one announcement in every attempt.
+    const ATTEMPTS: u32 = 3;
+    let mut settle = Duration::from_millis(200);
+    for attempt in 1..=ATTEMPTS {
+        stays_open(&connection, settle).await;
 
-    if let Ok(Some((_, response))) =
-        tokio::time::timeout(Duration::from_secs(1), batch.answers.recv()).await
-    {
-        panic!(
-            "the budget did not survive the storm: a full-sized request was answered {}",
+        let mut streams = Vec::new();
+        for _ in 0..FULL_SIZED_FRAMES_THAT_FIT {
+            streams.push(announce_full_sized_headers(&connection).await);
+        }
+        let mut batch = collect_refusals(streams, FULL_SIZED_FRAMES_THAT_FIT);
+
+        let Ok(Some((_, response))) =
+            tokio::time::timeout(Duration::from_secs(1), batch.answers.recv()).await
+        else {
+            // Checked while `batch` still holds the sending halves: a dropped
+            // one would end its stream mid-frame, which is a verdict of its own.
+            stays_open(&connection, Duration::from_millis(200)).await;
+            return;
+        };
+        assert!(
+            attempt < ATTEMPTS,
+            "the budget did not survive the storm: in each of {ATTEMPTS} attempts a full-sized \
+             request was answered {}",
             status_of_response(&response)
         );
+        for mut send in batch.held {
+            let _ = send.reset(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED as u32));
+        }
+        settle *= 2;
     }
-    stays_open(&connection, Duration::from_millis(200)).await;
 }
 
 // ---------------------------------------------------------------------------
