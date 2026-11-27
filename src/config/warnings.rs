@@ -385,11 +385,6 @@ mod tests {
     }
 
     /// The example's password is startable, published, and warned about.
-    ///
-    /// The install paths copy `script/config.example.toml` into place and the
-    /// ACME instructions leave the certificate where it already points, so an
-    /// operator who follows them and stops before the edit has a running server
-    /// that anybody can authenticate against. The warning is what tells them.
     #[test]
     fn the_example_placeholder_password_warns() {
         let warnings = parse(&format!(
