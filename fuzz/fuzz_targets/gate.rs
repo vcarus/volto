@@ -49,8 +49,6 @@ const CLIENT_HELLO: u8 = 1;
 /// and the third does not: under the third, every seed that names a host is a
 /// refusal for its name. An empty list is not here, because an empty list is
 /// the gate switched off and `poll_recv` never calls the judgement path at all.
-/// Spelling variants (case, a root dot) are not here either: `Names::new`
-/// normalises them once at load, and that is unit-tested where it lives.
 const NAMES: [&[&str]; 3] = [
     &["localhost"],
     &["localhost", "other.example"],
@@ -247,13 +245,8 @@ fn refusing_needs_the_keys_this_datagram_carries(
         return;
     }
 
-    // Reachable only through a header the gate parsed, so the length byte and a
-    // first byte of the connection ID are both there.
-    let dcid_length = usize::from(datagram[5]);
-    if dcid_length == 0 {
-        return;
-    }
-
+    // Reachable only through a header the gate parsed and opened, so the
+    // connection ID is at least eight bytes and byte 6 is its first.
     let mut rotated = datagram.to_vec();
     rotated[6] ^= 0x01;
     assert_eq!(
