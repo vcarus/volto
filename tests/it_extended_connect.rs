@@ -1,11 +1,9 @@
 //! Extended CONNECT requests this server does not serve or cannot accept, and a
 //! field section it cannot decode, judged on the wire.
 
-// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
-// allow: the frame lengths are ones this file writes out itself.
-#![allow(clippy::as_conversions)]
-
 mod common;
+
+use std::net::SocketAddr;
 
 use bytes::BytesMut;
 use common::rawstream::{H3_MESSAGE_ERROR, QPACK_DECOMPRESSION_FAILED, close_reason};
@@ -33,9 +31,7 @@ const USER: (&str, &str) = ("surge", "s3cret-p4ssw0rd");
 /// under test was reached at all.
 #[tokio::test]
 async fn an_unimplemented_connect_protocol_is_answered_501() {
-    let server = TestServer::start_with(&format!("{}{ALLOW_PRIVATE}", auth_section(&[USER]))).await;
-    let target = spawn_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
+    let (server, target, mut client) = served().await;
 
     let response = respond_to(&mut client, connect_ip_request(&server.addr.to_string())).await;
     assert_eq!(
@@ -46,9 +42,7 @@ async fn an_unimplemented_connect_protocol_is_answered_501() {
 
     // One request this server will not serve is not a reason to drop the rest:
     // the same connection must still open an ordinary tunnel.
-    let mut tunnel =
-        common::open_tcp_tunnel_as(&mut client, &target.to_string(), USER.0, USER.1).await;
-    echoes(&mut tunnel, b"after 501").await;
+    still_tunnels(&mut client, target, b"after 501").await;
 }
 
 /// A `:protocol` that is not a token makes the request malformed.
@@ -71,9 +65,7 @@ async fn an_unimplemented_connect_protocol_is_answered_501() {
 /// 407 would hide which verdict was reached.
 #[tokio::test]
 async fn a_connect_protocol_that_is_not_a_token_is_malformed() {
-    let server = TestServer::start_with(&format!("{}{ALLOW_PRIVATE}", auth_section(&[USER]))).await;
-    let target = spawn_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
+    let (server, target, mut client) = served().await;
 
     // A prefix that would have routed, followed by a field line of the peer's
     // own: the 501 arm compares the whole value, so nothing but the character
@@ -81,21 +73,15 @@ async fn a_connect_protocol_that_is_not_a_token_is_malformed() {
     let mut request = connect_ip_request(&server.addr.to_string());
     request.protocol = Some("connect-udp\r\nx-injected: 1".into());
 
-    let mut stream = client
-        .send
-        .send_request(request)
-        .await
-        .expect("send a request carrying a :protocol that is not a token");
-    let error = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("the server must answer promptly")
-        .expect_err("a :protocol that is not a token must be refused as malformed");
-    assert_peer_reset(&error, H3_MESSAGE_ERROR);
+    refused_as_malformed(
+        &mut client,
+        request,
+        "a request carrying a :protocol that is not a token",
+    )
+    .await;
 
     // A malformed request is a stream error, so the connection carries on.
-    let mut tunnel =
-        common::open_tcp_tunnel_as(&mut client, &target.to_string(), USER.0, USER.1).await;
-    echoes(&mut tunnel, b"after the malformed :protocol").await;
+    still_tunnels(&mut client, target, b"after the malformed :protocol").await;
 }
 
 /// A Host-only extended CONNECT for an unimplemented protocol is answered 501,
@@ -112,9 +98,7 @@ async fn a_connect_protocol_that_is_not_a_token_is_malformed() {
 /// alone.
 #[tokio::test]
 async fn a_host_only_extended_connect_is_answered_501() {
-    let server = TestServer::start_with(&format!("{}{ALLOW_PRIVATE}", auth_section(&[USER]))).await;
-    let target = spawn_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
+    let (server, target, mut client) = served().await;
 
     let proxy = server.addr.to_string();
     let mut request = connect_ip_request(&proxy);
@@ -132,9 +116,7 @@ async fn a_host_only_extended_connect_is_answered_501() {
     );
 
     // One request this server will not serve is not a reason to drop the rest.
-    let mut tunnel =
-        common::open_tcp_tunnel_as(&mut client, &target.to_string(), USER.0, USER.1).await;
-    echoes(&mut tunnel, b"after a Host-only 501").await;
+    still_tunnels(&mut client, target, b"after a Host-only 501").await;
 }
 
 /// `connect-udp` still requires `:authority`, even when Host names the proxy.
@@ -144,9 +126,7 @@ async fn a_host_only_extended_connect_is_answered_501() {
 /// so a Host field cannot stand in.
 #[tokio::test]
 async fn connect_udp_with_host_but_no_authority_is_malformed() {
-    let server = TestServer::start_with(&format!("{}{ALLOW_PRIVATE}", auth_section(&[USER]))).await;
-    let target = spawn_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
+    let (server, target, mut client) = served().await;
 
     let proxy = server.addr.to_string();
     let mut request = connect_ip_request(&proxy);
@@ -157,21 +137,15 @@ async fn connect_udp_with_host_but_no_authority_is_malformed() {
         FieldValue::parse(proxy.as_bytes()).expect("a valid Host"),
     );
 
-    let mut stream = client
-        .send
-        .send_request(request)
-        .await
-        .expect("send a connect-udp request naming the proxy only through Host");
-    let error = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("the server must answer promptly")
-        .expect_err("connect-udp without :authority must be refused as malformed");
-    assert_peer_reset(&error, H3_MESSAGE_ERROR);
+    refused_as_malformed(
+        &mut client,
+        request,
+        "a connect-udp request naming the proxy only through Host",
+    )
+    .await;
 
     // A malformed request is a stream error, so the connection carries on.
-    let mut tunnel =
-        common::open_tcp_tunnel_as(&mut client, &target.to_string(), USER.0, USER.1).await;
-    echoes(&mut tunnel, b"after malformed connect-udp").await;
+    still_tunnels(&mut client, target, b"after malformed connect-udp").await;
 }
 
 /// An extended CONNECT for another protocol with neither `:authority` nor Host
@@ -183,28 +157,20 @@ async fn connect_udp_with_host_but_no_authority_is_malformed() {
 /// comes first.
 #[tokio::test]
 async fn an_extended_connect_with_no_authority_and_no_host_is_malformed() {
-    let server = TestServer::start_with(&format!("{}{ALLOW_PRIVATE}", auth_section(&[USER]))).await;
-    let target = spawn_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
+    let (server, target, mut client) = served().await;
 
     let mut request = connect_ip_request(&server.addr.to_string());
     request.authority = None;
 
-    let mut stream = client
-        .send
-        .send_request(request)
-        .await
-        .expect("send an extended CONNECT with neither :authority nor Host");
-    let error = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("the server must answer promptly")
-        .expect_err("an extended CONNECT with no authority and no Host must be malformed");
-    assert_peer_reset(&error, H3_MESSAGE_ERROR);
+    refused_as_malformed(
+        &mut client,
+        request,
+        "an extended CONNECT with neither :authority nor Host",
+    )
+    .await;
 
     // A malformed request is a stream error, so the connection carries on.
-    let mut tunnel =
-        common::open_tcp_tunnel_as(&mut client, &target.to_string(), USER.0, USER.1).await;
-    echoes(&mut tunnel, b"after the authority-less request").await;
+    still_tunnels(&mut client, target, b"after the authority-less request").await;
 }
 
 /// The whole connection ends when a field section references the dynamic table.
@@ -233,7 +199,11 @@ async fn a_dynamic_table_reference_closes_the_connection() {
         0xcf,
     ];
     let mut request = BytesMut::new();
-    frame::put_header(&mut request, frame::HEADERS, block.len() as u64);
+    frame::put_header(
+        &mut request,
+        frame::HEADERS,
+        u64::try_from(block.len()).expect("a short block"),
+    );
     request.extend_from_slice(&block);
     send.write_all(&request)
         .await
@@ -256,11 +226,39 @@ fn connect_ip_request(proxy: &str) -> Request {
     request.authority = Some(proxy.into());
     request.path = Some("/.well-known/masque/ip/*/*/".into());
     request.protocol = Some("connect-ip".into());
-    authorize_as_user(&mut request);
+    authorize(&mut request, &basic_credentials(USER.0, USER.1));
     request
 }
 
-/// Adds this suite's credentials to a request.
-fn authorize_as_user(request: &mut Request) {
-    authorize(request, &basic_credentials(USER.0, USER.1));
+/// A server with [`USER`] configured and private destinations open, a TCP echo
+/// target, and a client connected to the server.
+async fn served() -> (TestServer, SocketAddr, H3Client) {
+    let server = TestServer::start_with(&format!("{}{ALLOW_PRIVATE}", auth_section(&[USER]))).await;
+    let target = spawn_echo_target().await;
+    let client = H3Client::connect(&server).await;
+    (server, target, client)
+}
+
+/// Sends `request` and asserts that the server resets it with H3_MESSAGE_ERROR
+/// within [`TIMEOUT`]. `what` names the request in a failure.
+async fn refused_as_malformed(client: &mut H3Client, request: Request, what: &str) {
+    let mut stream = client
+        .send
+        .send_request(request)
+        .await
+        .unwrap_or_else(|error| panic!("send {what}: {error:?}"));
+    let answer = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .unwrap_or_else(|_| panic!("the server must answer {what} promptly"));
+    match answer {
+        Ok(response) => panic!("{what} must be refused as malformed, got {response:?}"),
+        Err(error) => assert_peer_reset(&error, H3_MESSAGE_ERROR),
+    }
+}
+
+/// Opens an ordinary tunnel to `target` on `client` and echoes `tag` through
+/// it: the connection carries on after the request a test was about.
+async fn still_tunnels(client: &mut H3Client, target: SocketAddr, tag: &[u8]) {
+    let mut tunnel = common::open_tcp_tunnel_as(client, &target.to_string(), USER.0, USER.1).await;
+    echoes(&mut tunnel, tag).await;
 }
