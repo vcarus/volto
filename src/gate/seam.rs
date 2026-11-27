@@ -1,7 +1,9 @@
 //! The gate's entry points for the fuzz targets and the tests (D83).
 //!
 //! Every item here exists for `fuzz/` and `tests/`. Each is public and hidden,
-//! and the gate re-exports it, so its path stays `volto::gate::<name>`.
+//! and the gate re-exports it, so its path stays `volto::gate::<name>`. Each
+//! judging seam calls the functions the socket path calls, the server's
+//! Initial key code included.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,24 +28,6 @@ use crate::tls::{EchKey, EchKeySet};
 #[doc(hidden)]
 pub use crate::hello::{FirstFlight, first_flight};
 
-// The seams `fuzz/fuzz_targets/gate.rs`, `fuzz/fuzz_targets/hold.rs` and
-// `tests/it_gate_shapes.rs` reach this module through (D83): [`judgement`],
-// [`Screening`] and [`held_fragments`], [`first_flight`] above,
-// [`sealed_initial`] for building the packets the `hold` target judges, and
-// [`HoldInput`], [`hold_input_key`] and [`hold_input_previous_key`], that
-// target's input format, reloads included.
-//
-// Everything above judges bytes an internet scanner chose, before any peer has
-// authenticated and before quinn has seen them, which is exactly the shape a
-// coverage-guided fuzzer is for. Each judging seam calls the functions the
-// socket path calls, the server's Initial key code included. The packets
-// `tests/it_gate_shapes.rs` builds are sealed with rustls's Initial key code
-// (`nameless_crypto` in `tests/common`), so for those the code that builds a
-// packet and the code that opens it are two implementations. [`sealed_initial`]
-// seals with the server's own key code, which RFC 9001 Appendix A pins
-// (`tls::awslc::keys`), and a test in `tests/it_gate_shapes.rs` opens what it
-// seals with rustls's keys.
-
 /// The hold's bounds, for the fuzz target and the tests that assert them.
 #[doc(hidden)]
 pub use super::hold::{
@@ -56,9 +40,6 @@ pub use super::hold::{
 /// This is the `judge` that `screen_one` calls, Initial key code included.
 /// The socket, the batch walk and the blinding are left out, and none of them
 /// is a parser.
-///
-/// Hidden rather than API: nothing outside `fuzz/` and `tests/` has any reason
-/// to call it, and nothing in this crate does.
 #[doc(hidden)]
 pub fn judgement(datagram: &[u8], expected: &Names) -> Verdict {
     judge(datagram, expected)
