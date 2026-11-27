@@ -15,8 +15,8 @@
 # so the lockfiles are refreshed by hand (`cargo update`, root and fuzz/) before
 # a release.
 #
-# Every dependency PR must pass the full CI suite, on Linux and macOS, before it
-# is merged.
+# Every dependency PR passes the full CI suite (Linux) before it is merged;
+# macOS is judged by the local suite on the dev host.
 version: 2
 updates:
   - package-ecosystem: cargo
