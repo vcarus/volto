@@ -24,6 +24,7 @@ replay it, and compare the two profiles field by field.
 | | |
 |---|---|
 | `shape_extract.py` | reads volto's own INFO log, writes a JSON shape profile |
+| `shape_extract_test.py` | runs the extractor over fixture lines in the shape the server logs now |
 | `shape_compare.py` | puts two profiles side by side with the ratio between them |
 | `profiles/*.json` | committed profiles, one per captured host |
 | `../it_replay.rs` | the replayer: consumes a profile, drives a lab server |

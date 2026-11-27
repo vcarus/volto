@@ -196,7 +196,9 @@ MSG_EVICTION = "QUIC datagram send buffer full, older datagrams evicted"
 # Every message that stands for one request stream that reached the routing
 # layer. A blackholed or policy-denied target consumed a stream and a resolver
 # slot exactly as a successful tunnel did, so all four count as tunnel
-# *attempts*; the `outcome` field is what tells them apart afterwards.
+# *attempts*; the `outcome` field is what tells them apart afterwards. Each is
+# matched on how the message starts: the policy refusal's INFO line adds a
+# sentence about its sampling after the text above, and its DEBUG line does not.
 TUNNEL_MESSAGES = {
     MSG_TCP_TUNNEL: "tcp",
     MSG_UDP_SESSION: "udp",
@@ -553,7 +555,10 @@ def reconstruct(events: list[tuple]) -> dict:
             datagram_evictions += 1
             continue
 
-        kind = TUNNEL_MESSAGES.get(message)
+        kind = next(
+            (kind for text, kind in TUNNEL_MESSAGES.items() if message.startswith(text)),
+            None,
+        )
         if kind is None:
             continue
 
