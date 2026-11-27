@@ -953,6 +953,20 @@ async fn a_reload_cannot_move_the_listening_socket() {
         );
     }
 
+    // `log.level` is the third key a reload cannot apply. The server started on
+    // `debug` (`TestServer`'s file) and this file has no `[log]` table, so it
+    // asks for the default.
+    let level = logs
+        .lines()
+        .find(|line| line.contains("log_id=\"w8t2n5kr\""))
+        .unwrap_or_else(|| panic!("the unapplied log.level must be reported; log was:\n{logs}"));
+    assert!(
+        level.contains(" WARN ")
+            && level.contains("startup=debug")
+            && level.contains("configured=info"),
+        "the warning must name the level in force and the one the file asks for: {level}"
+    );
+
     // Still answering where it was bound, and the reloadable key from the same
     // file did take effect.
     let mut client = H3Client::connect(&server).await;
