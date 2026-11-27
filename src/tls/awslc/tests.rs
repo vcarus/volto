@@ -353,6 +353,92 @@ struct Ran {
     client_next: Option<rustls::quic::Secrets>,
 }
 
+/// Handshake bytes on their way to one side: (level index, bytes).
+type Queue = std::collections::VecDeque<(usize, Vec<u8>)>;
+
+/// The rustls client of an in-memory handshake, the level it writes at, and
+/// its next 1-RTT secrets once it has them.
+struct Client {
+    tls: rustls::quic::ClientConnection,
+    level: usize,
+    next: Option<rustls::quic::Secrets>,
+}
+
+impl Client {
+    fn new(config: Arc<rustls::ClientConfig>) -> Self {
+        let tls = rustls::quic::ClientConnection::new(
+            config,
+            rustls::quic::Version::V1,
+            ServerName::try_from("localhost").expect("a name"),
+            PARAMS.to_vec(),
+        )
+        .expect("start a client");
+        Self {
+            tls,
+            level: 0,
+            next: None,
+        }
+    }
+
+    /// Queues everything the client has to send. It runs right after each
+    /// read, as quinn does, so the bytes a write returns ahead of a key change
+    /// belong to the old level.
+    fn drain(&mut self, queue: &mut Queue) {
+        loop {
+            let mut buf = Vec::new();
+            let change = self.tls.write_hs(&mut buf);
+            let empty = buf.is_empty();
+            if !empty {
+                queue.push_back((self.level, buf));
+            }
+            match change {
+                Some(KeyChange::Handshake { .. }) => self.level = 2,
+                Some(KeyChange::OneRtt { next, .. }) => {
+                    self.level = 3;
+                    self.next = Some(next);
+                }
+                None if empty => return,
+                None => {}
+            }
+        }
+    }
+}
+
+impl Outcome {
+    /// Records the handshake data the first time `session` reports any.
+    fn note_handshake_data(&mut self, session: &Session) {
+        if self.handshake_data.is_none()
+            && let Some(data) = session.handshake_data()
+        {
+            let data = data
+                .downcast::<HandshakeData>()
+                .expect("the provider's type");
+            self.handshake_data = Some((data.protocol, data.server_name));
+        }
+    }
+
+    /// Records what one server flight at `level` holds.
+    fn note_server_flight(&mut self, level: usize, buf: &[u8]) {
+        for (kind, body) in messages(buf) {
+            self.server_messages.push((level, kind, body.len()));
+            if kind == SERVER_HELLO && body.get(2..34) == Some(&HRR_RANDOM[..]) {
+                self.hello_retry = true;
+            }
+            if kind == ENCRYPTED_EXTENSIONS
+                && let Some(list) = extension_body(body, EXT_ECH)
+            {
+                self.retry_configs = Some(list.to_vec());
+            }
+            if kind == CERTIFICATE {
+                self.certificate_sent = true;
+            }
+            if kind == NEW_SESSION_TICKET {
+                self.tickets.push(body.to_vec());
+            }
+        }
+    }
+}
+
 /// Runs one handshake in memory. `tamper` may rewrite each ClientHello before
 /// the server reads it.
 fn handshake(
@@ -365,51 +451,11 @@ fn handshake(
     // `ProbeSession::write` takes what the server has to send as quinn does.
     let mut session =
         ProbeSession(Session::new(server, Version::V1, &PARAMS).expect("start a session"));
-    let mut rustls = rustls::quic::ClientConnection::new(
-        client,
-        rustls::quic::Version::V1,
-        ServerName::try_from("localhost").expect("a name"),
-        PARAMS.to_vec(),
-    )
-    .expect("start a client");
-    // Each side runs its write loop right after each read, as quinn does, so
-    // the bytes a write returns ahead of a key change belong to the old level.
-    let mut client_level = 0usize;
-    let mut client_next = None;
-    let mut to_server: std::collections::VecDeque<(usize, Vec<u8>)> = Default::default();
-    let mut to_client: std::collections::VecDeque<(usize, Vec<u8>)> = Default::default();
+    let mut client = Client::new(client);
+    let mut to_server = Queue::new();
+    let mut to_client = Queue::new();
 
-    fn drain_client(
-        rustls: &mut rustls::quic::ClientConnection,
-        level: &mut usize,
-        next: &mut Option<rustls::quic::Secrets>,
-        queue: &mut std::collections::VecDeque<(usize, Vec<u8>)>,
-    ) {
-        loop {
-            let mut buf = Vec::new();
-            let change = rustls.write_hs(&mut buf);
-            let empty = buf.is_empty();
-            if !empty {
-                queue.push_back((*level, buf));
-            }
-            match change {
-                Some(KeyChange::Handshake { .. }) => *level = 2,
-                Some(KeyChange::OneRtt { next: secrets, .. }) => {
-                    *level = 3;
-                    *next = Some(secrets);
-                }
-                None if empty => return,
-                None => {}
-            }
-        }
-    }
-
-    drain_client(
-        &mut rustls,
-        &mut client_level,
-        &mut client_next,
-        &mut to_server,
-    );
+    client.drain(&mut to_server);
     for _step in 0..64 {
         if let Some((level, mut buf)) = to_server.pop_front() {
             if level == 0 {
@@ -417,14 +463,7 @@ fn handshake(
                 out.client_hellos.push(buf.clone());
             }
             let result = session.0.read_handshake(&buf);
-            if out.handshake_data.is_none()
-                && let Some(data) = session.0.handshake_data()
-            {
-                let data = data
-                    .downcast::<HandshakeData>()
-                    .expect("the provider's type");
-                out.handshake_data = Some((data.protocol, data.server_name));
-            }
+            out.note_handshake_data(&session.0);
             if let Err(error) = result {
                 out.server_error = Some(format!("{error}"));
                 break;
@@ -432,52 +471,29 @@ fn handshake(
             for (level, buf) in session.write() {
                 to_client.push_back((usize::from(level), buf));
             }
-            continue;
-        }
-        if let Some((level, buf)) = to_client.pop_front() {
-            for (kind, body) in messages(&buf) {
-                out.server_messages.push((level, kind, body.len()));
-                if kind == SERVER_HELLO && body.get(2..34) == Some(&HRR_RANDOM[..]) {
-                    out.hello_retry = true;
-                }
-                if kind == ENCRYPTED_EXTENSIONS
-                    && let Some(list) = extension_body(body, EXT_ECH)
-                {
-                    out.retry_configs = Some(list.to_vec());
-                }
-                if kind == CERTIFICATE {
-                    out.certificate_sent = true;
-                }
-                if kind == NEW_SESSION_TICKET {
-                    out.tickets.push(body.to_vec());
-                }
-            }
-            if let Err(error) = rustls.read_hs(&buf) {
+        } else if let Some((level, buf)) = to_client.pop_front() {
+            out.note_server_flight(level, &buf);
+            if let Err(error) = client.tls.read_hs(&buf) {
                 out.client_error = Some(error);
                 break;
             }
-            drain_client(
-                &mut rustls,
-                &mut client_level,
-                &mut client_next,
-                &mut to_server,
-            );
-            continue;
+            client.drain(&mut to_server);
+        } else {
+            break;
         }
-        break;
     }
 
     let session = session.0;
     out.ech_accepted = session.ech_accepted();
     out.server_done = !session.is_handshaking();
-    out.client_done = !rustls.is_handshaking();
+    out.client_done = !client.tls.is_handshaking();
     out.verified = recorder.seen.lock().expect("recorder lock").clone();
     // SAFETY: the session's SSL is valid; the getter only reads.
     out.group = unsafe { sys::SSL_get_group_id(session.ssl.as_ptr()) };
     Ran {
         outcome: out,
         session,
-        client_next,
+        client_next: client.next,
     }
 }
 
@@ -1508,15 +1524,8 @@ fn client_hello() -> Vec<u8> {
         pq_first(),
         Arc::new(Recorder::default()),
     ));
-    let mut rustls = rustls::quic::ClientConnection::new(
-        client,
-        rustls::quic::Version::V1,
-        ServerName::try_from("localhost").expect("a name"),
-        PARAMS.to_vec(),
-    )
-    .expect("start a client");
     let mut hello = Vec::new();
-    rustls.write_hs(&mut hello);
+    Client::new(client).tls.write_hs(&mut hello);
     hello
 }
 
