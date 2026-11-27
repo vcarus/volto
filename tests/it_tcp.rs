@@ -1807,20 +1807,53 @@ fn request_on(
     }
 }
 
+/// A TCP target that echoes every read back with `tag` in front of it.
+///
+/// The tag says which target answered, so a tunnel delivered to another
+/// tunnel's target is caught even when the bytes it carries come back intact.
+async fn spawn_tagged_echo_target(tag: u8) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+    let addr = listener.local_addr().expect("target address");
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                while let Ok(read) = socket.read(&mut buf).await {
+                    if read == 0 {
+                        return;
+                    }
+                    let reply = [&[tag][..], &buf[..read]].concat();
+                    if socket.write_all(&reply).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    addr
+}
+
 /// Several tunnels multiplexed on one QUIC connection must stay independent.
+///
+/// Each tunnel has a target of its own that tags its echo, so a tunnel carried
+/// to another tunnel's target fails here even when every stream gets its own
+/// bytes back.
 #[tokio::test]
 async fn concurrent_tunnels_on_one_connection_stay_independent() {
     let server = TestServer::start().await;
-    let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
     let mut streams = Vec::new();
     for i in 0..5u8 {
+        let target = spawn_tagged_echo_target(i).await;
         let stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
         streams.push((i, stream));
     }
 
-    // Write a distinct payload per tunnel, then check each one got its own back.
+    // Write a distinct payload per tunnel, then check each one got its own back
+    // from its own target.
     for (i, stream) in &mut streams {
         stream
             .send_data(Bytes::from(vec![*i; 8]))
@@ -1828,8 +1861,12 @@ async fn concurrent_tunnels_on_one_connection_stay_independent() {
             .expect("send payload");
     }
     for (i, stream) in &mut streams {
-        let echoed = read_at_least(stream, 8).await;
-        assert_eq!(echoed, vec![*i; 8], "tunnel {i} received another's bytes");
+        let echoed = read_at_least(stream, 9).await;
+        let expected = [&[*i][..], &[*i; 8][..]].concat();
+        assert_eq!(
+            echoed, expected,
+            "tunnel {i} reached another tunnel's target or received another's bytes"
+        );
     }
 }
 
