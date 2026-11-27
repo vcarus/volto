@@ -1564,16 +1564,29 @@ fn a_notification_socket_nobody_listens_on_is_one_warning_and_no_outage() {
 
     let (status, lines, stderr) = serving.stop();
     assert!(status.success(), "{status} {stderr}\n{}", lines.join("\n"));
-    let warnings: Vec<&String> = lines.iter().filter(|line| line.contains("WARN")).collect();
+    // Only the lines of `volto::systemd` are counted. Startup has WARN lines of
+    // its own that depend on the host, such as a socket buffer the kernel
+    // capped, which a Linux runner at its default `rmem_max` writes.
+    const NOTIFICATION_LINES: [&str; 5] = [
+        "log_id=\"wkj009dk\"",
+        "log_id=\"h6ro04gv\"",
+        "log_id=\"kyd7134y\"",
+        "log_id=\"4s9p4dd7\"",
+        "log_id=\"30nndon9\"",
+    ];
+    let warnings: Vec<&String> = lines
+        .iter()
+        .filter(|line| NOTIFICATION_LINES.iter().any(|id| line.contains(id)))
+        .collect();
     assert_eq!(
         warnings.len(),
         1,
-        "exactly one WARN line: {warnings:#?}\n{}",
+        "exactly one line about notifications: {warnings:#?}\n{}",
         lines.join("\n")
     );
     assert!(
-        warnings[0].contains("log_id=\"h6ro04gv\""),
-        "the WARN line is the notification socket's: {}",
+        warnings[0].contains("WARN") && warnings[0].contains("log_id=\"h6ro04gv\""),
+        "the line is the WARN for a socket that cannot be reached: {}",
         warnings[0]
     );
 }
