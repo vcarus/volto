@@ -1,53 +1,32 @@
 //! A minimal HTTP/3 client for driving the server under test.
 //!
-//! It replaces the `h3` / `h3-quinn` client the suite used until the HTTP/3
-//! layer moved into this tree, and it is built on the same codec the server is:
-//! [`volto::h3::frame`] for framing, [`volto::h3::qpack`] for field sections,
-//! [`volto::h3::error`] for the codes. Only the client *behaviour* on top of
-//! them is written here -- which pseudo-headers a request carries, what a
-//! response is decoded into, which streams are opened on connection setup.
+//! It is built on the same codec the server is: [`volto::h3::frame`] for
+//! framing, [`volto::h3::qpack`] for field sections, [`volto::h3::error`] for
+//! the codes. Only the client *behaviour* on top of them is written here --
+//! which pseudo-headers a request carries, what a response is decoded into,
+//! which streams are opened on connection setup.
 //!
-//! # What this costs, and where it is paid back
+//! # What sharing the codec costs
 //!
-//! Sharing a codec with the server means the two ends can no longer disagree
-//! about the bytes: a mistake in the frame or QPACK layer is a mistake both
-//! sides make, and this suite would not see it. That check has one home, and it
-//! is the `interop` job in CI, which starts a real `volto` process and drives it
-//! with two clients that share neither code nor a reading of the RFCs with this
-//! one. Go's [masque-go](https://github.com/quic-go/masque-go) on quic-go covers
-//! CONNECT-UDP. aioquic (`tests/interop/aioquic`) covers CONNECT-UDP as well and
-//! is the only independent client for classic CONNECT, since masque-go speaks
-//! only CONNECT-UDP. Removing the last independent client from `cargo test`
-//! makes that job more load-bearing than it was, not less.
+//! A mistake in framing or QPACK is made by both ends and is invisible here.
+//! The `interop` job is the independent judge: masque-go for CONNECT-UDP,
+//! aioquic for CONNECT-UDP and classic CONNECT. What this suite asserts in full
+//! is the behaviour above the codec. `it_settings` decodes the server's
+//! SETTINGS from raw bytes with its own reader.
 //!
-//! What the suite still asserts with full force is everything *above* the
-//! codec, which is where a proxy's behaviour lives: statuses, `Proxy-Status`,
-//! half-close, which error code a reset carries, when a stream is finished
-//! rather than reset. None of that is shared with the server -- the server
-//! decides it and this client only observes it -- and `it_settings` still
-//! decodes the server's SETTINGS from raw QUIC bytes with a varint reader of
-//! its own, so the one frame Surge disconnects over is read independently even
-//! here.
+//! # What an abandoned stream puts on the wire
 //!
-//! # Wire behaviour that is deliberately h3's
+//! Tests pin it, so:
 //!
-//! Several tests pin what happens to a stream that is abandoned, so this client
-//! reproduces what the `h3` client did rather than what is tidiest:
-//!
-//! * [`ClientStream::stop_stream`] resets the **sending** side only, exactly as
-//!   `h3::client::RequestStream::stop_stream` did (`self.stream.reset(code)`).
-//! * [`ClientStream`] has no `Drop` of its own, because neither `h3` nor
-//!   `h3-quinn` had one: what a dropped request stream puts on the wire was
-//!   always plain quinn's doing -- the send side is finished (or, if the peer
-//!   had stopped it, reset with the peer's code) and the receive side sends
-//!   `STOP_SENDING(0)` unless every byte had already been read. Holding
-//!   `quinn::SendStream` and `quinn::RecvStream` directly is what keeps that
-//!   true without a line of code.
-//! * A request whose field section is larger than the server's advertised
-//!   `SETTINGS_MAX_FIELD_SECTION_SIZE` is refused *after* the stream has been
-//!   opened, which is where `h3` refused it: the server sees a request stream
-//!   that ends without a HEADERS frame, and must treat that as a stream error
-//!   rather than a connection one.
+//! * [`ClientStream::stop_stream`] resets the **sending** side only.
+//! * [`ClientStream`] has no `Drop`, so a dropped stream does what plain quinn
+//!   does: the send side is finished (or, if the peer had stopped it, reset
+//!   with the peer's code) and the receive side sends `STOP_SENDING(0)` unless
+//!   every byte had already been read.
+//! * A request whose field section is larger than the server's
+//!   `SETTINGS_MAX_FIELD_SECTION_SIZE` is refused *after* its stream has been
+//!   opened, so the server sees a request stream that ends before its HEADERS
+//!   frame.
 
 #![allow(dead_code)]
 // Each integration test binary uses a subset of this.
@@ -683,9 +662,9 @@ impl SendRequest {
         //# An HTTP implementation MUST NOT send frames or requests that would be
         //# invalid based on its current understanding of the peer's settings.
         //
-        // Checked after the stream is opened, which is where `h3` checked it:
-        // the stream is then dropped unsent, and the server has to answer a
-        // request stream that ends before its HEADERS frame.
+        // Checked after the stream is opened: the stream is then dropped
+        // unsent, and the server has to answer a request stream that ends
+        // before its HEADERS frame.
         let size = section_size(&fields);
         let allowed = self.peer.max_field_section_size.load(Ordering::Relaxed);
         if size > allowed {
