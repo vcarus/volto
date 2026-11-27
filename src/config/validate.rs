@@ -12,7 +12,8 @@ impl Config {
     /// Checks everything that TOML deserialization cannot express.
     ///
     /// Every error names the offending field so the operator does not have to
-    /// guess which key is wrong.
+    /// guess which key is wrong. Startup, `--check-config` and a reload all
+    /// call this, so each of them refuses what it refuses.
     /// Checks are ordered cheapest first, so a syntactic mistake is reported
     /// without touching the filesystem.
     pub fn validate(&self) -> Result<()> {
@@ -33,8 +34,7 @@ impl Config {
 ///
 /// Without a key no ClientHello can open, so the gate would drop every client
 /// without a word, which is the silent misconfiguration D106's validation
-/// exists to refuse. Checked on the configuration, so startup, `--check-config`
-/// and a reload all refuse it.
+/// exists to refuse.
 fn validate_require_ech(security: &Security, server: &Server) -> Result<()> {
     if security.require_ech && server.ech_key.is_none() {
         bail!(
@@ -49,9 +49,8 @@ fn validate_require_ech(security: &Security, server: &Server) -> Result<()> {
 ///
 /// The previous key is the one a rotation still accepts beside the current
 /// one, so without a current key there is nothing for the clients to move to
-/// and no ECHConfigList to send as retry configs. Checked on the configuration,
-/// so startup, `--check-config` and a reload all refuse it. That the two keys
-/// differ in config_id needs both files, and [`validate_certificate_paths`]
+/// and no ECHConfigList to send as retry configs. That the two keys differ in
+/// config_id needs both files, and [`validate_certificate_paths`]
 /// checks it with them (`EchKeySet::load`).
 fn validate_ech_previous_key(server: &Server) -> Result<()> {
     if server.ech_previous_key.is_some() && server.ech_key.is_none() {
@@ -102,8 +101,7 @@ struct Bound {
     key: &'static str,
     value: u64,
     range: RangeInclusive<u64>,
-    /// Appended to both ends of the range: `" seconds"`, `" bytes"`, or empty
-    /// for a count.
+    /// Appended to both ends of the range, e.g. `" seconds"`; empty for a count.
     unit: &'static str,
     why: &'static str,
 }
@@ -241,19 +239,13 @@ const SOCKET_BUFFER_WHY: &str = "the value is passed to setsockopt as a signed 3
 /// `limits.keep_alive_interval` against `limits.max_idle_timeout`, the one
 /// `[limits]` rule that is not a fixed range.
 fn validate_keep_alive(limits: &Limits) -> Result<()> {
-    // Strictly below half, not at it: at exactly half, losing a single
-    // keep-alive packet is enough for the connection to time out. The relay in
-    // front of this server is the reason keep-alives exist at all. Its UDP
-    // conntrack entry expires on its own schedule (30s by default), and only a
-    // keep-alive well inside both timeouts keeps the NAT mapping alive.
+    // Strictly below half; see `DEFAULT_KEEP_ALIVE_INTERVAL`.
     //
     // Written as `interval >= ceil(idle / 2)` rather than the more obvious
     // `interval * 2 >= idle`: the two reject exactly the same pairs of
     // integers, and this one cannot overflow. The doubling overflows above
-    // `u64::MAX / 2`, a value the file can hold, since TOML integers
-    // deserialize across the whole target type's range, and the overflow would
-    // panic inside this function in every build: the release profile keeps
-    // overflow checks on for this crate (D86).
+    // `u64::MAX / 2`, which the file can hold, and the release profile keeps
+    // overflow checks on (D86).
     if limits.keep_alive_interval > 0
         && limits.keep_alive_interval >= limits.max_idle_timeout.div_ceil(2)
     {
@@ -289,16 +281,9 @@ fn validate_auth(auth: &Auth) -> Result<()> {
             );
         }
         if user.username.len() > crate::logfmt::MAX_TOKEN {
-            // Failures are counted under the user-id as a log line carries
-            // it, truncated at `logfmt::MAX_TOKEN`, so a longer name could
-            // never be cleared by its own success, and its owner would lose
-            // the connection at the `security.max_auth_failures`-th failure
-            // however often it authenticates in between.
-            //
-            // The name is not echoed: it is not a secret, but it lives in
-            // the same table as one, and nothing out of `[auth]` goes to
-            // stderr (see `parse_error`). The index and the limit are what
-            // it takes to find and fix it.
+            // Over `logfmt::MAX_TOKEN` a name could never clear its own
+            // failures (see `MAX_TOKEN`). The name is not echoed: nothing out
+            // of `[auth]` goes to stderr.
             bail!(
                 "auth.users[{i}].username is {} bytes, over the {}-byte limit a user-id has \
                  to stay within to be told apart in the logs and in the authentication \
@@ -558,15 +543,9 @@ fn validate_expected_sni(index: usize, name: &str) -> Result<()> {
         bail!("security.expected_sni[{index}] is empty, which is not a host name");
     }
 
-    // One trailing dot spells the root and is stripped above; a second one, or a
-    // dot at the start, or two in a row, is an empty label. Refused here rather
-    // than left to rustls-pki-types, for the reason the whole function exists:
-    // `Names` would hold `host.tw.` for `host.tw..`, no ClientHello can carry
-    // that form (RFC 6066 §3 has the name represented "without a trailing
-    // dot"), and the gate would refuse every client in silence.
-    // `ServerName::try_from` would refuse it too, but only in the
-    // certificate-coverage warning, which is a warning and not a refusal to
-    // start.
+    // One trailing dot spells the root and is stripped above; any other empty
+    // label is refused here, because no ClientHello carries that form and
+    // `ServerName::try_from` would catch it only in a warning.
     if bare.split('.').any(str::is_empty) {
         bail!(
             "security.expected_sni[{index}] = {name:?} has an empty label; a host name \
@@ -601,16 +580,11 @@ fn validate_expected_sni(index: usize, name: &str) -> Result<()> {
         );
     }
 
-    // The character set above already turns away every IPv6 literal, since none
-    // of them can be written without a colon, but the rule is stated as the rule
-    // rather than left as a side effect of the character class. It is exactly
-    // the class this function exists for: an operator who typed the address the
-    // relay is reached on has a name no conforming client will ever send, and
-    // the gate then refuses every handshake in silence.
+    // IPv6 literals already fail the character set above.
     //
     //= https://www.rfc-editor.org/rfc/rfc6066#section-3
     //# Literal IPv4 and IPv6 addresses are not permitted in "HostName".
-    if bare.parse::<std::net::Ipv4Addr>().is_ok() || bare.parse::<std::net::Ipv6Addr>().is_ok() {
+    if bare.parse::<std::net::Ipv4Addr>().is_ok() {
         bail!(
             "security.expected_sni[{index}] = {name:?} is an IP address literal, which \
              RFC 6066 §3 does not permit in a server_name, so no conforming client can \
@@ -651,11 +625,6 @@ mod tests {
 
     /// Asserts that `body` is refused by [`Config::validate`], that the refusal
     /// names `key`, and returns the whole message.
-    ///
-    /// About twenty tests here are the same four lines: build a body, expect the
-    /// error, render it, assert it names the key. The key stays a literal at the
-    /// call site so nothing becomes less greppable, and a test that checks a
-    /// second phrase checks it against the returned string.
     fn rejected(body: &str, key: &str) -> String {
         let message = parse(body)
             .validate()
@@ -856,13 +825,8 @@ mod tests {
         }
     }
 
-    /// A file that sets only `initial_mtu`, at any value it was allowed before
-    /// the default ceiling fell to 1436, still loads.
-    ///
-    /// Before that change the default ceiling was 1452, equal to
-    /// [`MAX_INITIAL_MTU`], so no legal `initial_mtu` could sit above it. An
-    /// absent ceiling now resolves to the larger of the default and the
-    /// starting size, so such a file probes nothing below where it starts.
+    /// A file that sets only `initial_mtu`, above the default ceiling, still
+    /// loads: an absent ceiling follows `initial_mtu` up.
     #[test]
     fn an_initial_mtu_above_the_default_ceiling_loads_without_a_ceiling() {
         let cfg = parse("[limits]\ninitial_mtu = 1452");
@@ -885,21 +849,9 @@ mod tests {
     /// The positive half of D86: the largest legal configuration is one every
     /// deadline in this server can actually be built from.
     ///
-    /// The tests above prove the ceiling *rejects*. That is only half a bound —
-    /// a ceiling that rejected everything would pass them all — and the half it
-    /// leaves out is the one an operator meets: a value the file accepts and
-    /// the first connection then panics on. So this does the arithmetic itself,
-    /// every sum a running server makes out of these four keys, on the largest
-    /// values the file will take.
-    ///
-    /// It has teeth because of where it runs. `Duration`'s `Mul` and `Instant`'s
-    /// `Add` panic on overflow rather than saturating, and `cargo test` is a
-    /// debug build where integer overflow panics too — so a ceiling raised past
-    /// what the arithmetic can carry fails here rather than in production, which
-    /// is the whole point of having one.
-    ///
-    /// The factor is `crate::conn`'s own rather than a copy: a copy would go on
-    /// agreeing with itself after the real one moved.
+    /// The largest legal values must still build every deadline; `Duration` and
+    /// `Instant` arithmetic panics on overflow, so a ceiling raised too far fails
+    /// here.
     #[test]
     fn every_deadline_can_be_built_from_the_largest_legal_configuration() {
         let cfg = parse(&format!(
@@ -913,8 +865,8 @@ mod tests {
 
         let now = tokio::time::Instant::now();
 
-        // `crate::conn`: D76's absolute deadline, the only product of two
-        // configured numbers in the tree.
+        // `crate::conn`: D76's absolute deadline, the idle timeout times
+        // `SILENCE_FACTOR`.
         let silence = cfg.limits.max_idle_timeout() * crate::conn::SILENCE_FACTOR;
         let deadline = now + silence;
         assert!(deadline > now, "the D76 deadline did not move forward");
@@ -1027,7 +979,7 @@ mod tests {
             ("\"::1\"", "contains"),
             // What the TLS layer's `DnsName` refuses and the checks above do
             // not: such a name never reaches the second SNI gate as a name, so
-            // the gate admits no client for it (R7-M1).
+            // the gate admits no client for it.
             ("\"proxy-.example\"", "not a DNS host name"),
             ("\"-proxy.example\"", "not a DNS host name"),
             ("\"host.123\"", "not a DNS host name"),
@@ -1056,9 +1008,7 @@ mod tests {
     /// ClientHello can carry, so it has to be accepted; one more byte has to be
     /// refused, and the refusal has to print both the length it got and the
     /// limit, because that pair is what tells an operator whether the entry is a
-    /// typo or a name no client could ever send. Nothing pinned the accepting
-    /// side, so `>=` in place of the `>` refused the longest legal name and every
-    /// test stayed green.
+    /// typo or a name no client could ever send.
     #[test]
     fn the_longest_expected_sni_is_accepted_and_one_byte_more_is_not() {
         let label = |len: usize| "a".repeat(len);
@@ -1423,7 +1373,7 @@ mod tests {
         /// across the whole of each target type — so a `u64` that breaks the
         /// arithmetic *inside* `validate` is an operator's typo turning startup
         /// into an abort, and a `SIGHUP` into one on a running server. The
-        /// property is deliberately weak on purpose: `Ok` or `Err`, but a third
+        /// property is weak on purpose: `Ok` or `Err`, but a third
         /// outcome is not allowed to exist.
         #[test]
         fn validation_of_any_limits_answers_rather_than_panicking(limits in any_limits()) {
