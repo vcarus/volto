@@ -23,8 +23,9 @@
 //!   repository at all. They come from outside the tree: `VOLTO_SCRUB_PATTERNS`
 //!   (`|`-separated, from a repository secret in CI) and, on the dev host, the
 //!   gitignored `dev_docs/scrub-patterns.txt`. They are searched for in the raw
-//!   bytes of every file, binary ones included, without regard to ASCII
-//!   letter case. Matches are reported by file and line with the pattern *redacted*: CI logs
+//!   bytes of every file, binary ones included, without regard to letter case.
+//!   A PNG may carry no compressed text chunk, whose bytes a search cannot see.
+//!   Matches are reported by file and line with the pattern *redacted*: CI logs
 //!   are public too.
 //!
 //! The presence of `dev_docs/` marks the dev host, the one place where the gate
@@ -104,6 +105,10 @@ const BINARY_EXTENSIONS: [&str; 1] = ["png"];
 /// Fewer listed files than this is a listing that went wrong, not a tree.
 const TRACKED_FLOOR: usize = 100;
 
+/// The id of the canonical repository on GitHub, which a rename or a transfer
+/// keeps and a fork does not share.
+const CANONICAL_REPOSITORY_ID: &str = "1333836681";
+
 /// The word list on the dev host, a path `CLAUDE.md` fixes.
 const WORD_LIST: &str = "dev_docs/scrub-patterns.txt";
 
@@ -146,7 +151,7 @@ impl Gate<'_> {
 /// repository secrets by design, so both fall back to the CJK check alone.
 fn is_push_to_canonical_repository() -> bool {
     std::env::var("GITHUB_EVENT_NAME").as_deref() == Ok("push")
-        && std::env::var("GITHUB_REPOSITORY").as_deref() == Ok("vcarus/volto")
+        && std::env::var("GITHUB_REPOSITORY_ID").as_deref() == Ok(CANONICAL_REPOSITORY_ID)
 }
 
 /// One file the next commit can carry: its path as git lists it, and each copy
@@ -239,9 +244,13 @@ fn listing(gate: &Gate) -> Result<Option<Vec<Listed>>, String> {
         let path = String::from_utf8_lossy(&path_bytes).into_owned();
         let on_disk = gate.root.join(&path);
         let mut copies = Vec::new();
+        // A symbolic link is committed as the text of its target, which is
+        // what is read here; `fs::read` would follow it.
         let working = match fs::symlink_metadata(&on_disk) {
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
             Ok(meta) if meta.is_dir() => Ok(None),
+            Ok(meta) if meta.file_type().is_symlink() => fs::read_link(&on_disk)
+                .map(|target| Some(target.into_os_string().into_encoded_bytes())),
             _ => fs::read(&on_disk).map(Some),
         };
         match working {
@@ -312,7 +321,7 @@ fn scrub_patterns(gate: &Gate) -> Result<Vec<String>, String> {
                     VOLTO_SCRUB_PATTERNS secret is missing or empty"
             .to_owned());
     }
-    Ok(patterns.iter().map(|pattern| pattern.to_ascii_lowercase()).collect())
+    Ok(patterns.iter().map(|pattern| pattern.to_lowercase()).collect())
 }
 
 /// Every CJK character in a path or in the text of a file, and every file that
@@ -361,8 +370,35 @@ fn cjk_violations(files: &[Listed]) -> Vec<String> {
     violations
 }
 
+/// Whether a PNG carries a chunk whose text is compressed: `zTXt`, or `iTXt`
+/// with its compression flag set. A byte search cannot see into either.
+fn png_has_compressed_text(bytes: &[u8]) -> bool {
+    let mut at = 8;
+    while let Some(header) = bytes.get(at..at + 8) {
+        let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let Ok(length) = usize::try_from(length) else {
+            return false;
+        };
+        let kind = &header[4..8];
+        let data = bytes.get(at + 8..).unwrap_or_default();
+        let data = &data[..length.min(data.len())];
+        let compressed_itxt = kind == b"iTXt"
+            && data
+                .iter()
+                .position(|byte| *byte == 0)
+                .and_then(|keyword_end| data.get(keyword_end + 1))
+                == Some(&1);
+        if kind == b"zTXt" || compressed_itxt {
+            return true;
+        }
+        at += 12 + length;
+    }
+    false
+}
+
 /// Every occurrence of one of `patterns` (already in lower case) in a path or
-/// in the bytes of a file, with the pattern redacted.
+/// in the bytes of a file, with the pattern redacted, and every PNG whose text
+/// the search cannot read.
 fn literal_violations(files: &[Listed], patterns: &[String]) -> Vec<String> {
     // Redacted on purpose: this output can end up in a public CI log. The file
     // and line are enough to find a match.
@@ -387,6 +423,11 @@ fn literal_violations(files: &[Listed], patterns: &[String]) -> Vec<String> {
         // find the match.
         for (label, bytes) in &file.copies {
             let name = file.name(label);
+            if file.is_binary() && png_has_compressed_text(bytes) {
+                violations.push(format!(
+                    "{name}: carries a compressed text chunk, which the search cannot read"
+                ));
+            }
             let bytes = lowered(bytes);
             for (number, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
                 for (index, pattern) in patterns.iter().enumerate() {
@@ -404,10 +445,14 @@ fn literal_violations(files: &[Listed], patterns: &[String]) -> Vec<String> {
     violations
 }
 
-/// `bytes` with its ASCII letters in lower case. A name written with a
-/// capital in a heading is the same private literal as the entry in the list.
+/// `bytes` in lower case: every letter when they are UTF-8, the ASCII letters
+/// otherwise. A name written with a capital in a heading is the same private
+/// literal as the entry in the list.
 fn lowered(bytes: &[u8]) -> Vec<u8> {
-    bytes.to_ascii_lowercase()
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_lowercase().into_bytes(),
+        Err(_) => bytes.to_ascii_lowercase(),
+    }
 }
 
 /// Whether the line `haystack` contains `needle`.
@@ -596,5 +641,45 @@ fn away_from_the_dev_host_only_the_word_list_part_is_skipped() {
     assert!(
         matches!(listing(&scratch_gate(&not_a_repository)), Ok(None)),
         "without dev_docs a git that fails skips the gate"
+    );
+}
+
+/// The gate reads the bytes git stores: a symbolic link as the text of its
+/// target, a letter in any case, and a PNG's compressed text, which it cannot
+/// search and so refuses.
+#[test]
+fn the_gate_reads_what_git_would_publish() {
+    let root = scratch_repository("published-bytes");
+    fs::create_dir(root.join("dev_docs")).expect("create dev_docs");
+    fs::write(
+        root.join(WORD_LIST),
+        format!("{MADE_UP_LITERAL}\nSm\u{f8}rgaflux\n"),
+    )
+    .expect("write the word list");
+    std::os::unix::fs::symlink(
+        format!("/nowhere/{MADE_UP_LITERAL}"),
+        root.join("link.md"),
+    )
+    .expect("plant a dangling link");
+    fs::write(root.join("upper.md"), "SM\u{d8}RGAFLUX\n").expect("write");
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend_from_slice(&5u32.to_be_bytes());
+    png.extend_from_slice(b"zTXtk\0\0xx");
+    png.extend_from_slice(&[0; 4]);
+    fs::write(root.join("pic.png"), png).expect("write");
+
+    let gate = scratch_gate(&root);
+    let patterns = scrub_patterns(&gate).expect("the word list names literals");
+    let files = listing(&gate)
+        .expect("the scratch repository can be listed")
+        .expect("the dev host never skips");
+
+    assert_eq!(
+        literal_violations(&files, &patterns),
+        [
+            "link.md:1 (pattern #1, len 11)",
+            "pic.png: carries a compressed text chunk, which the search cannot read",
+            "upper.md:1 (pattern #2, len 10)",
+        ]
     );
 }
