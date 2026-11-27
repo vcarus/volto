@@ -71,7 +71,9 @@ use common::{
     spawn_echo_target,
 };
 use volto::h3api::Status;
-use volto::net::{BURST_LOOKUPS, SHARED_LOOKUPS, blocking_pool_size};
+use volto::net::{
+    BURST_LOOKUPS, Family, OtherFamily, ResolverBudget, SHARED_LOOKUPS, blocking_pool_size,
+};
 
 /// Seconds the injected resolver makes one lookup take.
 ///
@@ -197,14 +199,20 @@ fn a_connection_keeps_its_lookup_slot_while_the_pool_is_parked() {
         // The self-check that makes every assertion below mean something: an
         // injection that did not take would leave the server resolving every
         // name happily, and the run would pass while testing nothing.
+        // Asked the way a tunnel asks under the default `ip_family_preference`:
+        // one family, through the budgeted lookup.
+        let resolver = ResolverBudget::new(MAX_CONNECTIONS).per_connection();
+        let mut other = OtherFamily::new("self-check.example", 443, Family::Ipv6);
         let hung = tokio::time::timeout(
             Duration::from_secs(2),
-            volto::net::resolve("self-check.example", 443),
+            resolver.lookup_family("self-check.example", 443, Family::Ipv4, &mut other),
         )
         .await;
         assert!(hung.is_err(), "the injected resolver answered: {hung:?}");
 
-        let from_hosts = volto::net::resolve("localhost", 80)
+        let mut other = OtherFamily::new("localhost", 80, Family::Ipv6);
+        let from_hosts = resolver
+            .lookup_family("localhost", 80, Family::Ipv4, &mut other)
             .await
             .expect("localhost resolves from /etc/hosts, not from the resolver");
         assert!(

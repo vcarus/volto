@@ -93,54 +93,18 @@ fn no_address(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, NoAddress(message))
 }
 
-/// Resolves `host`/`port` to a non-empty list of socket addresses.
-///
-/// **Unbudgeted**: this takes no slot from the D90 lookup budget, so nothing a
-/// client controls may reach it: a tunnel target resolves through
-/// [`ConnectionResolver::lookup`] or not at all. What keeps this `pub` is the
-/// tests (`it_resolver_pool` proves its injected resolver took hold by watching
-/// this very function hang).
-///
-/// An IP literal resolves to itself without consulting the resolver, and an IPv6
-/// one is written bare: the brackets belong to the syntax a target arrived in,
-/// and each of the two places a target arrives has already taken them off:
-/// `tunnel::tcp` splitting an RFC 3986 authority, `tunnel::udp` decoding an
-/// RFC 9298 template, which carries them bare to begin with. Stripping them here
-/// as well would mean accepting a host neither of those produced, and answering
-/// `example.com]:443` by dialling `example.com`.
-pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    match literal(host, port) {
-        Some(address) => Ok(vec![address]),
-        None => on_the_blocking_pool(host, port, None).await,
-    }
-}
-
 /// `host` read as an IP address, which resolves to itself.
+///
+/// An IPv6 literal is written bare: the brackets belong to the syntax a target
+/// arrived in, and each of the two places a target arrives has already taken
+/// them off: `tunnel::tcp` splitting an RFC 3986 authority, `tunnel::udp`
+/// decoding an RFC 9298 template, which carries them bare to begin with.
+/// Stripping them here as well would mean accepting a host neither of those
+/// produced, and answering `example.com]:443` by dialling `example.com`.
 pub(crate) fn literal(host: &str, port: u16) -> Option<SocketAddr> {
     host.parse::<std::net::IpAddr>()
         .ok()
         .map(|ip| SocketAddr::new(ip, port))
-}
-
-/// Asks the system resolver about `host`, holding `slot` until it answers.
-///
-/// The blocking task is spawned here rather than left to
-/// `tokio::net::lookup_host`, which spawns exactly this, for one reason: the
-/// permit has to be dropped by the *thread*, not by the future. A
-/// `connect_timeout` that expires drops the caller, and `getaddrinfo` is not
-/// cancellable: the thread stays in the resolver until the stub gives up, five
-/// seconds per attempt on a stock `resolv.conf` and tens of seconds where the
-/// nameserver answers nothing at all. A permit released at that moment would say a slot is free while the thread it
-/// stands for is still gone, which is the accounting that lets a client park
-/// the pool one `connect_timeout` at a time (D90).
-///
-/// `None` is the unbudgeted path: [`resolve`] itself, and the tests.
-async fn on_the_blocking_pool(
-    host: &str,
-    port: u16,
-    slot: Option<LookupSlot>,
-) -> io::Result<Vec<SocketAddr>> {
-    answered(host, &mut System::Getaddrinfo.spawn(host, port, None, slot)).await
 }
 
 /// The answer of a lookup [`System::spawn`] started.
@@ -209,12 +173,23 @@ impl System {
     ///
     /// `None` is the call `std::net::ToSocketAddrs` makes, unchanged. A family
     /// is asked through [`one_family`].
+    ///
+    /// The blocking task is spawned here rather than left to
+    /// `tokio::net::lookup_host`, which spawns the same task, because the slot
+    /// has to be dropped by the *thread*, not by the future. A `connect_timeout`
+    /// that expires drops the caller, and `getaddrinfo` is not cancellable: the
+    /// thread stays in the resolver until the stub gives up, five seconds per
+    /// attempt on a stock `resolv.conf` and tens of seconds where the nameserver
+    /// answers nothing at all. A slot released at that moment would say a
+    /// thread is free while the thread it stands for is still gone, which is
+    /// the accounting that lets a client park the pool one `connect_timeout` at
+    /// a time (D90).
     fn spawn(
         &self,
         host: &str,
         port: u16,
         family: Option<Family>,
-        slot: Option<LookupSlot>,
+        slot: LookupSlot,
     ) -> JoinHandle<io::Result<Vec<SocketAddr>>> {
         let owned = host.to_owned();
         match self {
@@ -313,7 +288,7 @@ fn one_family_list(
 ///
 /// The number this bounds is threads, not queries: a lookup holds a thread of
 /// the runtime's *blocking* pool until `getaddrinfo` returns, whatever the
-/// client does meanwhile (`on_the_blocking_pool`). So an unbounded proxy
+/// client does meanwhile ([`System::spawn`]). So an unbounded proxy
 /// converts one client's black-holed names directly into parked threads, and the
 /// pool is process-wide: with the default `max_connections` x
 /// `max_targets_per_conn` at 65 536 in-flight requests against tokio's 512
@@ -502,7 +477,8 @@ pub struct ConnectionResolver {
 }
 
 impl ConnectionResolver {
-    /// [`resolve`], with a slot in the blocking pool taken for the length of it.
+    /// The addresses of `host` in both families, in the resolver's order, with
+    /// a slot in the blocking pool taken for the length of the lookup.
     ///
     /// An IP literal never reaches the resolver and so never occupies a thread:
     /// it is answered without taking a slot at all, which keeps the budget
@@ -513,7 +489,7 @@ impl ConnectionResolver {
         }
 
         let slot = self.acquire().await;
-        answered(host, &mut self.system.spawn(host, port, None, Some(slot))).await
+        answered(host, &mut self.system.spawn(host, port, None, slot)).await
     }
 
     /// [`lookup`](Self::lookup) of `family` alone, with the lookup of the
@@ -540,7 +516,7 @@ impl ConnectionResolver {
         }
 
         let slot = self.acquire().await;
-        let mut lookup = self.system.spawn(host, port, Some(family), Some(slot));
+        let mut lookup = self.system.spawn(host, port, Some(family), slot);
         other.start_if_spare(self);
         answered(host, &mut lookup).await
     }
@@ -637,7 +613,7 @@ impl ConnectionResolver {
 ///
 /// Owned rather than borrowed because of where it is dropped: it travels into
 /// the blocking task and is released there, outliving the future that asked for
-/// it whenever a `connect_timeout` expires first. See [`on_the_blocking_pool`].
+/// it whenever a `connect_timeout` expires first. See [`System::spawn`].
 #[derive(Debug)]
 enum LookupSlot {
     /// The connection's own slot, and the server-wide reserved permit it
@@ -718,7 +694,7 @@ impl OtherFamily {
             &self.host,
             self.port,
             Some(self.family),
-            Some(slot),
+            slot,
         ));
     }
 
@@ -1095,7 +1071,7 @@ mod tests {
 
         /// An IP literal costs nothing, because it blocks nothing.
         ///
-        /// Asserted without a runtime at all: [`on_the_blocking_pool`] would
+        /// Asserted without a runtime at all: [`System::spawn`] would
         /// reach the blocking pool, and reaching it from here panics. So a literal
         /// answered by a single poll is a literal that never went near a
         /// thread — with every slot this connection has already held.
@@ -1126,7 +1102,7 @@ mod tests {
         /// time until no connection could resolve anything.
         ///
         /// A lookup that has already reached the blocking pool keeps its slot
-        /// on purpose ([`on_the_blocking_pool`]). What is proved here is the
+        /// on purpose ([`System::spawn`]). What is proved here is the
         /// other half: a lookup that never got a slot keeps no claim on one.
         #[test]
         fn lookups_that_all_give_up_at_once_give_back_everything_they_held() {
@@ -1567,9 +1543,17 @@ mod tests {
         }
     }
 
+    /// The budgeted lookup with the real `getaddrinfo` behind it.
+    fn real_resolver() -> ConnectionResolver {
+        ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS).per_connection()
+    }
+
     #[tokio::test]
     async fn resolves_ipv4_literals_without_a_resolver() {
-        let addresses = resolve("192.0.2.1", 443).await.expect("literal resolves");
+        let addresses = real_resolver()
+            .lookup("192.0.2.1", 443)
+            .await
+            .expect("literal resolves");
         assert_eq!(addresses, vec!["192.0.2.1:443".parse().unwrap()]);
     }
 
@@ -1579,16 +1563,36 @@ mod tests {
     /// contain, and is left to fail as one.
     #[tokio::test]
     async fn resolves_bare_ipv6_literals() {
-        let bare = resolve("2001:db8::1", 53).await.expect("bare literal");
+        let bare = real_resolver()
+            .lookup("2001:db8::1", 53)
+            .await
+            .expect("bare literal");
         assert_eq!(bare, vec!["[2001:db8::1]:53".parse().unwrap()]);
     }
 
+    /// `localhost` through the system resolver, and the slot it held is back
+    /// once the answer is: the blocking thread drops it before it returns.
     #[tokio::test]
     async fn resolves_localhost() {
-        let addresses = resolve("localhost", 80).await.expect("localhost resolves");
+        let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
+        let resolver = budget.per_connection();
+        let addresses = resolver
+            .lookup("localhost", 80)
+            .await
+            .expect("localhost resolves");
         assert!(
             addresses.iter().all(|address| address.ip().is_loopback()),
             "{addresses:?}"
+        );
+        assert_eq!(
+            resolver.reserved.available_permits(),
+            1,
+            "the lookup kept its slot after it answered"
+        );
+        assert_eq!(
+            budget.reserved.available_permits(),
+            reserved_lookups(crate::config::DEFAULT_MAX_CONNECTIONS),
+            "the lookup kept its server-wide permit after it answered"
         );
     }
 
@@ -1596,16 +1600,19 @@ mod tests {
     /// rather than about the local resolver.
     ///
     /// A plain nonexistent name is unusable as a test: resolvers that hijack
-    /// NXDOMAIN — including Surge itself, which answers from a fake-IP range —
-    /// make it succeed. A name longer than the 255 octets DNS allows is rejected
-    /// by the stub resolver before any query goes out, on every platform.
+    /// NXDOMAIN, Surge among them with its fake-IP range, make it succeed. A
+    /// name longer than the 255 octets DNS allows is rejected by the stub
+    /// resolver before any query goes out, on every platform.
     #[tokio::test]
     async fn a_name_too_long_for_dns_fails_to_resolve() {
         let label = "a".repeat(60);
         let host = vec![label; 5].join(".") + ".invalid";
         assert!(host.len() > 255, "{} octets", host.len());
 
-        let error = resolve(&host, 443).await.expect_err("must not resolve");
+        let error = real_resolver()
+            .lookup(&host, 443)
+            .await
+            .expect_err("must not resolve");
         // Whatever the platform calls it, it must be an error rather than an
         // empty success.
         assert!(!error.to_string().is_empty());
