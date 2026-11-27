@@ -5,10 +5,10 @@
 //! times, can drop packets in episodes or all of them for a span, or as a
 //! recorded sequence of packet fates says, can limit
 //! the rate with a token-bucket policer or a queue, and delays each packet by
-//! a fixed time each way. The sender is a bulk sender that behaves as
+//! a fixed time each way, which can change at given times. The sender is a bulk sender that behaves as
 //! quinn-proto 0.11.19 does under this crate's transport settings. It is never
-//! short of data, except in a handshake or at [`Scenario::client_window`]
-//! when a scenario sets them. It sends
+//! short of data, except in a handshake, at [`Scenario::client_window`] or in
+//! [`Scenario::idle`] when a scenario sets them. It sends
 //! while in-flight data is under [`Controller::window`] and its pacer allows
 //! it. It calls the controller in quinn's order and declares a loss by quinn's
 //! rule.
@@ -307,6 +307,18 @@ struct Scenario {
     client_window: Option<u64>,
     /// A handshake in its simplest form; see [`Handshake`].
     handshake: Option<Handshake>,
+    /// The sender has no data from the first time to the second: it is
+    /// app-limited, and in-flight data drains. The keep-alive of this crate's
+    /// transport settings is not modelled, so a span under its 20 s default
+    /// is what a scenario can trust.
+    idle: Option<(Duration, Duration)>,
+    /// With `idle`, the bytes to arrive after the idle span ends whose
+    /// transfer time [`Report::resumed_transfer`] gives.
+    resumed_transfer: Option<u64>,
+    /// Changes of `rtt`: from each second given, the round-trip time given,
+    /// for the packets sent from then on. A packet sent later must not arrive
+    /// earlier, so a test changes the RTT only while nothing is in flight.
+    rtt_steps: &'static [(u64, Duration)],
     /// The packets with these numbers are dropped on the path whatever else
     /// happens to them.
     drop_packets: &'static [u64],
@@ -349,6 +361,9 @@ impl Scenario {
             transfer: None,
             client_window: None,
             handshake: None,
+            idle: None,
+            resumed_transfer: None,
+            rtt_steps: &[],
             drop_packets: &[],
             trace: None,
             trace_start: 0,
@@ -513,6 +528,12 @@ struct Report {
     stopped: Option<f64>,
     /// When `Scenario::transfer` bytes had arrived, in seconds.
     transferred: Option<f64>,
+    /// With [`Scenario::idle`], the megabytes that arrived in the first 1, 2
+    /// and 5 s after the idle span ended.
+    resumed: [f64; 3],
+    /// How long after the idle span ended `Scenario::resumed_transfer` bytes
+    /// had arrived, in seconds.
+    resumed_transfer: Option<f64>,
     /// How many times the probe timeout fired.
     timeouts: u32,
     /// The share of 100 ms spans with packets sent in which the path's drop
@@ -607,6 +628,11 @@ struct Sim {
     /// `Scenario::transfer`.
     arrived: u64,
     transferred: Option<u64>,
+    /// Bytes that have arrived after the idle span, in all and in its first
+    /// 1, 2 and 5 s, and when they first reached `Scenario::resumed_transfer`.
+    resumed_arrived: u64,
+    resumed: [u64; 3],
+    resumed_transferred: Option<u64>,
     /// Packets sent and packets the drop stages dropped, per 100 ms.
     spans: Vec<(u32, u32)>,
     clock: u64,
@@ -801,6 +827,9 @@ impl Sim {
             stopped: None,
             arrived: 0,
             transferred: None,
+            resumed_arrived: 0,
+            resumed: [0; 3],
+            resumed_transferred: None,
             spans: vec![(0, 0); usize::try_from(sc.seconds * 10).unwrap_or(0)],
             clock: 0,
             seconds,
@@ -868,6 +897,24 @@ impl Sim {
             .map_or(self.sc.drop_share, |&(_, share)| share)
     }
 
+    /// The path's round-trip time without a queue for a packet sent at `now`.
+    fn path_rtt(&self, now: u64) -> u64 {
+        let rtt = self
+            .sc
+            .rtt_steps
+            .iter()
+            .rev()
+            .find(|&&(from, _)| now >= from * 1_000_000_000)
+            .map_or(self.sc.rtt, |&(_, rtt)| rtt);
+        nanos(rtt)
+    }
+
+    /// Whether the sender has no data at `now`, and when it has again.
+    fn idle_until(&self, now: u64) -> Option<u64> {
+        let (from, until) = self.sc.idle?;
+        (now >= nanos(from) && now < nanos(until)).then(|| nanos(until))
+    }
+
     /// Passes one packet sent at `now` through the policer, the queue, the
     /// random drop, the episodes, the outage and the delay. Returns when it
     /// reaches the receiver, or `None` when the path drops it.
@@ -917,7 +964,7 @@ impl Sim {
             }
             return None;
         }
-        Some(left + nanos(self.sc.rtt) / 2)
+        Some(left + self.path_rtt(now) / 2)
     }
 
     /// When the ACK of a packet that reaches the sender at `back` is handled:
@@ -961,6 +1008,11 @@ impl Sim {
                     return;
                 }
             }
+            if let Some(until) = self.idle_until(now) {
+                self.app_limited = true;
+                self.pacing_at = Some(until);
+                return;
+            }
             if self
                 .sc
                 .client_window
@@ -998,6 +1050,9 @@ impl Sim {
                 *count += 1;
             }
             self.in_flight += size;
+            // quinn calls it once per datagram batch, after the batch's
+            // packets count as in flight.
+            self.c.on_sent(self.at(now), size, packet.number);
             self.last_sent = now;
             if let Some(s) = self.second(now) {
                 s.sent += size;
@@ -1016,11 +1071,36 @@ impl Sim {
                     {
                         self.transferred = Some(arrived);
                     }
-                    let back = self.batch_time(arrived + nanos(self.sc.rtt) / 2);
+                    self.count_resumed(arrived, size);
+                    let back = self.batch_time(arrived + self.path_rtt(now) / 2);
                     self.pending.push_back((packet, back));
                 }
                 None => self.holes.push_back(packet),
             }
+        }
+    }
+
+    /// Counts `size` bytes that arrived at `arrived` after the idle span.
+    fn count_resumed(&mut self, arrived: u64, size: u64) {
+        let Some((_, until)) = self.sc.idle else {
+            return;
+        };
+        let Some(after) = arrived.checked_sub(nanos(until)) else {
+            return;
+        };
+        for (sum, secs) in self.resumed.iter_mut().zip([1, 2, 5]) {
+            if after < secs * 1_000_000_000 {
+                *sum += size;
+            }
+        }
+        self.resumed_arrived += size;
+        if self.resumed_transferred.is_none()
+            && self
+                .sc
+                .resumed_transfer
+                .is_some_and(|bytes| self.resumed_arrived >= bytes)
+        {
+            self.resumed_transferred = Some(after);
         }
     }
 
@@ -1323,6 +1403,8 @@ impl Sim {
             span_empty: span.is_empty(),
             stopped: self.stopped.map(seconds_of),
             transferred: self.transferred.map(seconds_of),
+            resumed: self.resumed.map(|bytes| to_f64(bytes) / 1e6),
+            resumed_transfer: self.resumed_transferred.map(seconds_of),
             timeouts: self.timeouts,
             clean_spans: to_f64(u64::try_from(clean).unwrap_or(0))
                 / to_f64(u64::try_from(used.len()).unwrap_or(0)).max(1.0),
@@ -2123,6 +2205,95 @@ fn acknowledgements_in_clumps_hold_the_sender_at_the_floor_and_the_record_shows_
             flight >= Some(1000) && flight <= Some(1100),
             "seed {seed}: in flight {flight:?}"
         );
+    }
+}
+
+/// What the sender of [`idle_gap`] has to deliver after the idle span: 20 MB,
+/// several windows on every line it runs.
+const RESUMED_TRANSFER: u64 = 20_000_000;
+
+/// A bulk transfer of 10 s, an idle span of `gap` seconds, and a second bulk
+/// transfer of 20 s on the same connection, at 85 ms behind a policer of
+/// 200 Mbit/s and 1 MB that drops `drop_share`. The means are those of the
+/// last 10 s. With `rtt_after_ms` the path's RTT is that from 12 s on, inside
+/// the idle span.
+fn idle_gap(gap: u64, drop_share: f64, rtt_after_ms: Option<u64>, seed: u64) -> Scenario {
+    let mut sc = Scenario::new(85, drop_share, seed).policer(200.0, 1e6);
+    sc.seconds = 30 + gap;
+    sc.warmup = 20 + gap;
+    sc.idle = Some((Duration::from_secs(10), Duration::from_secs(10 + gap)));
+    sc.resumed_transfer = Some(RESUMED_TRANSFER);
+    if let Some(ms) = rtt_after_ms {
+        let step: &'static [(u64, Duration)] =
+            Box::leak(vec![(12, Duration::from_millis(ms))].into_boxed_slice());
+        sc.rtt_steps = step;
+    }
+    sc
+}
+
+/// One line of [`idle_gap`]'s figures after the idle span.
+fn print_resumed(name: &str, sc: &Scenario, r: &Report) {
+    let seed = sc.seed;
+    let resumed = sc.idle.map_or(0, |(_, until)| nanos(until));
+    let after = |t: f64| t >= seconds_of(resumed);
+    let readings: Vec<String> = r
+        .readings
+        .iter()
+        .filter(|(t, _)| after(*t))
+        .map(|(t, p)| format!("{p:.3}@{t:.2}"))
+        .collect();
+    let probes: Vec<String> = r
+        .probes
+        .iter()
+        .filter(|t| after(**t))
+        .map(|t| format!("{t:.2}"))
+        .collect();
+    let min_rtt: Vec<String> = r
+        .min_rtt_changes
+        .iter()
+        .filter(|(t, _, _)| after(*t))
+        .map(|(t, v, _)| format!("{v:.1}@{t:.2}"))
+        .take(4)
+        .collect();
+    println!(
+        "IDLE {name} seed {seed}: first 1/2/5 s {:.1}/{:.1}/{:.1} MB, 20 MB in {}, \
+         last 10 s {:.1} Mbit/s, window-limited {:.2} s floor {:.2} s lossless {:.2} s, \
+         readings after {}, probes after {}, min rtt after {}",
+        r.resumed[0],
+        r.resumed[1],
+        r.resumed[2],
+        r.resumed_transfer
+            .map_or_else(|| "never".to_owned(), |t| format!("{t:.3} s")),
+        r.delivered_end,
+        r.record.window_limited.as_secs_f64(),
+        r.record.floor.as_secs_f64(),
+        r.record.floor_lossless.as_secs_f64(),
+        readings.join(" "),
+        probes.join(" "),
+        min_rtt.join(" "),
+    );
+}
+
+/// A connection that is idle for 5 s or 15 s between two bulk transfers, on
+/// a clean line, on lines that drop 0.15 and 0.23, and with the RTT raised
+/// from 85 to 150 ms during the idle span.
+#[test]
+fn an_idle_gap_between_two_transfers() {
+    for gap in [5, 15] {
+        for (name, drop_share, rtt_after) in [
+            ("clean", 0.0, None),
+            ("0.15", 0.15, None),
+            ("0.23", 0.23, None),
+            ("clean, RTT 150 ms after", 0.0, Some(150)),
+            ("0.15, RTT 150 ms after", 0.15, Some(150)),
+        ] {
+            for seed in SEEDS {
+                let sc = idle_gap(gap, drop_share, rtt_after, seed);
+                let name = format!("gap {gap} s, {name}");
+                let r = run(&format!("idle {name}"), sc, false);
+                print_resumed(&name, &sc, &r);
+            }
+        }
     }
 }
 
