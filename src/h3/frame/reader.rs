@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use tokio::task::coop::cooperative;
 
 use super::{BufferBudget, Error, FrameDecoder, Item, StreamKind};
 use crate::h3::error::{Code, Violation};
@@ -232,15 +233,18 @@ impl FrameReader {
             // stream read before its request has been accepted gets; a
             // slot-full once it is on. Neither touches `self` until it
             // completes, so dropping this future here loses nothing.
+            //
+            // Each read is charged to tokio's cooperative budget, as a tokio
+            // socket read is: quinn's reads charge nothing. A peer can keep a
+            // stream supplied, since reading it returns flow-control credit,
+            // and a loop over this would then never return `Pending`. A task
+            // that loop wakes waits in the worker's LIFO slot, which no other
+            // worker takes from, until it does.
             let taken = match &mut self.ahead {
-                None => self
-                    .recv
-                    .read_chunk(usize::MAX, true)
+                None => cooperative(self.recv.read_chunk(usize::MAX, true))
                     .await?
                     .map(|chunk| self.decoder.push(chunk.bytes)),
-                Some(ahead) => self
-                    .recv
-                    .read_chunks(&mut ahead.slots)
+                Some(ahead) => cooperative(self.recv.read_chunks(&mut ahead.slots))
                     .await?
                     .map(|filled| {
                         ahead.next = 0;
@@ -568,6 +572,65 @@ mod tests {
         );
         let ahead = reader.ahead.as_ref().expect("a tunnel reads ahead");
         assert!(ahead.slots.iter().all(Bytes::is_empty));
+    }
+
+    /// One poll of a loop over [`FrameReader::next`] returns `Pending` before it
+    /// has taken everything quinn holds, once it has used up the task's budget.
+    ///
+    /// A request-mode reader takes one chunk per read, and every chunk here is
+    /// under 1.5 KB, so the 510 KB of body are far more than the 128 reads of
+    /// one budget. A loop that read the stream without charging the budget
+    /// would take all of it in one poll.
+    #[tokio::test]
+    async fn one_poll_of_a_reading_loop_stops_at_the_budget() {
+        let (wire, payload) = loopback::numbered_frames(255, 2000);
+        let mut upload = loopback::Upload::start(&wire).await;
+        let mut reader =
+            FrameReader::on_request_stream(upload.take_recv(), BufferBudget::unshared());
+
+        // Inside a task of its own, so the poll runs with a whole budget.
+        let (first, second) = tokio::spawn(async move {
+            let delivered = std::sync::atomic::AtomicUsize::new(0);
+            let mut reading = std::pin::pin!(async {
+                loop {
+                    match reader.next().await {
+                        Ok(Some(Item::Data(data))) => {
+                            delivered.fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                        other => panic!("expected DATA, got {other:?}"),
+                    }
+                }
+            });
+            let mut poll_once = async || {
+                let polled =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(reading.as_mut().poll(cx)))
+                        .await;
+                assert!(polled.is_pending(), "the loop never ends");
+                delivered.load(std::sync::atomic::Ordering::Relaxed)
+            };
+
+            let first = poll_once().await;
+            // A new poll of this task starts with a new budget.
+            tokio::task::yield_now().await;
+            let second = poll_once().await;
+            (first, second)
+        })
+        .await
+        .expect("the reading task");
+
+        assert!(
+            first > 0,
+            "the first poll must read something, or the bound proves nothing"
+        );
+        assert!(
+            first < payload.len(),
+            "one poll read {first} of the {} bytes quinn held",
+            payload.len()
+        );
+        assert!(
+            second > first,
+            "the second poll must read more: {first} then {second}"
+        );
     }
 }
 

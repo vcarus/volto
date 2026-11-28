@@ -426,7 +426,8 @@ async fn serve_qpack(handle: &Handle, mut recv: quinn::RecvStream, kind: QpackSt
     // ending needs no arm of its own: `close_reason` is `Some` by then, which
     // is exactly the exemption.
     let ended = loop {
-        let chunk = match recv.read_chunk(usize::MAX, true).await {
+        // Charged to tokio's budget for the reason `FrameReader::next` gives.
+        let chunk = match tokio::task::coop::cooperative(recv.read_chunk(usize::MAX, true)).await {
             Ok(Some(chunk)) => chunk,
 
             Ok(None) => break format!("the peer closed its QPACK {} stream", kind.name()),
@@ -1013,5 +1014,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// One poll of [`serve_qpack`] stops at the task's budget, however much of
+    /// the stream quinn holds.
+    ///
+    /// The stream carries 510 KB of one-byte Stream Cancellations and then its
+    /// FIN, so the loop returns only at the end. Read one chunk of under 1.5 KB
+    /// at a time, that is far more than the 128 reads of one budget. A loop
+    /// that did not charge the budget would reach the end in its first poll.
+    #[tokio::test]
+    async fn one_poll_of_a_qpack_stream_stops_at_the_budget() {
+        let (client, server) =
+            crate::quic::tests::loopback_pair(quinn::TransportConfig::default()).await;
+        let mut send = client.open_uni().await.expect("open the stream");
+        // Above the barrier stream's default of 0, so quinn sends every byte
+        // of this stream before the barrier's byte.
+        send.set_priority(1).expect("set the stream priority");
+        // Stream Cancellation for stream 0 (RFC 9204 §4.4.2), which this
+        // server accepts and reads past.
+        send.write_all(&vec![0x40; 510_000])
+            .await
+            .expect("write the instructions");
+        send.finish().expect("finish the stream");
+        let recv = server.accept_uni().await.expect("accept the stream");
+        // Read nothing, and wait until every byte and the FIN are in quinn.
+        let mut barrier = client.open_uni().await.expect("open the barrier");
+        barrier.write_all(&[0]).await.expect("write the barrier");
+        barrier.finish().expect("finish the barrier");
+        let mut seen = server.accept_uni().await.expect("accept the barrier");
+        tokio::time::timeout(std::time::Duration::from_secs(5), seen.read_to_end(1))
+            .await
+            .expect("the barrier must arrive")
+            .expect("read the barrier");
+
+        let handle = Handle::for_tests(server.clone());
+        // Inside a task of its own, so each poll runs with a whole budget.
+        let polls = tokio::spawn(async move {
+            let mut serving = std::pin::pin!(serve_qpack(&handle, recv, QpackStream::Decoder));
+            let mut polls = 0;
+            loop {
+                polls += 1;
+                let polled =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(serving.as_mut().poll(cx)))
+                        .await;
+                if polled.is_ready() || polls == 1000 {
+                    return polls;
+                }
+                // A new poll of this task starts with a new budget.
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the serving task");
+
+        assert!(
+            polls > 1,
+            "one poll read the whole stream, past 510 KB, to its end"
+        );
+        assert!(
+            polls < 1000,
+            "the loop must make progress on every poll and reach the end"
+        );
     }
 }
