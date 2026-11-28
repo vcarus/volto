@@ -2526,6 +2526,7 @@ fn the_script_documents_itself() {
         "--replace-binary",
         "--ech-public-name",
         "Re-running is safe",
+        "sing-box outbound",
     ] {
         assert!(
             usage.contains(expected),
@@ -2614,4 +2615,322 @@ fn a_rollback_on_a_host_with_a_key_and_no_certificate_puts_the_old_key_back() {
             "{name}: no new or backup file may stay behind, found {leftovers:?}: {stderr}"
         );
     }
+}
+
+/// Whether a `python3` is on `PATH`. The tests that need one say so and are
+/// skipped without it, as the terminal test above is.
+fn python3_on_path(test: &str) -> bool {
+    match Command::new("python3").arg("--version").output() {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("{test} skipped: no python3 on PATH");
+            false
+        }
+        Err(error) => panic!("python3 must be runnable: {error}"),
+    }
+}
+
+/// The sing-box outbound the report printed, read by Python's `json` module
+/// and written back with its keys sorted and its non-ASCII characters as they
+/// are, so a test can compare it with [`expected_sing_box_outbound`].
+///
+/// The object is the lines from `  {` to `  }` after the report's
+/// `sing-box outbound` heading. A run on a terminal ends its lines in `\r\n`.
+fn printed_sing_box_outbound(root: &Path, stdout: &str) -> String {
+    let lines: Vec<&str> = stdout
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    let heading = lines
+        .iter()
+        .position(|line| line.starts_with("sing-box outbound"))
+        .unwrap_or_else(|| panic!("the report must print a sing-box outbound: {stdout}"));
+    let open = heading
+        + lines[heading..]
+            .iter()
+            .position(|line| *line == "  {")
+            .unwrap_or_else(|| panic!("the outbound must open with `  {{`: {stdout}"));
+    let close = open
+        + lines[open..]
+            .iter()
+            .position(|line| *line == "  }")
+            .unwrap_or_else(|| panic!("the outbound must close with `  }}`: {stdout}"));
+    let object = root.join("outbound.json");
+    fs::write(&object, lines[open..=close].join("\n")).expect("the object must be writable");
+
+    let output = run_within_deadline(
+        Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                "import json, sys\n\
+                 with open(sys.argv[1], encoding='utf-8') as f:\n\
+                 \x20   print(json.dumps(json.load(f), sort_keys=True, ensure_ascii=False))",
+            ])
+            .arg(&object)
+            .stdin(Stdio::null()),
+    );
+    assert!(
+        output.status.success(),
+        "the printed outbound must be valid JSON: {}\n{}",
+        stderr_of(&output),
+        lines[open..=close].join("\n")
+    );
+    stdout_of(&output).trim_end().to_owned()
+}
+
+/// The outbound the report must print, in the form
+/// [`printed_sing_box_outbound`] gives. No value here needs a JSON escape: the
+/// tests choose them so, and the installer refuses `"` and `\` in a
+/// credential.
+fn expected_sing_box_outbound(
+    server: &str,
+    username: &str,
+    password: &str,
+    pin: &str,
+    ech_list: Option<&str>,
+) -> String {
+    let ech = ech_list.map_or(String::new(), |list| {
+        format!(
+            "\"ech\": {{\"config\": [\"-----BEGIN ECH CONFIGS-----\", \"{list}\", \
+             \"-----END ECH CONFIGS-----\"], \"enabled\": true}}, "
+        )
+    });
+    format!(
+        "{{\"disable_version_fallback\": true, \"password\": \"{password}\", \
+         \"server\": \"{server}\", \"server_port\": 443, \"tag\": \"volto\", \
+         \"tls\": {{\"certificate_sha256\": [\"{pin}\"], {ech}\"enabled\": true, \
+         \"server_name\": \"volto.test\"}}, \"type\": \"http\", \
+         \"username\": \"{username}\", \"version\": 3}}"
+    )
+}
+
+/// The address the Surge policy line names, which the outbound names too.
+fn policy_line_address(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("volto = masque, "))
+        .and_then(|rest| rest.split(", ").next())
+        .unwrap_or_else(|| panic!("the report must print the policy line: {stdout}"))
+        .to_owned()
+}
+
+/// Standard padded base64 (RFC 4648 section 4), written out here so the test
+/// does not compute the pin the way the installer does.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, byte)| n | u32::from(*byte) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                let index = usize::try_from((n >> (18 - 6 * i)) & 63).expect("six bits");
+                out.push(char::from(ALPHABET[index]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// sing-box's `certificate_sha256` for the certificate the install wrote: the
+/// base64 SHA-256 of its DER encoding.
+fn certificate_pin(root: &Path) -> String {
+    use rustls_pki_types::CertificateDer;
+    use rustls_pki_types::pem::PemObject;
+
+    let der = CertificateDer::from_pem_file(root.join("etc/volto/cert.pem"))
+        .expect("the installed certificate must be PEM");
+    base64_encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &der).as_ref())
+}
+
+/// The pin is checked against a known value, so a wrong encoder here cannot
+/// agree with a wrong one in the installer.
+#[test]
+fn the_test_base64_encoder_matches_rfc_4648() {
+    for (input, encoded) in [
+        ("", ""),
+        ("f", "Zg=="),
+        ("fo", "Zm8="),
+        ("foo", "Zm9v"),
+        ("foob", "Zm9vYg=="),
+        ("fooba", "Zm9vYmE="),
+        ("foobar", "Zm9vYmFy"),
+    ] {
+        assert_eq!(base64_encode(input.as_bytes()), encoded, "{input:?}");
+    }
+}
+
+/// After the Surge policy line the report prints a sing-box `http` outbound:
+/// valid JSON, HTTP/3 with no fallback, and the certificate pinned by the
+/// base64 SHA-256 sing-box's `certificate_sha256` takes, which is the
+/// fingerprint the report prints in hex. Without a terminal the password is a
+/// pointer to the config, as on the policy line, and without an ECH key there
+/// is no `ech` object.
+#[test]
+fn the_report_prints_a_sing_box_outbound_that_pins_the_certificate() {
+    if !python3_on_path("the_report_prints_a_sing_box_outbound_that_pins_the_certificate") {
+        return;
+    }
+    let root = host_root("sing-box-outbound");
+    let stubs = plant_root_stubs(&root, 0, "active");
+
+    let output = run_full_install_with_stubs(&root, &stubs, &["--sni", "volto.test"]);
+
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let config = root.join("etc/volto/config.toml");
+    assert_eq!(
+        printed_sing_box_outbound(&root, &stdout),
+        expected_sing_box_outbound(
+            &policy_line_address(&stdout),
+            "alice",
+            &format!("<as in {}>", config.display()),
+            &certificate_pin(&root),
+            None,
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("correct-horse-battery"),
+        "the password reached a stdout that is not a terminal:\n{stdout}"
+    );
+}
+
+/// With an ECH key and no terminal, the outbound's `ech.config` names the
+/// command that prints the list, inside the PEM lines sing-box takes, and the
+/// list itself is printed nowhere.
+#[test]
+fn without_a_terminal_the_sing_box_outbound_names_where_the_ech_list_is() {
+    if !python3_on_path("without_a_terminal_the_sing_box_outbound_names_where_the_ech_list_is") {
+        return;
+    }
+    let root = host_root("sing-box-ech-pipe");
+    let stubs = plant_root_stubs(&root, 0, "active");
+    let key = root.join("etc/volto/ech.pem");
+
+    let output = run_full_install_with_stubs(
+        &root,
+        &stubs,
+        &["--sni", "volto.test", "--ech-public-name", ECH_PUBLIC_NAME],
+    );
+
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let config = root.join("etc/volto/config.toml");
+    assert_eq!(
+        printed_sing_box_outbound(&root, &stdout),
+        expected_sing_box_outbound(
+            &policy_line_address(&stdout),
+            "alice",
+            &format!("<as in {}>", config.display()),
+            &certificate_pin(&root),
+            Some(&format!("<run: volto ech-config {}>", key.display())),
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains(&ech_config_list(&key)),
+        "the list reached a stdout that is not a terminal:\n{stdout}"
+    );
+}
+
+/// On a terminal the outbound carries the password and the ECHConfigList, and
+/// it stays valid JSON for credentials made of the characters the installer
+/// accepts that mean something to a shell, to JSON or to a terminal: every
+/// printable character but `"`, `\`, a comma and whitespace, and non-ASCII
+/// letters.
+#[test]
+fn on_a_terminal_the_sing_box_outbound_carries_the_secrets_as_valid_json() {
+    if !python3_on_path("on_a_terminal_the_sing_box_outbound_carries_the_secrets_as_valid_json") {
+        return;
+    }
+    const USERNAME: &str = "\u{e1}l*ce|&;<>!";
+    const PASSWORD: &str = "p@ss/w*rd'$(x)`{}[]#%^~?=+\u{fc}";
+    let root = host_root("sing-box-terminal");
+    let stubs = plant_root_stubs(&root, 0, "active");
+    let mut command = Command::new("python3");
+    command
+        .args([
+            "-c",
+            "import os, pty, sys\n\
+             sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))",
+        ])
+        .arg(real_tool("bash"))
+        .arg(installer_script())
+        .args([
+            "--binary",
+            real_binary().to_str().expect("a UTF-8 path to the binary"),
+            "-u",
+            USERNAME,
+            "-w",
+            PASSWORD,
+            "--sni",
+            "volto.test",
+            "--ech-public-name",
+            ECH_PUBLIC_NAME,
+        ]);
+    in_the_checkout_without_installer_variables(&mut command);
+    command
+        .env("VOLTO_INSTALL_ROOT", &*root)
+        .env("PATH", path_with_stubs(&stubs));
+
+    let output = run_within_deadline(&mut command);
+
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}\n{}", stderr_of(&output));
+    let list = ech_config_list(&root.join("etc/volto/ech.pem"));
+    assert_eq!(
+        printed_sing_box_outbound(&root, &stdout),
+        expected_sing_box_outbound(
+            &policy_line_address(&stdout),
+            USERNAME,
+            PASSWORD,
+            &certificate_pin(&root),
+            Some(&list),
+        ),
+        "{stdout}"
+    );
+}
+
+/// A credential read back from a config edited by hand can hold a TOML escape,
+/// which the installer does not decode. The outbound then names the config in
+/// its place rather than print a value that is not the credential, and stays
+/// valid JSON.
+#[test]
+fn a_toml_escape_in_the_config_is_not_copied_into_the_sing_box_outbound() {
+    if !python3_on_path("a_toml_escape_in_the_config_is_not_copied_into_the_sing_box_outbound") {
+        return;
+    }
+    let root = configured_root("sing-box-toml-escape", "");
+    let config = root.join("etc/volto/config.toml");
+    let text = fs::read_to_string(&config).expect("the planted config");
+    fs::write(
+        &config,
+        text.replace("username = \"user1\"", "username = \"us\\u0065r1\""),
+    )
+    .expect("the config must be writable");
+    let stubs = plant_root_stubs(&root, 0, "active");
+
+    // --force, because the planted certificate is a placeholder with no pin.
+    let output = run_full_install_with_stubs(&root, &stubs, &["--sni", "volto.test", "--force"]);
+
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let placeholder = format!("<as in {}>", config.display());
+    assert_eq!(
+        printed_sing_box_outbound(&root, &stdout),
+        expected_sing_box_outbound(
+            &policy_line_address(&stdout),
+            &placeholder,
+            &placeholder,
+            &certificate_pin(&root),
+            None,
+        ),
+        "{stdout}"
+    );
 }
