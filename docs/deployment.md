@@ -996,8 +996,9 @@ which is the protocol volto serves to Surge. The server needs no setting for
 it. sing-box 1.14 and older have no HTTP/3 in this outbound and cannot
 connect.
 
-The installer prints the outbound for its host at the end of every run. Written
-by hand, for a server with a self-signed certificate:
+The installer prints the outbound for its host at the end of every run, in
+releases after v1.8.8. Written by hand, for a server with a self-signed
+certificate:
 
 ```json
 {

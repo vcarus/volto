@@ -46,7 +46,7 @@ It finishes by printing a ready-to-paste Surge policy line:
 volto = masque, 203.0.113.10, 443, sni=volto.internal, server-cert-fingerprint-sha256=AA:BB:…:FF, username=yourname, password=…
 ```
 
-Below it the same run prints the server as a [sing-box](docs/deployment.md#sing-box) `http` outbound, a JSON object to paste into `outbounds`, for sing-box 1.15.0 or newer.
+Below it the same run prints the server as a [sing-box](docs/deployment.md#sing-box) `http` outbound, a JSON object to paste into `outbounds`, for sing-box 1.15.0 or newer. The installer has this in releases after v1.8.8.
 
 > **The fingerprint is the trust anchor:** carry it to the client over a channel you trust and never replace it with `skip-cert-verify`, for the reasons under [Self-signed with fingerprint pinning](docs/deployment.md#self-signed-with-fingerprint-pinning). For a public-CA certificate instead, see [Certificates](docs/deployment.md#certificates).
 
