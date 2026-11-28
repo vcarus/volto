@@ -42,6 +42,11 @@ SNI="${SNI:-volto.internal}"
 PORT="${PORT:-443}"
 USERNAME="${USERNAME:-surge}"
 PASSWORD="${PASSWORD:-}"
+# Empty means no ECH. Whether it was given is remembered apart from the value,
+# so that an empty name on the command line is refused and not read as no ECH.
+ECH_GIVEN=0
+[ -z "${ECH_PUBLIC_NAME:-}" ] || ECH_GIVEN=1
+ECH_PUBLIC_NAME="${ECH_PUBLIC_NAME:-}"
 FORCE=0
 REPLACE_BINARY=0
 PRINT_CONFIG=0
@@ -60,6 +65,7 @@ CONF_DIR="$ROOT/etc/volto"
 CONF="$CONF_DIR/config.toml"
 CERT="$CONF_DIR/cert.pem"
 KEY="$CONF_DIR/key.pem"
+ECH_KEY="$CONF_DIR/ech.pem"
 SERVICE_NAME=volto
 BIN="$ROOT/usr/local/bin/volto"
 UNIT="$ROOT/etc/systemd/system/$SERVICE_NAME.service"
@@ -81,6 +87,13 @@ Options:
   -p, --port PORT      UDP port to listen on     (default: 443)
   -u, --username NAME  proxy username            (default: surge)
   -w, --password PASS  proxy password            (default: generated)
+  -e, --ech-public-name NAME
+                       also set up Encrypted Client Hello on a first install:
+                       generate the ECH key /etc/volto/ech.pem with this public
+                       name, point the config at it, and put ech-config on the
+                       policy line. The public name is the one name an
+                       observer still sees, so choose a host name that says
+                       nothing about this server. Needs volto 1.6.0 or newer
   -f, --force          regenerate the certificate even if one exists, and
                        reload the service so it serves the new one
       --replace-binary on a host that already has /etc/volto/config.toml,
@@ -97,8 +110,9 @@ Options:
   -h, --help           show this help
 
 Every option can also be given as an environment variable: BINARY, SNI, PORT,
-USERNAME, PASSWORD. VOLTO_INSTALL_ROOT prefixes every path this script installs
-into (/etc/volto, /etc/systemd/system, /usr/local/bin); it exists for the tests.
+USERNAME, PASSWORD, ECH_PUBLIC_NAME. VOLTO_INSTALL_ROOT prefixes every path
+this script installs into (/etc/volto, /etc/systemd/system, /usr/local/bin); it
+exists for the tests.
 
 The username must not contain a colon (RFC 7617) and must be at most 32 bytes.
 That bound is volto's, not this script's -- the binary refuses a longer user-id
@@ -128,6 +142,9 @@ installed. --force regenerates the certificate only; it never rewrites
 config.toml, so edits you made there survive. Note that regenerating the
 certificate changes the fingerprint, so every client has to be updated.
 --replace-binary is the one way this script replaces an installed binary.
+--ech-public-name writes nothing on such a host either: the run prints the
+steps that add an ECH key to an existing config. Once the config names an ECH
+key, every run prints the policy line with its ech-config.
 USAGE
 }
 
@@ -177,6 +194,16 @@ check_credentials() {
     esac
 }
 
+# Whether $1 is a host name by this script's rule: dot-separated labels of
+# ASCII letters, digits and inner hyphens, each at most 63 bytes, at most 253
+# in all, and a last label that is not all digits, so no IPv4 address passes.
+# In the C locale, so the ranges are ASCII and the length is in bytes.
+is_host_name() {
+    local LC_ALL=C
+    local label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    [ "${#1}" -le 253 ] && [[ "$1" =~ ^($label\.)*$label$ ]] && ! [[ "${1##*.}" =~ ^[0-9]+$ ]]
+}
+
 # --- arguments --------------------------------------------------------------
 
 while [ $# -gt 0 ]; do
@@ -186,6 +213,9 @@ while [ $# -gt 0 ]; do
         -p|--port)     [ $# -ge 2 ] || die "$1 needs a value"; PORT="$2"; shift 2 ;;
         -u|--username) [ $# -ge 2 ] || die "$1 needs a value"; USERNAME="$2"; shift 2 ;;
         -w|--password) [ $# -ge 2 ] || die "$1 needs a value"; PASSWORD="$2"; shift 2 ;;
+        -e|--ech-public-name)
+                       [ $# -ge 2 ] || die "$1 needs a value"
+                       ECH_PUBLIC_NAME="$2"; ECH_GIVEN=1; shift 2 ;;
         -f|--force)    FORCE=1; shift ;;
         --replace-binary) REPLACE_BINARY=1; shift ;;
         --print-config) PRINT_CONFIG=1; shift ;;
@@ -205,7 +235,8 @@ EXAMPLE_SRC="$SCRIPT_DIR/config.example.toml"
 # Derives the installed config from the shipped example, so the generated file
 # keeps every comment explaining the keys it does not touch. Only four lines are
 # replaced, each matched from the start of the line so a value cannot match a
-# comment or the commented-out second user.
+# comment or the commented-out second user. With --ech-public-name a fifth is:
+# the example's commented `#ech_key` line becomes the key this run generates.
 #
 # Shell builtins only, here and in verify_config: the password must never be
 # an argument of another program, because every local user can read a
@@ -221,6 +252,12 @@ generate_config() {
             'key = '*) printf 'key = "%s"\n' "$KEY" ;;
             '  { username = '*)
                 printf '  { username = "%s", password = "%s" },\n' "$USERNAME" "$PASSWORD" ;;
+            '#ech_key = '*)
+                if [ "$ECH_GIVEN" -eq 1 ]; then
+                    printf 'ech_key = "%s"\n' "$ECH_KEY"
+                else
+                    printf '%s\n' "$line"
+                fi ;;
             *) printf '%s\n' "$line" ;;
         esac
     done <"$EXAMPLE_SRC"
@@ -237,6 +274,8 @@ verify_config() {
     [[ "$text" == *$'\n'"key = \"$KEY\""$'\n'* ]] || die "failed to set key in the config"
     [[ "$text" == *$'\n'"  { username = \"$USERNAME\", password = \"$PASSWORD\" },"$'\n'* ]] ||
         die "failed to set the user in the config"
+    [ "$ECH_GIVEN" -eq 0 ] || [[ "$text" == *$'\n'"ech_key = \"$ECH_KEY\""$'\n'* ]] ||
+        die "failed to set ech_key in the config"
     [[ "$text" != *'replace-me-with-something-long'* ]] ||
         die "the example placeholder password survived; refusing to install this config"
 }
@@ -462,6 +501,17 @@ if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
     die "port out of range: $PORT"
 fi
 
+# The public name is checked here for the same reason, and so that a name the
+# key generator would refuse stops the run before the certificate is made.
+# `volto ech-keygen` applies its own rule when it writes the key (RFC 9849,
+# section 6.1.7); the second test below is the part of that rule the host-name
+# rule above does not have, a last label that reads as a hexadecimal number.
+if [ "$ECH_GIVEN" -eq 1 ]; then
+    if ! is_host_name "$ECH_PUBLIC_NAME" || [[ "${ECH_PUBLIC_NAME##*.}" =~ ^0[xX][0-9A-Fa-f]*$ ]]; then
+        die "the ECH public name must be a host name (letters, digits, hyphens and dots, not ending in a number), got: $ECH_PUBLIC_NAME"
+    fi
+fi
+
 # Both flags below stop after the config has been generated, and both reach it
 # through the same temporary file the install path writes. That is what puts
 # generate_config, verify_config and check_generated_config within reach of the
@@ -525,6 +575,15 @@ if [ "$HAD_CONFIG" -eq 1 ] && [ "$PLACE_BINARY" -eq 1 ]; then
     check_existing_config
 fi
 
+# A first install with --ech-public-name has $BINARY generate the key. A volto
+# from before `ech-keygen` cannot, and is refused here, before the certificate
+# is made. The help text is read for the flag, the way ask_binary reads it for
+# --check-config: an old binary may exit 0 on arguments it does not know.
+if [ "$ECH_GIVEN" -eq 1 ] && [ "$HAD_CONFIG" -eq 0 ]; then
+    [[ "$("$BINARY" ech-keygen --help 2>/dev/null || true)" == *--public-name* ]] ||
+        die "$BINARY has no ech-keygen subcommand, so it cannot generate an ECH key: --ech-public-name needs volto 1.6.0 or newer"
+fi
+
 # A run with no terminal on stdout is the update timer's (its output goes to
 # the journal) or another program's. Where the config is missing on a host that
 # already has a binary or a unit, generating a password would replace the one
@@ -550,18 +609,9 @@ fi
 # The name goes into openssl's -subj and -addext arguments and into the printed
 # policy line, where a comma adds a second subjectAltName entry (an IP address
 # among them) and a slash a subject field. So it must be a host name by our
-# rule: dot-separated labels of ASCII letters, digits and inner hyphens, each
-# at most 63 bytes, at most 253 in all, and a last label that is not all
-# digits, so no IPv4 address passes. In the C locale, so the ranges are ASCII
-# and the length is in bytes.
-check_sni() {
-    local LC_ALL=C
-    local label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
-    if [ "${#SNI}" -gt 253 ] || ! [[ "$SNI" =~ ^($label\.)*$label$ ]] || [[ "${SNI##*.}" =~ ^[0-9]+$ ]]; then
-        die "the certificate name must be a host name (letters, digits, hyphens and dots, not ending in a number), got: $SNI"
-    fi
-}
-check_sni
+# rule, which is_host_name states.
+is_host_name "$SNI" ||
+    die "the certificate name must be a host name (letters, digits, hyphens and dots, not ending in a number), got: $SNI"
 
 echo "==> installing volto (self-signed, sni=$SNI, port=$PORT)"
 
@@ -763,8 +813,39 @@ if [ -f "$CONF" ]; then
     # Its content is kept; its owner and mode become those of the new layout.
     chown root:volto "$CONF"
     chmod 0640 "$CONF"
+    if [ "$ECH_GIVEN" -eq 1 ]; then
+        note "--ech-public-name writes nothing on a host that has a config. To add ECH to it:"
+        note "  volto ech-keygen --public-name $ECH_PUBLIC_NAME --out $ECH_KEY"
+        note "  chgrp volto $ECH_KEY && chmod 0640 $ECH_KEY"
+        note "  set ech_key = \"$ECH_KEY\" under [server] in $CONF"
+        note "  systemctl reload $SERVICE_NAME"
+        note "then run this script again: it prints the policy line with ech-config"
+    fi
 else
     [ -n "$PASSWORD" ] || PASSWORD="$(openssl rand -base64 18)"
+
+    # The ECH key comes before the config, because the config names it and the
+    # binary is asked below whether it can load that config. A key file left by
+    # an earlier run that stopped after this step is kept, as the certificate
+    # is. The list ech-keygen prints is discarded here: the report prints it,
+    # and only to a terminal.
+    if [ "$ECH_GIVEN" -eq 1 ]; then
+        refuse_unsafe_entry "$ECH_KEY"
+        if [ -f "$ECH_KEY" ]; then
+            note "ECH key already exists, keeping it with the public name it was made with"
+        else
+            "$BINARY" ech-keygen --public-name "$ECH_PUBLIC_NAME" --out "$ECH_KEY" >/dev/null ||
+                die "volto ech-keygen could not write $ECH_KEY; no configuration was written"
+            note "generated an ECH key with the public name $ECH_PUBLIC_NAME"
+        fi
+        chown root:volto "$ECH_KEY"
+        chmod 0640 "$ECH_KEY"
+    elif [ -f "$ECH_KEY" ]; then
+        # A config deleted to be regenerated, on a host that had ECH: the new
+        # file would leave the key unused, and every client that sends ECH out.
+        note "$ECH_KEY exists and the new config will not name it, so ECH is off;"
+        note "run with --ech-public-name to keep that key in use (the key keeps its own name)"
+    fi
 
     tmp="$(mktemp)"
     # shellcheck disable=SC2064  # $tmp must expand now, not at trap time.
@@ -960,6 +1041,28 @@ if [ -z "$conf_username" ] || [ -z "$conf_password" ]; then
     [ -n "$conf_password" ] || conf_password="<unknown>"
 fi
 
+# The ECH key the config names, if it names one, read the way the user line
+# is. A commented line starts with `#` and does not match, and `ech_previous_key`
+# does not either. The list itself is as private as the password, so the
+# installed binary is asked for it only when a terminal will show it. Anything
+# but a base64 value, which an installed binary from before `ech-config` or an
+# unreadable key file gives, prints as the command that produces the list.
+conf_ech_key=""
+ech_key_line='^[[:space:]]*ech_key[[:space:]]*=[[:space:]]*"([^"]*)"'
+while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ $ech_key_line ]]; then
+        conf_ech_key="${BASH_REMATCH[1]}"
+        break
+    fi
+done <"$CONF" || true
+ech_part=""
+if [ -n "$conf_ech_key" ]; then
+    ech_list=""
+    [ ! -t 1 ] || ech_list="$("$BIN" ech-config "$conf_ech_key" 2>/dev/null || true)"
+    [[ "$ech_list" =~ ^[A-Za-z0-9+/]+=*$ ]] || ech_list="<run: volto ech-config $conf_ech_key>"
+    ech_part="ech-config=$ech_list, "
+fi
+
 echo
 echo "==> done"
 echo "service:     $SERVICE_NAME is $status  (journalctl -u $SERVICE_NAME -f)"
@@ -975,13 +1078,18 @@ if [ -t 1 ]; then
 else
     shown_password="<as in $CONF>"
 fi
-echo "  volto = masque, $address, $PORT, sni=$SNI, server-cert-fingerprint-sha256=${fingerprint#*=}, username=$conf_username, password=$shown_password"
+echo "  volto = masque, $address, $PORT, sni=$SNI, server-cert-fingerprint-sha256=${fingerprint#*=}, ${ech_part}username=$conf_username, password=$shown_password"
 echo
 echo "Security notes:"
 echo "  * The fingerprint above IS the trust anchor. Carry it to your device over a"
 echo "    channel you trust and type it in yourself. Never use skip-cert-verify instead."
 echo "  * $KEY must never leave this machine. There is no revocation: if it leaks,"
 echo "    regenerate with --force and update the fingerprint on every client."
+if [ -n "$conf_ech_key" ]; then
+    echo "  * Keep the ech-config value as private as the password. The server never"
+    echo "    publishes it, and with [security] require_ech = true it answers only a"
+    echo "    client that holds it."
+fi
 echo
 
 # After the report, so the fingerprint and the policy line are printed even when

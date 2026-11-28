@@ -181,6 +181,7 @@ fn the_script_documents_itself() {
         "--allow-unsigned",
         "--verify-signature",
         "--sni",
+        "--ech-public-name",
         "Re-running is safe",
     ] {
         assert!(
@@ -2553,6 +2554,8 @@ fn a_host_without_a_config_runs_the_bundled_installer() {
         UNSIGNED_TAG,
         "--sni",
         "volto.test",
+        "--ech-public-name",
+        "public.example",
     ]);
 
     let stderr = stderr_of(&output);
@@ -2564,8 +2567,10 @@ fn a_host_without_a_config_runs_the_bundled_installer() {
     let expected_start = format!("VOLTO_INSTALL_ROOT={} --binary ", host.root.display());
     assert!(
         installer.starts_with(&expected_start)
-            && installer
-                .ends_with("/volto-1.3.7-x86_64-unknown-linux-musl/volto --sni volto.test\n")
+            && installer.ends_with(
+                "/volto-1.3.7-x86_64-unknown-linux-musl/volto --sni volto.test \
+                     --ech-public-name public.example\n"
+            )
             && installer.lines().count() == 1,
         "the bundled installer must run once, under the relocated root, with the \
          release's binary and the first-install arguments: {installer:?}\n{stderr}"
