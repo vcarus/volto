@@ -260,7 +260,9 @@ three things the host needs:
 
 - **No install yet** (`/etc/volto/config.toml` absent): it runs the bundled
   `install-selfsigned.sh` for the full first-time setup, so the same flags and
-  environment variables apply (`--sni`, `--port`, `--username`, `--password`).
+  environment variables apply (`--sni`, `--port`, `--username`, `--password`,
+  and `--ech-public-name` for [Encrypted Client Hello](#encrypted-client-hello)
+  in the same run).
 - **Older version installed**: it asks the release it is about to install
   whether it can load this host's `/etc/volto/config.toml` and stops if it
   cannot (see [before the swap](#before-the-swap)); otherwise it keeps the
@@ -853,7 +855,29 @@ names the relay is judged like any other public address. See
 
 ECH is optional. Without a key the server runs plain TLS 1.3; with one, a client
 that holds the server's ECHConfigList sends its real server name encrypted, and
-only the key's public name travels in the clear. Generate the key on the host,
+only the key's public name travels in the clear.
+
+**On a first install the installer does it in the same run.** Give
+`--ech-public-name <name>` to `install-selfsigned.sh`, or to `deploy.sh`, which
+passes it on:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh |
+  sudo bash -s -- --enable-timer --username yourname --ech-public-name public.example
+```
+
+It generates `/etc/volto/ech.pem` with that public name, writes `ech_key` into
+the new `config.toml`, and prints the Surge policy line with `ech-config` in
+it. The list is printed only to a terminal, as the password is; a run without
+one prints the command that shows it. The option is in the installer of every
+release after v1.8.7, and an older installer refuses it as unknown. On a host
+that already has a `config.toml` the option writes nothing and the run prints
+the steps below, because that file is never rewritten. Once the config names an
+ECH key, by either route, every run of the installer prints the policy line
+with the current key's `ech-config`, which is also how to get the line again
+after a key rotation.
+
+**By hand, on a host that is already installed.** Generate the key on the host,
 so the private key never leaves it. `/etc/volto` belongs to root, so the key is
 written as root and given to the service's group, as the other files there are.
 `ech-keygen` run as root in that directory creates the file `root:volto` 0640

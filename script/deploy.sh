@@ -142,6 +142,11 @@ Options:
   -s, --sni NAME       first install only: passed to install-selfsigned.sh
   -p, --port PORT      first install only: passed to install-selfsigned.sh
   -u, --username NAME  first install only: passed to install-selfsigned.sh
+  -e, --ech-public-name NAME
+                       first install only: passed to install-selfsigned.sh,
+                       which then sets up Encrypted Client Hello too. The
+                       installer of a release up to v1.8.7 does not know the
+                       option and refuses it
   -w, --password PASS  first install only: passed to install-selfsigned.sh in
                        its environment. On this command line every local user
                        can read it while the run lasts, and sudo records the
@@ -150,10 +155,11 @@ Options:
   -h, --help           show this help
 
 REPO and TAG can also be given as environment variables, as can the
-install-selfsigned.sh variables (SNI, PORT, USERNAME, PASSWORD) on a first
-install. VOLTO_DEPLOY_ROOT prefixes every install path (/usr/local/bin,
-/etc/volto, /etc/systemd/system) and VOLTO_DEPLOY_CANDIDATE names the binary
-the config check runs; both exist for --dry-run tests.
+install-selfsigned.sh variables (SNI, PORT, USERNAME, PASSWORD,
+ECH_PUBLIC_NAME) on a first install. VOLTO_DEPLOY_ROOT prefixes every install
+path (/usr/local/bin, /etc/volto, /etc/systemd/system) and
+VOLTO_DEPLOY_CANDIDATE names the binary the config check runs; both exist for
+--dry-run tests.
 
 Re-running is safe: the version check turns a run with nothing new into a
 no-op, and the first-install path inherits install-selfsigned.sh's guarantees
@@ -645,7 +651,7 @@ while [ $# -gt 0 ]; do
         --verify-signature)
                         [ $# -ge 3 ] || die "$1 needs two values: SUMS and SIG"
                         VERIFY_ONLY=1; VERIFY_SUMS="$2"; VERIFY_SIG="$3"; shift 3 ;;
-        -s|--sni|-p|--port|-u|--username)
+        -s|--sni|-p|--port|-u|--username|-e|--ech-public-name)
                         [ $# -ge 2 ] || die "$1 needs a value"
                         INSTALL_ARGS+=("$1" "$2"); shift 2 ;;
         -w|--password)  [ $# -ge 2 ] || die "$1 needs a value"; PASSWORD="$2"; shift 2 ;;

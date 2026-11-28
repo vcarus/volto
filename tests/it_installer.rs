@@ -46,28 +46,33 @@ fn installer_script() -> PathBuf {
 /// `bash script`, run from the checkout with a null stdin and without any
 /// variable the installer reads from its environment.
 ///
-/// The installer takes `BINARY`, `SNI`, `PORT`, `USERNAME` and `PASSWORD` from
-/// the environment, and `VOLTO_INSTALL_ROOT` relocates it, so a shell that
+/// The installer takes `BINARY`, `SNI`, `PORT`, `USERNAME`, `PASSWORD` and
+/// `ECH_PUBLIC_NAME` from the environment, and `VOLTO_INSTALL_ROOT` relocates it, so a shell that
 /// exports one of them would change every run. A caller sets what it means.
 fn installer(script: &Path) -> Command {
     let mut command = Command::new(real_tool("bash"));
+    command.arg(script);
+    in_the_checkout_without_installer_variables(&mut command);
     command
-        .arg(script)
-        .current_dir(repo_root())
-        .stdin(Stdio::null());
+}
+
+/// Makes `command` run from the checkout with a null stdin and without the
+/// variables [`installer`] names.
+fn in_the_checkout_without_installer_variables(command: &mut Command) {
+    command.current_dir(repo_root()).stdin(Stdio::null());
     for variable in [
         "BINARY",
         "SNI",
         "PORT",
         "USERNAME",
         "PASSWORD",
+        "ECH_PUBLIC_NAME",
         "VOLTO_INSTALL_ROOT",
         "RUST_LOG",
         "JOURNAL_STREAM",
     ] {
         command.env_remove(variable);
     }
-    command
 }
 
 /// A stand-in for the host filesystem the installer writes into, carrying the
@@ -504,8 +509,10 @@ fn command_words(line: &str) -> Vec<&str> {
 
 /// The installer runs no tool by its absolute path, which a recorder on
 /// `PATH` cannot see, except the three that must be: `"$BINARY"`, the volto it
-/// was handed, asked for `--help` and `--check-config`; `"$BIN"`, the
-/// installed one, asked for `--version`; and `"$1"` in
+/// was handed, asked for `--help` and `--check-config` and, with
+/// `--ech-public-name`, for the ECH key (`ech-keygen`); `"$BIN"`, the
+/// installed one, asked for `--version` and for the ECHConfigList of the key
+/// the config names (`ech-config`); and `"$1"` in
 /// `check_config_as_the_unit`, which is `$BINARY` again. None of the three is
 /// given the password.
 ///
@@ -1880,6 +1887,308 @@ fn a_first_install_writes_the_root_owned_layout() {
     );
 }
 
+/// The public name the ECH tests give the installer.
+const ECH_PUBLIC_NAME: &str = "public.example";
+
+/// What is in `root`'s `/etc/volto`, by file name.
+fn conf_dir_entries(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(root.join("etc/volto"))
+        .expect("the config directory must be readable")
+        .map(|entry| {
+            entry
+                .expect("a directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The ECHConfigList the real binary prints for the key file `key`.
+fn ech_config_list(key: &Path) -> String {
+    let output = run_within_deadline(Command::new(real_binary()).arg("ech-config").arg(key));
+    assert!(
+        output.status.success(),
+        "volto ech-config must read the key the installer wrote: {}",
+        stderr_of(&output)
+    );
+    stdout_of(&output).trim().to_owned()
+}
+
+/// `--ech-public-name` turns the example's commented `ech_key` line into one
+/// that names the key file the install writes. Without the option the line
+/// stays a comment and the config sets no key.
+#[test]
+fn the_ech_option_points_the_generated_config_at_the_key_file() {
+    let with = generated_config(&["--ech-public-name", ECH_PUBLIC_NAME]);
+    let config: Config = toml::from_str(&with).expect("the generated config must parse");
+    assert_eq!(
+        config.server.ech_key.as_deref(),
+        Some(Path::new("/etc/volto/ech.pem")),
+        "the config must name the key file: {with}"
+    );
+
+    let without = generated_config(&[]);
+    let config: Config = toml::from_str(&without).expect("the generated config must parse");
+    assert_eq!(config.server.ech_key, None);
+    assert!(
+        without
+            .lines()
+            .any(|line| line == "#ech_key = \"/etc/volto/ech.pem\""),
+        "without the option the example's line must stay a comment: {without}"
+    );
+}
+
+/// A first install with `--ech-public-name` sets ECH up in one run: the key
+/// file beside the certificate, a config that names it and that the binary
+/// loads, and `ech-config` on the policy line. A later run without the option
+/// reads the key out of the config and prints the line with it again.
+///
+/// Without a terminal the list is not printed, for the reason the password is
+/// not: it is what lets a client in. The line then names the command that
+/// prints it.
+#[test]
+fn a_first_install_with_the_ech_option_sets_up_ech_in_one_run() {
+    let root = host_root("ech-first");
+    let stubs = plant_root_stubs(&root, 0, "active");
+    let key = root.join("etc/volto/ech.pem");
+    let config_path = root.join("etc/volto/config.toml");
+
+    let output = run_full_install_with_stubs(
+        &root,
+        &stubs,
+        &["--sni", "volto.test", "--ech-public-name", ECH_PUBLIC_NAME],
+    );
+
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(
+        fs::metadata(&key)
+            .expect("the ECH key file must exist")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640,
+        "the service reads the key through its group"
+    );
+    let chown = fs::read_to_string(stubs.join("chown.log")).unwrap_or_default();
+    assert!(
+        chown.contains(&format!("root:volto {}\n", key.display())),
+        "the key must go to root:volto: {chown}"
+    );
+    let config: Config =
+        toml::from_str(&fs::read_to_string(&config_path).expect("the installed config"))
+            .expect("the installed config parses");
+    assert_eq!(config.server.ech_key.as_deref(), Some(key.as_path()));
+    let check = run_within_deadline(
+        Command::new(real_binary())
+            .arg("--check-config")
+            .arg("--config")
+            .arg(&config_path)
+            .env_remove("RUST_LOG"),
+    );
+    assert!(
+        check.status.success(),
+        "the binary must load the installed config with its ECH key: {}",
+        stderr_of(&check)
+    );
+    let list = ech_config_list(&key);
+    assert!(list.len() > 40, "an ECHConfigList in base64: {list:?}");
+    let placeholder = format!(
+        "ech-config=<run: volto ech-config {}>, username=",
+        key.display()
+    );
+    assert!(
+        stdout.contains(&placeholder),
+        "the policy line must carry ech-config and say where the list comes from: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&list),
+        "the list reached a stdout that is not a terminal:\n{stdout}"
+    );
+
+    let again = run_full_install_with_stubs(&root, &stubs, &["--sni", "volto.test"]);
+
+    assert!(again.status.success(), "{}", stderr_of(&again));
+    assert!(
+        stdout_of(&again).contains(&placeholder),
+        "a re-run must read the key out of the config: {}",
+        stdout_of(&again)
+    );
+    assert_eq!(ech_config_list(&key), list, "a re-run must keep the key");
+}
+
+/// On a terminal the policy line carries the ECHConfigList itself, and the
+/// password, ready to paste.
+///
+/// Every other test here runs the installer on a pipe, where both print as a
+/// pointer to where they are. Python's `pty.spawn` gives this run a terminal
+/// and copies what it prints. The test is skipped, with the reason printed,
+/// only when no `python3` is on `PATH`.
+#[test]
+fn on_a_terminal_the_policy_line_carries_the_ech_config_list() {
+    match Command::new("python3").arg("--version").output() {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipped: no python3 on PATH to give the installer a terminal");
+            return;
+        }
+        Err(error) => panic!("python3 must be runnable: {error}"),
+    }
+    let root = host_root("ech-terminal");
+    let stubs = plant_root_stubs(&root, 0, "active");
+    let mut command = Command::new("python3");
+    command
+        .args([
+            "-c",
+            "import os, pty, sys\n\
+             sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))",
+        ])
+        .arg(real_tool("bash"))
+        .arg(installer_script())
+        .args([
+            "--binary",
+            real_binary().to_str().expect("a UTF-8 path to the binary"),
+            "-u",
+            "alice",
+            "-w",
+            "correct-horse-battery",
+            "--sni",
+            "volto.test",
+            "--ech-public-name",
+            ECH_PUBLIC_NAME,
+        ]);
+    in_the_checkout_without_installer_variables(&mut command);
+    command
+        .env("VOLTO_INSTALL_ROOT", &*root)
+        .env("PATH", path_with_stubs(&stubs));
+
+    let output = run_within_deadline(&mut command);
+
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}\n{}", stderr_of(&output));
+    let list = ech_config_list(&root.join("etc/volto/ech.pem"));
+    let expected = format!("ech-config={list}, username=alice, password=correct-horse-battery");
+    assert!(
+        stdout.contains(&expected),
+        "a terminal must get the line with the list and the password in it: {stdout}"
+    );
+}
+
+/// A config regenerated on a host that has an ECH key, without the option,
+/// does not name the key, and the run says so: clients that send ECH would
+/// otherwise stop connecting with nothing printed about it.
+#[test]
+fn a_regenerated_config_that_leaves_an_ech_key_unused_is_pointed_out() {
+    let root = host_root("ech-unused");
+    let stubs = plant_root_stubs(&root, 0, "active");
+    let key = root.join("etc/volto/ech.pem");
+    fs::write(&key, "a key file from an earlier install\n").expect("the key must be writable");
+
+    let output = run_full_install_with_stubs(&root, &stubs, &["--sni", "volto.test"]);
+
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout.contains(&format!(
+            "{} exists and the new config will not name it",
+            key.display()
+        )) && stdout.contains("--ech-public-name"),
+        "the run must say that the key is left unused and how to keep it: {stdout}"
+    );
+    assert!(!stdout.contains("ech-config="), "{stdout}");
+}
+
+/// On a host that already has a config, `--ech-public-name` writes nothing:
+/// the config is the operator's, and the run says how to add ECH to it.
+#[test]
+fn the_ech_option_on_a_configured_host_writes_nothing_and_says_what_to_do() {
+    let root = configured_root("ech-configured", "");
+    let stubs = plant_root_stubs(&root, 0, "active");
+    let config_path = root.join("etc/volto/config.toml");
+    let before = fs::read(&config_path).expect("the planted config");
+    let entries = conf_dir_entries(&root);
+
+    let output =
+        run_full_install_with_stubs(&root, &stubs, &["--ech-public-name", ECH_PUBLIC_NAME]);
+
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(fs::read(&config_path).ok(), Some(before));
+    assert_eq!(conf_dir_entries(&root), entries, "no key file may appear");
+    assert!(
+        stdout.contains(&format!(
+            "ech-keygen --public-name {ECH_PUBLIC_NAME} --out "
+        )),
+        "the run must give the command that makes the key: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ech-config="),
+        "a config without an ECH key gives a policy line without ech-config: {stdout}"
+    );
+}
+
+/// A public name that is not a host name is refused before anything is
+/// generated, by the flags that stop early as well.
+#[test]
+fn a_public_name_that_is_not_a_host_name_is_refused_before_anything_is_written() {
+    for name in ["two words", "a..b", "-a.example", "192.0.2.1", ""] {
+        let (ok, config, stderr) = print_config(&["--ech-public-name", name]);
+        assert!(
+            !ok && config.is_empty() && stderr.contains("ECH public name"),
+            "{name:?} must be refused by name, with no config printed: {stderr}"
+        );
+    }
+
+    let root = host_root("ech-bad-name");
+    let stubs = plant_root_stubs(&root, 0, "active");
+
+    let output = run_full_install_with_stubs(&root, &stubs, &["--ech-public-name", "a..b"]);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("ECH public name"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(conf_dir_entries(&root), Vec::<String>::new());
+}
+
+/// A volto without `ech-keygen` cannot make the key, so the run stops before
+/// it writes anything, the certificate included.
+#[test]
+fn a_binary_without_ech_keygen_is_refused_before_anything_is_written() {
+    let root = host_root("ech-old-binary");
+    let stubs = plant_root_stubs(&root, 0, "active");
+    let old = plant_binary_without_the_flag(&root, "volto-old");
+
+    let output = run_within_deadline(
+        installer(&installer_script())
+            .args([
+                "--binary",
+                old.to_str().expect("a UTF-8 path to the binary"),
+                "-u",
+                "alice",
+                "-w",
+                "correct-horse-battery",
+                "--ech-public-name",
+                ECH_PUBLIC_NAME,
+            ])
+            .env("VOLTO_INSTALL_ROOT", &*root)
+            .env("PATH", path_with_stubs(&stubs)),
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("ech-keygen"),
+        "the refusal must name what the binary lacks: {}",
+        stderr_of(&output)
+    );
+    assert_eq!(conf_dir_entries(&root), Vec::<String>::new());
+}
+
 /// A symbolic link where the key belongs is refused, and the file it points at
 /// is not changed.
 ///
@@ -2215,6 +2524,7 @@ fn the_script_documents_itself() {
         "--print-config",
         "--check-config",
         "--replace-binary",
+        "--ech-public-name",
         "Re-running is safe",
     ] {
         assert!(
