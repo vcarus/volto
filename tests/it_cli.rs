@@ -1675,3 +1675,102 @@ fn a_filter_that_hides_warnings_does_not_hide_the_configuration_warnings() {
         }
     }
 }
+
+/// A reload's configuration warnings reach stderr as well when the filter in
+/// force hides WARN at the target the reload logs from.
+///
+/// The subscriber is built once at startup, so the filter in force is the one
+/// the server started with, whatever the reloaded file says. A reload that
+/// empties `[auth] users` makes the server an open proxy, and under
+/// `log.level = "error"` its warning would otherwise be written nowhere.
+/// `warn,volto::quic=error` shows WARN at startup and hides it at the reload's
+/// target. The test reads stderr until the copy arrives.
+#[test]
+fn a_filter_that_hides_warnings_does_not_hide_a_reloads_configuration_warnings() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixDatagram;
+
+    use rustix::process::{Pid, Signal, kill_process};
+
+    const WARNING: &str = "[auth].users is empty, so authentication is DISABLED";
+
+    for (name, level, journal, prefix) in [
+        ("error", "error", None, "warning: "),
+        (
+            "quic-journal",
+            "warn,volto::quic=error",
+            Some("8:12345"),
+            "<4>warning: ",
+        ),
+    ] {
+        let dir = scratch_tree("cli", &format!("reload-hidden-{name}"), &[]);
+        let socket = dir.join("notify");
+        let receiver = UnixDatagram::bind(&socket).expect("the notification socket must bind");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("a read timeout");
+        let mut env = vec![("NOTIFY_SOCKET", socket.as_os_str())];
+        if let Some(value) = journal {
+            env.push(("JOURNAL_STREAM", std::ffi::OsStr::new(value)));
+        }
+        let log = format!("[log]\nlevel = \"{level}\"\n");
+        let mut serving = Serving::start(&dir, &log, &env);
+        let stderr = serving.child.0.stderr.take().expect("stderr is piped");
+        let (sender, copies) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut buf = [0u8; 64];
+        let len = receiver
+            .recv(&mut buf)
+            .unwrap_or_else(|error| panic!("{name}: READY=1 must arrive within 20 s: {error}"));
+        assert_eq!(&buf[..len], b"READY=1", "{name}");
+
+        write_private(
+            &dir.join("config.toml"),
+            &format!(
+                "{}[auth]\nusers = []\n{log}",
+                server_section(
+                    &dir.join("cert.pem"),
+                    &dir.join("key.pem"),
+                    &serving.addr.to_string()
+                )
+            ),
+        );
+        kill_process(Pid::from_child(&serving.child.0), Signal::HUP)
+            .expect("SIGHUP must be deliverable");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = Vec::new();
+        let copy = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match copies.recv_timeout(left) {
+                Ok(line) if line.contains(WARNING) => break line,
+                Ok(line) => seen.push(line),
+                Err(_) => panic!(
+                    "{name}: no copy of the reload's warning on stderr within 20 s; \
+                     stderr so far:\n{}",
+                    seen.join("\n")
+                ),
+            }
+        };
+        assert!(
+            copy.starts_with(&format!("{prefix}{WARNING}")),
+            "{name}: the copy starts with {prefix:?}: {copy:?}"
+        );
+
+        let (status, lines, _) = serving.stop();
+        assert!(status.success(), "{name}: {status}");
+        assert!(
+            !lines.iter().any(|l| l.contains(WARNING)),
+            "{name}: the filter hides the log line:\n{}",
+            lines.join("\n")
+        );
+    }
+}

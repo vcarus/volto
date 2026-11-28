@@ -255,6 +255,47 @@ impl Config {
     }
 }
 
+/// Writes the configuration warnings to stderr when the log filter hides
+/// them, so that they reach the operator whatever the filter.
+///
+/// `shown` is whether the filter enables WARN at the target the caller's own
+/// warning lines carry. The caller asks, because `tracing::enabled!` judges
+/// the target of the place it is written. The filter is the one installed at
+/// startup, on a reload as well, because the subscriber is built once. The
+/// warnings say such things as "authentication is DISABLED", and an accepted
+/// filter such as `log.level = "error"` hides WARN, so without this copy a
+/// file that opens the proxy would leave no line anywhere.
+///
+/// One line each, `warning: ` first as `--check-config` writes them, and the
+/// warning priority `<4>` before that when journald reads stderr.
+pub fn copy_hidden_warnings(warnings: &[String], shown: bool) {
+    if shown {
+        return;
+    }
+    let journal = crate::systemd::logs_to_journal(
+        std::env::var_os(crate::systemd::JOURNAL_STREAM).as_deref(),
+    );
+    // Not `eprint!`, which panics when stderr cannot be written.
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        hidden_warnings_report(warnings, journal).as_bytes(),
+    );
+}
+
+/// The text [`copy_hidden_warnings`] writes, with the warning priority on
+/// each line when `journal` is true.
+fn hidden_warnings_report(warnings: &[String], journal: bool) -> String {
+    let prefix = if journal {
+        crate::systemd::syslog_prefix(&tracing::Level::WARN)
+    } else {
+        ""
+    };
+    warnings
+        .iter()
+        .map(|warning| format!("{prefix}warning: {warning}\n"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

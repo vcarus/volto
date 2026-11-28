@@ -25,11 +25,17 @@
 //!
 //! The protocol exists on Unix only. On any other platform [`Notifier::connect`]
 //! returns `None` and nothing is sent.
+//!
+//! The module also holds what the program needs to know about the journal:
+//! whether journald reads this process's output ([`logs_to_journal`]), and
+//! the priority prefix journald reads at the start of a line
+//! ([`syslog_prefix`]).
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use tracing::Level;
 #[cfg(unix)]
 use tracing::warn;
 
@@ -45,6 +51,39 @@ const WATCHDOG: &[u8] = b"WATCHDOG=1";
 /// `WATCHDOG_USEC` of 1 is zero microseconds. A watchdog that short cannot be
 /// met by any period, so the floor only has to keep the interval legal.
 const SHORTEST_HEARTBEAT: Duration = Duration::from_millis(1);
+
+/// The variable systemd sets when a service's standard streams go to the journal.
+///
+/// Its value is the `device:inode` of that connection (`systemd.exec(5)`); only
+/// its presence is used here, see [`logs_to_journal`].
+pub const JOURNAL_STREAM: &str = "JOURNAL_STREAM";
+
+/// Whether this process's log output is being read by journald.
+///
+/// Deliberately a presence test rather than an `fstat` of stdout compared against
+/// the `device:inode` in the value: the shipped unit sends both standard streams
+/// to the journal, so anything that sets the variable is a journal, and a wrong
+/// answer here costs a cosmetic prefix rather than a log line. Taking the value as
+/// an argument keeps it testable without mutating the environment of a running
+/// test binary.
+pub fn logs_to_journal(journal_stream: Option<&OsStr>) -> bool {
+    journal_stream.is_some_and(|value| !value.is_empty())
+}
+
+/// The syslog severity for a tracing level, formatted as a `printk` prefix.
+///
+/// Syslog has eight severities and tracing has five, so the mapping is not onto:
+/// ERROR/WARN/INFO land on their namesakes (3/4/6), while DEBUG and TRACE share
+/// 7, debug, the least severe thing syslog can say.
+pub fn syslog_prefix(level: &Level) -> &'static str {
+    match *level {
+        Level::ERROR => "<3>",
+        Level::WARN => "<4>",
+        Level::INFO => "<6>",
+        // DEBUG and TRACE.
+        _ => "<7>",
+    }
+}
 
 /// What the service manager put in this process's environment, as `main` read
 /// it.
@@ -696,5 +735,24 @@ mod tests {
         }));
         assert_eq!(answer, 42, "the work's output is handed back");
         assert!(arrivals.finish().is_empty());
+    }
+
+    #[test]
+    fn every_level_maps_to_its_syslog_severity() {
+        assert_eq!(syslog_prefix(&Level::ERROR), "<3>");
+        assert_eq!(syslog_prefix(&Level::WARN), "<4>");
+        assert_eq!(syslog_prefix(&Level::INFO), "<6>");
+        assert_eq!(syslog_prefix(&Level::DEBUG), "<7>");
+        assert_eq!(syslog_prefix(&Level::TRACE), "<7>");
+    }
+
+    /// systemd sets the variable to `device:inode`; nothing else sets it.
+    #[test]
+    fn the_journal_is_detected_from_the_environment() {
+        assert!(logs_to_journal(Some(OsStr::new("8:12345"))));
+        // Not set: an interactive `cargo run`, which must be left alone.
+        assert!(!logs_to_journal(None));
+        // Set but empty is not a journal either.
+        assert!(!logs_to_journal(Some(OsStr::new(""))));
     }
 }

@@ -20,6 +20,7 @@ use tracing_subscriber::registry::LookupSpan;
 use volto::config::{Config, FilterRefusal};
 use volto::quic::{Server, Stopped};
 use volto::shutdown::Trigger;
+use volto::systemd::{JOURNAL_STREAM, logs_to_journal, syslog_prefix};
 
 // mimalloc on the musl targets, `System` elsewhere. `volto::alloc` says why.
 #[global_allocator]
@@ -145,22 +146,6 @@ fn failure_report(error: &anyhow::Error, journal: bool) -> String {
         let _ = writeln!(report, "{}{line}", syslog_prefix(&Level::ERROR));
         report
     })
-}
-
-/// The configuration warnings as [`run`] writes them to stderr when the log
-/// filter hides them: one line each, `warning: ` first as `--check-config`
-/// writes them, and the warning priority `<4>` before that when `journal` is
-/// true.
-fn hidden_warnings_report(warnings: &[String], journal: bool) -> String {
-    let prefix = if journal {
-        syslog_prefix(&Level::WARN)
-    } else {
-        ""
-    };
-    warnings
-        .iter()
-        .map(|warning| format!("{prefix}warning: {warning}\n"))
-        .collect()
 }
 
 /// Everything `main` does, with its error returned for [`main`] to report.
@@ -538,18 +523,7 @@ async fn run(path: PathBuf, config: Config) -> Result<()> {
     for warning in &warnings {
         tracing::warn!(log_id = "f9be058r", "{warning}");
     }
-    // An accepted filter can still hide WARN at this target (`log.level =
-    // "error"`), and the warnings say things such as "authentication is
-    // DISABLED". So they are written to stderr as well whenever the filter
-    // hides them.
-    if !tracing::enabled!(target: "volto", Level::WARN) {
-        let journal = logs_to_journal(std::env::var_os(JOURNAL_STREAM).as_deref());
-        // Not `eprint!`, which panics when stderr cannot be written.
-        let _ = std::io::Write::write_all(
-            &mut std::io::stderr(),
-            hidden_warnings_report(&warnings, journal).as_bytes(),
-        );
-    }
+    volto::config::copy_hidden_warnings(&warnings, tracing::enabled!(target: "volto", Level::WARN));
     #[cfg(debug_assertions)]
     pause_after_the_warnings();
 
@@ -813,12 +787,6 @@ async fn first_termination(
     }
 }
 
-/// The variable systemd sets when a service's standard streams go to the journal.
-///
-/// Its value is the `device:inode` of that connection (`systemd.exec(5)`); only
-/// its presence is used here, see [`logs_to_journal`].
-const JOURNAL_STREAM: &str = "JOURNAL_STREAM";
-
 /// Installs the tracing subscriber.
 ///
 /// `RUST_LOG` wins over `log.level` so verbosity can be raised without touching
@@ -956,33 +924,6 @@ fn filter_source(rust_log: Option<&OsStr>) -> FilterSource {
     }
 }
 
-/// Whether this process's log output is being read by journald.
-///
-/// Deliberately a presence test rather than an `fstat` of stdout compared against
-/// the `device:inode` in the value: the shipped unit sends both standard streams
-/// to the journal, so anything that sets the variable is a journal, and a wrong
-/// answer here costs a cosmetic prefix rather than a log line. Taking the value as
-/// an argument keeps it testable without mutating the environment of a running
-/// test binary.
-fn logs_to_journal(journal_stream: Option<&OsStr>) -> bool {
-    journal_stream.is_some_and(|value| !value.is_empty())
-}
-
-/// The syslog severity for a tracing level, formatted as a `printk` prefix.
-///
-/// Syslog has eight severities and tracing has five, so the mapping is not onto:
-/// ERROR/WARN/INFO land on their namesakes (3/4/6), while DEBUG and TRACE share
-/// 7, debug, the least severe thing syslog can say.
-fn syslog_prefix(level: &Level) -> &'static str {
-    match *level {
-        Level::ERROR => "<3>",
-        Level::WARN => "<4>",
-        Level::INFO => "<6>",
-        // DEBUG and TRACE.
-        _ => "<7>",
-    }
-}
-
 /// Wraps an event formatter so each line starts with its syslog priority.
 ///
 /// volto writes plain text to stdout, and journald files plain text as PRIORITY=6
@@ -1084,15 +1025,6 @@ mod tests {
         buffer.contents()
     }
 
-    #[test]
-    fn every_level_maps_to_its_syslog_severity() {
-        assert_eq!(syslog_prefix(&Level::ERROR), "<3>");
-        assert_eq!(syslog_prefix(&Level::WARN), "<4>");
-        assert_eq!(syslog_prefix(&Level::INFO), "<6>");
-        assert_eq!(syslog_prefix(&Level::DEBUG), "<7>");
-        assert_eq!(syslog_prefix(&Level::TRACE), "<7>");
-    }
-
     /// A `SIGINT` stream that could not be created leaves `SIGTERM` watched.
     ///
     /// The signal is raised in this test process, which is safe because the
@@ -1139,16 +1071,6 @@ mod tests {
             format!("{error:#}").contains("without a shutdown"),
             "the error says what happened: {error:#}"
         );
-    }
-
-    /// systemd sets the variable to `device:inode`; nothing else sets it.
-    #[test]
-    fn the_journal_is_detected_from_the_environment() {
-        assert!(logs_to_journal(Some(OsStr::new("8:12345"))));
-        // Not set: an interactive `cargo run`, which must be left alone.
-        assert!(!logs_to_journal(None));
-        // Set but empty is not a journal either.
-        assert!(!logs_to_journal(Some(OsStr::new(""))));
     }
 
     /// An error with a cause spans several lines, and journald reads the

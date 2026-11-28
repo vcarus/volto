@@ -309,9 +309,10 @@ impl ReloadHandle {
             );
         }
 
-        for warning in warnings {
+        for warning in &warnings {
             warn!(log_id = "bg9ux69o", "{warning}");
         }
+        crate::config::copy_hidden_warnings(&warnings, tracing::enabled!(tracing::Level::WARN));
 
         // The same no-op as `listen` above, for the same reason and with the
         // same remedy: the sizes are asked of the socket when it is created and
