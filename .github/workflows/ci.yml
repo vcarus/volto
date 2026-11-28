@@ -440,8 +440,11 @@ jobs:
         working-directory: tests/interop/singbox
         env:
           VOLTO_CERT: ${{ github.workspace }}/interop/cert.pem
+        # The list is named from the workspace root: this step runs one
+        # directory deeper than the masque-go step, so that step's relative
+        # path does not reach it from here.
         run: |
-          VOLTO_ECH_CONFIG="$(cat ../../interop/ech.list)" \
+          VOLTO_ECH_CONFIG="$(cat "$GITHUB_WORKSPACE/interop/ech.list")" \
             go test -v -count=1 -timeout 600s ./...
 
       # The server log must be clean as well: a regression every client
