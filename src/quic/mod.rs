@@ -28,8 +28,9 @@ pub use reload::ReloadHandle;
 pub use socket::FD_HEADROOM;
 pub(crate) use transport::admit_configured_streams;
 pub use transport::{
-    AuthGate, CONNECTION_RECEIVE_WINDOW, INITIAL_BIDI_STREAMS, INITIAL_CONNECTION_RECEIVE_WINDOW,
-    MAX_PEER_UNI_STREAMS, MarkOutcome, SEND_WINDOW, STREAM_RECEIVE_WINDOW,
+    AuthGate, BLACK_HOLE_COOLDOWN, CONNECTION_RECEIVE_WINDOW, INITIAL_BIDI_STREAMS,
+    INITIAL_CONNECTION_RECEIVE_WINDOW, MAX_PEER_UNI_STREAMS, MarkOutcome, SEND_WINDOW,
+    STREAM_RECEIVE_WINDOW,
 };
 
 use reload::{ConfigSwap, Live, LiveSlot, server_config};
