@@ -62,6 +62,9 @@ pub(super) struct DeliveryRate {
     /// interval started, or the latest send time acknowledged before it,
     /// whichever is earlier.
     earliest: Option<Instant>,
+    /// Whether in-flight data fell to zero while the current interval had
+    /// acknowledged nothing; see [`Self::resume`].
+    idle: bool,
     /// Stored samples in bytes per second, oldest overwritten first; a slot
     /// holds zero where expiry cleared it.
     pub(super) samples: [u64; SAMPLES],
@@ -74,6 +77,10 @@ pub(super) struct DeliveryRate {
 
 impl DeliveryRate {
     pub(super) fn on_ack(&mut self, sent: Instant, bytes: u64, app_limited: bool) {
+        if std::mem::take(&mut self.idle) {
+            self.started = Some(sent);
+            self.earliest = None;
+        }
         self.bytes = self.bytes.saturating_add(bytes);
         self.app_limited |= app_limited;
         // The two send times of the type's doc.
@@ -89,6 +96,11 @@ impl DeliveryRate {
         app_limited: bool,
         round: Duration,
     ) -> Option<Sample> {
+        // A batch that acknowledged only ACK-only packets, which are not in
+        // flight, while the interval waits for its first acknowledged one.
+        if self.idle {
+            return None;
+        }
         self.app_limited |= app_limited;
         let Some(started) = self.started else {
             self.restart(now);
@@ -153,21 +165,24 @@ impl DeliveryRate {
         self.app_limited = false;
     }
 
-    /// Starts the interval in progress again at `now`, the first send after
-    /// in-flight data had fallen to zero, if it has acknowledged nothing yet.
-    /// Such an interval began at the ACK batch that emptied the flight, and
-    /// nothing between that batch and `now` was the path's. Every packet
-    /// acknowledged before was sent before `now`, so the send interval starts
-    /// at the earliest packet acknowledged in the interval.
+    /// Marks that in-flight data has fallen to zero, if the interval in
+    /// progress has acknowledged nothing yet. Such an interval began at the
+    /// ACK batch that emptied the flight, and nothing until data was in flight
+    /// again was the path's. The interval then starts again at the send time
+    /// of the first packet it acknowledges, and an ACK batch before that
+    /// closes nothing. quinn calls `on_sent` for a packet that carries only
+    /// ACK frames too, but passes only ack-eliciting packets to `on_ack`, so
+    /// the interval cannot start at such a packet. Every packet acknowledged
+    /// before was sent before that time, so the send interval starts at the
+    /// earliest packet acknowledged in the interval.
     ///
     /// An interval that has acknowledged something is left as it is. The ACK
     /// that emptied the flight is in it, and quinn reports a sender with
     /// nothing to send as app-limited, so the interval is not stored unless it
     /// is above the estimate, and the record leaves it out.
-    pub(super) fn resume(&mut self, now: Instant) {
+    pub(super) fn resume(&mut self) {
         if self.started.is_some() && self.bytes == 0 {
-            self.started = Some(now);
-            self.earliest = None;
+            self.idle = true;
         }
     }
 

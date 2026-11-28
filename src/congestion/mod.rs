@@ -269,7 +269,8 @@ pub struct Bbr {
     /// In-flight data as the controller can count it since the last send: what
     /// the last ACK batch left in flight, less the bytes declared lost since.
     /// `None` once a packet has been sent after that batch. At zero, the next
-    /// send is the first after an idle period.
+    /// send is the first after an idle period, or an ACK-only packet sent in
+    /// it, which [`DeliveryRate::resume`] tells apart.
     unsent: Option<u64>,
 }
 
@@ -571,9 +572,9 @@ impl Controller for Bbr {
     /// quinn calls this once per datagram batch, after its packets count as
     /// in flight (quinn-proto `src/connection/mod.rs`,
     /// `Connection::poll_transmit`).
-    fn on_sent(&mut self, now: Instant, _bytes: u64, _last_packet_number: u64) {
+    fn on_sent(&mut self, _now: Instant, _bytes: u64, _last_packet_number: u64) {
         if self.unsent.take() == Some(0) {
-            self.rate.resume(now);
+            self.rate.resume();
         }
     }
 
@@ -2118,6 +2119,54 @@ mod tests {
                 r.window_limited,
                 3 * SRTT + MIN_RTT,
                 "{left} bytes left: from the send after the gap: {r:?}"
+            );
+            assert_eq!(
+                c.rate.max(),
+                Some(2_000_000),
+                "{left} bytes left: no sample over the gap"
+            );
+        }
+    }
+
+    /// quinn calls `on_sent` for a datagram that carries only ACK frames too.
+    /// Such a packet is not in flight and is never acknowledged, so an ACK-only
+    /// send in the gap does not start the interval: it starts at the send of
+    /// the first packet acknowledged after the gap. The peer acknowledging
+    /// that ACK-only packet ends an ACK batch with nothing acknowledged, which
+    /// closes no interval either.
+    #[test]
+    fn an_ack_only_send_in_an_idle_gap_does_not_start_the_interval() {
+        for (left, peer_acks) in [(0, false), (2_400, false), (0, true), (2_400, true)] {
+            let mut c = capped();
+            let mut t = Instant::now();
+            end_acks(&mut c, t, false);
+            t = interval(&mut c, t, 2_000_000, false);
+            ack(&mut c, t + SRTT, MIN_RTT, 200_000, false);
+            t += SRTT;
+            c.on_end_acks(t, left, false, None);
+            if left > 0 {
+                c.on_congestion_event(t, t - MIN_RTT, false, left);
+            }
+            assert_eq!(c.record().window_limited, 2 * SRTT);
+
+            // An ACK-only packet 1 s into the gap, and the peer's ACK of it
+            // 2 s into the gap.
+            c.on_sent(t + Duration::from_secs(1), 50, 900);
+            if peer_acks {
+                c.on_end_acks(t + Duration::from_secs(2), 0, false, None);
+            }
+
+            let resumed = t + Duration::from_secs(30);
+            c.on_sent(resumed, 1200, 1000);
+            let first = resumed + MIN_RTT;
+            ack(&mut c, first, MIN_RTT, 24_000, false);
+            c.on_end_acks(first, 200_000, false, None);
+            interval(&mut c, first, 2_000_000, false);
+            let r = c.record();
+            assert_eq!(
+                r.window_limited,
+                3 * SRTT + MIN_RTT,
+                "{left} bytes left, peer acks {peer_acks}: from the data send after the gap: {r:?}"
             );
             assert_eq!(
                 c.rate.max(),
