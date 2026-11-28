@@ -277,7 +277,9 @@ initial_rtt_ms = 150
 # other IPv6 blocks the IANA registry reserves (100::/8, 200::/7, 400::/6,
 # 800::/5, 1000::/4, 4000::/3, 6000::/3, 8000::/3, a000::/3, c000::/3,
 # e000::/4, f000::/5, f800::/6 and fe00::/9). So every IPv6 address outside
-# global unicast 2000::/3 is refused, multicast included.
+# global unicast 2000::/3 is refused, multicast included. The exceptions are an
+# IPv4-mapped (::ffff:0:0/96) or well-known NAT64 (64:ff9b::/96) address, which
+# is judged by the IPv4 address it carries, as the next paragraph says.
 #
 # Off by default, and it should stay off on a public deployment: the proxy's own
 # source address is inside your perimeter, and plenty of services trust
