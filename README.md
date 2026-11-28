@@ -4,7 +4,7 @@
 
 # volto
 
-**A MASQUE proxy server in Rust — HTTP/3 CONNECT and CONNECT-UDP over one QUIC connection, built for [Surge](https://nssurge.com)'s `masque` policy.**
+**A MASQUE proxy server in Rust: HTTP/3 CONNECT and CONNECT-UDP over one QUIC connection, for [Surge](https://nssurge.com)'s `masque` policy and [sing-box](https://sing-box.sagernet.org)'s HTTP/3 `http` outbound.**
 
 [![CI](https://github.com/vcarus/volto/actions/workflows/ci.yml/badge.svg)](https://github.com/vcarus/volto/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/vcarus/volto?display_name=tag)](https://github.com/vcarus/volto/releases/latest)
@@ -38,13 +38,15 @@ curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh 
   sudo bash -s -- --enable-timer --username yourname
 ```
 
-Add `--ech-public-name public.example` to set up [Encrypted Client Hello](docs/deployment.md#encrypted-client-hello) in the same run (from v1.8.8); the policy line then carries `ech-config` too.
+Add `--ech-public-name public.example` to set up [Encrypted Client Hello](docs/deployment.md#encrypted-client-hello) in the same run (from v1.8.8); the policy line then carries `ech-config` too, and the sing-box outbound an `ech` object.
 
 It finishes by printing a ready-to-paste Surge policy line:
 
 ```
 volto = masque, 203.0.113.10, 443, sni=volto.internal, server-cert-fingerprint-sha256=AA:BB:…:FF, username=yourname, password=…
 ```
+
+Below it the same run prints the server as a [sing-box](docs/deployment.md#sing-box) `http` outbound, a JSON object to paste into `outbounds`, for sing-box 1.15.0 or newer.
 
 > **The fingerprint is the trust anchor:** carry it to the client over a channel you trust and never replace it with `skip-cert-verify`, for the reasons under [Self-signed with fingerprint pinning](docs/deployment.md#self-signed-with-fingerprint-pinning). For a public-CA certificate instead, see [Certificates](docs/deployment.md#certificates).
 
@@ -84,13 +86,14 @@ A commented example configuration is [script/config.example.toml](script/config.
 | **Operations** | `SIGHUP` reload that rejects a bad configuration whole and keeps serving; graceful shutdown with GOAWAY and a grace period; systemd unit, installer and self-updating deploy script included. |
 | **Diagnostics** | Per-request debug logging with redacted credentials, `SSLKEYLOGFILE` for frame-level analysis, `--check-config` (see [what it covers](docs/configuration.md#checking-a-file-without-starting-the-server)), and `--diagnostics`, which prints a support bundle with the passwords redacted. |
 
-**Explicit non-goals:** CONNECT-IP (RFC 9484), traffic obfuscation, and a web admin panel.
+**Explicit non-goals:** CONNECT-IP (RFC 9484), traffic obfuscation, and a web admin panel. CONNECT-IP is what sing-box's `masque-client` endpoint and Xray's `masque` outbound speak, so neither connects; sing-box connects through its `http` outbound.
 
 ## Compatibility
 
 | | |
 |---|---|
 | **Client** | Surge (iOS / macOS) `masque` policy. Auth is HTTP Basic; add `sni=` and `server-cert-verify-name=` when the server sits behind a relay IP. |
+| **sing-box** | sing-box 1.15.0 or newer, `http` outbound with `"version": 3`: CONNECT for TCP, CONNECT-UDP for UDP, HTTP Basic, certificate pinning and ECH. Tested in CI against the release pinned in `tests/interop/singbox/go.mod`. See [sing-box](docs/deployment.md#sing-box). |
 | **Other clients** | Apple's relay client (`NERelay`, `ProxyConfiguration(relayHops:)`) works for CONNECT and CONNECT-UDP; tested through `Network.framework` on macOS 15, not with a device profile. It sends no ECH, so it needs `require_ech` off. See [Apple's relay client](docs/deployment.md#apples-relay-client). |
 | **Server** | Linux (`x86_64`, `aarch64`); static musl binaries, no runtime dependencies. Listens on **UDP only**: open the QUIC port in your firewall, there is no TCP listener. |
 | **Behind a relay** | Works behind a plain L4 UDP DNAT relay; TLS terminates only on volto. See [Running behind a UDP relay](docs/deployment.md#running-behind-a-udp-relay). |
@@ -117,7 +120,7 @@ cargo test --locked --test it_policy               # authentication / ACL / quot
 cargo test --locked --test it_stress -- --ignored  # heavy load tier
 ```
 
-Integration tests assert on-wire behaviour — status codes, response headers, the actual bytes on the control stream — rather than internal state. Because that suite has volto on both ends, CI also runs a cross-implementation job against two independent clients, Go's [masque-go](https://github.com/quic-go/masque-go) (CONNECT-UDP, with and without ECH) and Python's [aioquic](https://github.com/aiortc/aioquic) (CONNECT and CONNECT-UDP); see [tests/interop](tests/interop) and [Testing](docs/architecture.md#testing).
+Integration tests assert on-wire behaviour — status codes, response headers, the actual bytes on the control stream — rather than internal state. Because that suite has volto on both ends, CI also runs a cross-implementation job against three independent clients, Go's [masque-go](https://github.com/quic-go/masque-go) (CONNECT-UDP, with and without ECH), Python's [aioquic](https://github.com/aiortc/aioquic) (CONNECT and CONNECT-UDP) and [sing-box](https://github.com/SagerNet/sing-box) (both, through its SOCKS5 inbound, with and without ECH); see [tests/interop](tests/interop) and [Testing](docs/architecture.md#testing).
 
 ## License
 

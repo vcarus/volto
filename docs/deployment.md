@@ -139,7 +139,8 @@ The installer creates the `volto` system user, installs the binary, generates an
 EC P-256 certificate valid for ten years, derives `/etc/volto/config.toml` from
 the shipped example with a random password, installs and starts the systemd unit,
 opens the port in ufw if it is active, and prints the fingerprint, the expiry
-date and a pasteable Surge policy line. It asks for the certificate name when
+date, a pasteable Surge policy line and the same server as a
+[sing-box](#sing-box) outbound. It asks for the certificate name when
 neither `--sni` nor `$SNI` is set and a terminal is attached, and refuses a name
 that is not a host name (letters, digits, hyphens and dots, not ending in a
 number); everything else has a default:
@@ -359,9 +360,9 @@ curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh 
 
 Omitting `--password` is also fine, and usually better: the installer generates
 18 random bytes — 144 bits, 24 characters — and prints the result in the final
-Surge policy line when its output is a terminal, and no command line ever
-carries it. Without a terminal (a log file, the journal) the policy line names
-`/etc/volto/config.toml` in place of the password. A `--password` on this
+Surge policy line and sing-box outbound when its output is a terminal, and no
+command line ever carries it. Without a terminal (a log file, the journal) both
+name `/etc/volto/config.toml` in place of the password. A `--password` on this
 command line is readable by every local user while the run lasts and stays in `sudo`'s log. `--username` is independent, so naming the user still leaves
 the password generated.
 
@@ -842,6 +843,9 @@ UDP packets and holds no key material. Three things are worth knowing:
   volto = masque, 203.0.113.10, 443, sni=example.com, server-cert-verify-name=example.com, username=user1, password=…
   ```
 
+  In sing-box, `server` is the relay's address and `tls.server_name` the
+  domain; see [sing-box](#sing-box).
+
 One consequence to plan for: every client then reaches volto from the relay's
 address, so per-IP banning at the server cannot distinguish them — see
 [fail2ban](#fail2ban) below.
@@ -868,14 +872,15 @@ curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh 
 
 It generates `/etc/volto/ech.pem` with that public name, writes `ech_key` into
 the new `config.toml`, and prints the Surge policy line with `ech-config` in
-it. The list is printed only to a terminal, as the password is; a run without
+it and the sing-box outbound with an `ech` object. The list is printed only to
+a terminal, as the password is; a run without
 one prints the command that shows it. The option is in the installer from
 v1.8.8 on, and an older installer refuses it as unknown. On a host
 that already has a `config.toml` the option writes nothing and the run prints
 the steps below, because that file is never rewritten. Once the config names an
 ECH key, by either route, every run of the installer prints the policy line
-with the current key's `ech-config`, which is also how to get the line again
-after a key rotation.
+and the outbound with the current key's list, which is also how to get them
+again after a key rotation.
 
 **By hand, on a host that is already installed.** Generate the key on the host,
 so the private key never leaves it. `/etc/volto` belongs to root, so the key is
@@ -912,6 +917,9 @@ goes on the wire:
 ```
 volto = masque, 203.0.113.10, 443, sni=example.com, server-cert-verify-name=example.com, ech-config=AEX+DQBB…, username=user1, password=…
 ```
+
+In sing-box, the list goes into `tls.ech.config` as the lines of a PEM block,
+shown under [sing-box](#sing-box).
 
 ### Rotating the ECH key
 
@@ -979,9 +987,94 @@ by `--check-config` and on reload, and so is a reload that removes the key while
 it is on. A rotation under `require_ech` follows the same steps, and a client
 holding either key's list connects throughout it.
 
+## sing-box
+
+sing-box 1.15.0 or newer reaches volto through its `http` outbound with
+`"version": 3`. The outbound then speaks HTTP/3, with CONNECT for TCP and
+CONNECT-UDP (RFC 9298) for UDP and HTTP Basic credentials on every request,
+which is the protocol volto serves to Surge. The server needs no setting for
+it. sing-box 1.14 and older have no HTTP/3 in this outbound and cannot
+connect.
+
+The installer prints the outbound for its host at the end of every run. Written
+by hand, for a server with a self-signed certificate:
+
+```json
+{
+  "type": "http",
+  "tag": "volto",
+  "server": "203.0.113.10",
+  "server_port": 443,
+  "version": 3,
+  "disable_version_fallback": true,
+  "username": "yourname",
+  "password": "…",
+  "tls": {
+    "enabled": true,
+    "server_name": "volto.internal",
+    "certificate_sha256": ["…"]
+  }
+}
+```
+
+It goes into the `outbounds` array of a sing-box configuration. The smallest
+configuration that uses it has one local inbound, such as `socks`, and
+`"route": {"final": "volto"}`.
+
+- **`"version": 3` is required.** The outbound's default is HTTP/2 over TCP,
+  and volto listens on UDP only. `disable_version_fallback` keeps sing-box
+  from trying HTTP/2 and HTTP/1.1 after an HTTP/3 attempt fails: those
+  attempts go to a TCP port on which nothing listens.
+- **Use the `http` outbound, not the `masque-client` endpoint.** That endpoint
+  is CONNECT-IP (RFC 9484), which volto does not implement. Xray's `masque`
+  outbound is CONNECT-IP too.
+- **`server` is the address the client dials, and `tls.server_name` is the SNI
+  it sends.** Behind a UDP relay, `server` is the relay's address and
+  `server_name` stays the name on the certificate. When
+  [`expected_sni`](configuration.md#security) is non-empty, that name must be
+  in it.
+- **`certificate_sha256` pins a self-signed certificate.** It takes the SHA-256
+  of the DER-encoded certificate in base64, which is the fingerprint the
+  installer prints, in another encoding:
+
+  ```sh
+  openssl x509 -in /etc/volto/cert.pem -outform der | openssl dgst -sha256 -binary | openssl enc -base64
+  ```
+
+  With a pin, sing-box accepts the certificate with that hash and checks
+  nothing else about it, neither the name nor the expiry date. Carry the pin
+  to the client over a channel you trust, as with Surge's fingerprint, and do
+  not set `"insecure": true` in its place. For a certificate from a public CA,
+  leave the pin out; sing-box then validates the chain against `server_name`.
+- **UDP needs no setting.** A packet from the target that is too large for a
+  QUIC datagram on the connection is dropped, as it is for every client; see
+  [The capsule stream](architecture.md#the-capsule-stream).
+- **Encrypted Client Hello** is the `ech` object inside `tls`. Its `config` is
+  the ECHConfigList that `volto ech-keygen` and `volto ech-config` print, as
+  the lines of a PEM block:
+
+  ```json
+  "ech": {
+    "enabled": true,
+    "config": ["-----BEGIN ECH CONFIGS-----", "AEX+DQBB…", "-----END ECH CONFIGS-----"]
+  }
+  ```
+
+  With it, sing-box passes a server that runs with `require_ech = true`.
+
+The `interop` CI job drives volto with the sing-box release that
+`tests/interop/singbox/go.mod` pins, started from a configuration of this
+shape: TCP with a half-close, 4 MiB in each direction, UDP, eight concurrent
+UDP sessions on one connection, a refused target, missing credentials, and both
+tunnel kinds through a server that requires ECH. When this section was written
+the pinned release was `1.15.0-alpha.15`, because 1.15.0 itself was not yet
+released. sing-box's mobile applications and its `tun` inbound were not
+tested.
+
 ## Apple's relay client
 
-volto is built for Surge, and Apple's own relay client also works against it.
+volto is built for Surge and tested against sing-box, and Apple's own relay
+client also works against it.
 The client is the one behind `NERelay` and the `com.apple.relay.managed`
 profile payload, and `Network.framework` exposes it to a single process as
 `ProxyConfiguration(relayHops:)`. What was tested is that last form, on macOS

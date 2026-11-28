@@ -2,7 +2,7 @@
 
 # volto
 
-This manual covers volto, a MASQUE proxy server written in Rust. One QUIC connection from the client carries TCP through classic CONNECT (RFC 9114 §4.4) and UDP through CONNECT-UDP (RFC 9298, HTTP Datagrams per RFC 9297), both dispatched by the `:protocol` pseudo-header. It terminates TLS itself, runs unattended on a small Linux host, reloads certificates and credentials on `SIGHUP`, and ships as a static binary. It is built to interoperate with Surge's `masque` policy.
+This manual covers volto, a MASQUE proxy server written in Rust. One QUIC connection from the client carries TCP through classic CONNECT (RFC 9114 §4.4) and UDP through CONNECT-UDP (RFC 9298, HTTP Datagrams per RFC 9297), both dispatched by the `:protocol` pseudo-header. It terminates TLS itself, runs unattended on a small Linux host, reloads certificates and credentials on `SIGHUP`, and ships as a static binary. It is built to interoperate with Surge's `masque` policy, and sing-box 1.15.0 or newer reaches it through its `http` outbound over HTTP/3 (see [sing-box](deployment.md#sing-box)).
 
 <p align="center">
   <picture>
@@ -13,7 +13,7 @@ This manual covers volto, a MASQUE proxy server written in Rust. One QUIC connec
 
 ## Install
 
-One command on a fresh Ubuntu host downloads, verifies, installs and starts the newest release, and prints a ready-to-paste client policy line. The command, every flag, the certificate options and the tarball route are under [Deploying from releases](deployment.md#deploying-from-releases).
+One command on a fresh Ubuntu host downloads, verifies, installs and starts the newest release, and prints a ready-to-paste Surge policy line and sing-box outbound. The command, every flag, the certificate options and the tarball route are under [Deploying from releases](deployment.md#deploying-from-releases).
 
 ## This manual
 
