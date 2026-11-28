@@ -658,12 +658,35 @@ async fn control_stream_frames_on_a_request_stream_end_the_connection() {
         // Held rather than dropped: dropping the sending half finishes the
         // stream, and a stream that ends mid-frame has a verdict of its own
         // (H3_FRAME_ERROR) that would race this one.
-        let (_held, _recv) = announce_frame(&connection, kind, length).await;
+        let (_held, mut recv) = announce_frame(&connection, kind, length).await;
+        // Every byte that arrives before the stream or the connection ends,
+        // whether or not the stream is finished.
+        let answered = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            while bytes.len() < 4096 {
+                match recv.read_chunk(4096, true).await {
+                    Ok(Some(chunk)) => bytes.extend_from_slice(&chunk.bytes),
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            bytes
+        });
 
         let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
         assert_eq!(
             closed_with, H3_FRAME_UNEXPECTED,
             "{name} declaring {length} bytes on a request stream; the reason was {reason:?}"
+        );
+
+        // The close code alone passes a decoder that writes a 431 and then
+        // closes with the right code. The reader catches such a response when
+        // it arrives before the close; the close may discard it otherwise.
+        let answered = answered.await.expect("the response reader");
+        assert!(
+            answered.is_empty(),
+            "{name}: a frame that is not a field section must not be answered like one, \
+             got {} bytes: {answered:02x?}",
+            answered.len()
         );
     }
 }
