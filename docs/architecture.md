@@ -748,7 +748,7 @@ the HTTP/3 client in `tests/common/h3client.rs` that drives it.
 One thing that suite cannot do is disagree with itself: that client is built on
 the same codec as the server, so a misreading of the framing or of QPACK is one
 both ends share. The `interop` CI job closes that gap by starting a real
-`volto` process and driving it with two clients that share no code, no QUIC
+`volto` process and driving it with three clients that share no code, no QUIC
 stack and no reading of the RFCs with it or with each other. Go's
 [masque-go](https://github.com/quic-go/masque-go) on quic-go speaks CONNECT-UDP
 over the RFC 9298 default URI template, with authentication on and the server's
@@ -765,11 +765,23 @@ ID, which RFC 9298 requires to be dropped silently and which only a client that
 writes its own Context ID prefix can send. It also runs CONNECT-UDP cases of
 its own: a round trip, three concurrent sessions on one connection (the same
 baseline), a datagram sent before its request that must still be delivered, a
-407 when credentials are omitted and `Proxy-Status` on a refusal. The clients
-live in `tests/interop/` (a Go module) and `tests/interop/aioquic/` (a Python
-script), so `cargo test` neither sees nor needs them.
+407 when credentials are omitted and `Proxy-Status` on a refusal.
+[sing-box](https://github.com/SagerNet/sing-box) is the third, and the one a
+user runs where Surge is not available (see
+[sing-box](deployment.md#sing-box)). Its `http` outbound speaks HTTP/3 through
+its own HTTP layer on a fork of quic-go. The suite builds the pinned release,
+starts it as a subprocess from a JSON configuration of the shape the installer
+prints, with the certificate pinned by its SHA-256, and drives it through its
+SOCKS5 inbounds: a TCP tunnel with a half-close, a target named by host name,
+4 MiB in each direction compared by digest, UDP round trips, eight concurrent
+UDP sessions on one connection (the same baseline again), a refused target,
+missing credentials, and both tunnel kinds through the server that requires
+ECH. The clients live in `tests/interop/` (a Go module),
+`tests/interop/aioquic/` (a Python script) and `tests/interop/singbox/` (a
+second Go module, so that sing-box's dependency graph stays out of the first),
+so `cargo test` neither sees nor needs them.
 
-A third independent implementation judges the field-section encoding in
+A fourth independent implementation judges the field-section encoding in
 particular, and its verdicts are checked in rather than re-run: the differential
 oracle in `tests/interop/difforacle/` puts generated and mutated field sections
 through this server's QPACK and Huffman decoders and through ls-qpack (via

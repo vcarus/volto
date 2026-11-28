@@ -59,7 +59,8 @@ sudo chmod 0640 /etc/volto/ech.pem
 ```
 
 writes the key file and prints the ECHConfigList on stdout, in standard base64.
-That value is what a client takes, for example Surge's `ech-config`.
+That value is what a client takes: Surge's `ech-config`, or sing-box's
+`tls.ech.config` as the lines of a PEM block.
 `--config-id` picks the ECHConfig's config_id (random when left out), and
 `--max-name-length` its `maximum_name_length`, which only steers how much a
 client pads (default 0). `--replaces <file>` is for a rotation: it reads the
