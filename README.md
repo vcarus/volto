@@ -38,7 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh 
   sudo bash -s -- --enable-timer --username yourname
 ```
 
-Add `--ech-public-name public.example` to set up [Encrypted Client Hello](docs/deployment.md#encrypted-client-hello) in the same run (releases after v1.8.7); the policy line then carries `ech-config` too.
+Add `--ech-public-name public.example` to set up [Encrypted Client Hello](docs/deployment.md#encrypted-client-hello) in the same run (from v1.8.8); the policy line then carries `ech-config` too.
 
 It finishes by printing a ready-to-paste Surge policy line:
 

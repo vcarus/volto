@@ -98,7 +98,7 @@ are named `volto-<version>-<target>.tar.gz` for the two published targets,
 `uname -m` already answers on a Linux host:
 
 ```sh
-version=1.8.7                  # whatever the releases page shows
+version=1.8.8                  # whatever the releases page shows
 name="volto-${version}-$(uname -m)-unknown-linux-musl"
 base="https://github.com/vcarus/volto/releases/download/v${version}"
 
@@ -869,8 +869,8 @@ curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh 
 It generates `/etc/volto/ech.pem` with that public name, writes `ech_key` into
 the new `config.toml`, and prints the Surge policy line with `ech-config` in
 it. The list is printed only to a terminal, as the password is; a run without
-one prints the command that shows it. The option is in the installer of every
-release after v1.8.7, and an older installer refuses it as unknown. On a host
+one prints the command that shows it. The option is in the installer from
+v1.8.8 on, and an older installer refuses it as unknown. On a host
 that already has a `config.toml` the option writes nothing and the run prints
 the steps below, because that file is never rewritten. Once the config names an
 ECH key, by either route, every run of the installer prints the policy line
