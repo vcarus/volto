@@ -535,9 +535,25 @@ const MADE_UP_LITERAL: &str = "Quorbleflax";
 /// A scratch git repository in which `.gitignore` names `dev_docs/` and
 /// `ignored.txt`, as the real one names its private files, and `tracked.txt`
 /// is staged.
+///
+/// `--exclude-standard` also reads the excludes file of the user's global git
+/// configuration. The repository's own configuration names an empty file
+/// instead, so a global ignore of `*.md` or `*.png` cannot hide a file these
+/// tests plant.
 fn scratch_repository(name: &str) -> Scratch {
     let root = scratch_tree("scrub", name, &[]);
     git(&root, &["init", "-q"]).expect("git init must work in a scratch directory");
+    let no_excludes = root.join(".git/no-excludes");
+    fs::write(&no_excludes, "").expect("write an empty excludes file");
+    git(
+        &root,
+        &[
+            "config",
+            "core.excludesFile",
+            no_excludes.to_str().expect("a UTF-8 scratch path"),
+        ],
+    )
+    .expect("git config must work in a scratch repository");
     fs::write(root.join(".gitignore"), "dev_docs/\nignored.txt\n").expect("write .gitignore");
     fs::write(root.join("tracked.txt"), "nothing to see\n").expect("write a tracked file");
     git(&root, &["add", ".gitignore", "tracked.txt"]).expect("git add");
