@@ -19,8 +19,9 @@ use common::rawstream::{
     server_control_stream, status_of, still_serving, stopped_code,
 };
 use common::{
-    H3Client, TIMEOUT, TestServer, client_endpoint_with_transport, connect_quic, connect_request,
-    field_value, finish_connect, send_udp_payload, spawn_udp_echo_target, spawn_udp_target,
+    ALLOW_PRIVATE, H3Client, TIMEOUT, TestServer, client_endpoint, client_endpoint_with_transport,
+    connect_quic, connect_request, echoes, field_value, finish_connect, open_tcp_tunnel,
+    send_udp_payload, spawn_echo_target, spawn_udp_echo_target, spawn_udp_target,
 };
 use volto::capsule::CapsuleDecoder;
 use volto::datagram;
@@ -157,6 +158,44 @@ async fn server_negotiates_the_h3_alpn() {
         .expect("rustls handshake data");
 
     assert_eq!(handshake.protocol.as_deref(), Some(b"h3".as_slice()));
+}
+
+/// A server whose `alpn` list has no `h3` serves a client that offers one of
+/// the listed identifiers, and refuses a client that offers `h3` alone.
+///
+/// ALPN is compared byte for byte during the handshake, and nothing after it
+/// reads which identifier was chosen: the connection carries HTTP/3 under
+/// either name. So the startup warning for such a list is about clients left
+/// at `h3`, and the first half here is why it cannot say "every client".
+#[tokio::test]
+async fn a_server_without_h3_in_its_alpn_list_serves_only_a_client_offering_a_listed_identifier() {
+    const LISTED: &str = "volto-test";
+
+    let server = TestServer::start_with(&format!("alpn = [\"{LISTED}\"]\n{ALLOW_PRIVATE}")).await;
+    let target = spawn_echo_target().await;
+
+    let mut client = H3Client::connect_on(client_endpoint(&server.ca, &[LISTED]), &server).await;
+    let handshake = client
+        .quic
+        .handshake_data()
+        .expect("handshake data")
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .expect("rustls handshake data");
+    assert_eq!(handshake.protocol.as_deref(), Some(LISTED.as_bytes()));
+    let mut tunnel = open_tcp_tunnel(&mut client, &target.to_string()).await;
+    echoes(&mut tunnel, b"HTTP/3 under another ALPN identifier").await;
+
+    // no_application_protocol is TLS alert 120 (RFC 7301, section 3.2), which
+    // QUIC carries as the transport error 0x0100 + 120 (RFC 9001, section 4.8).
+    let left_at_h3 = client_endpoint(&server.ca, &["h3"]);
+    match finish_connect(&left_at_h3, server.addr).await {
+        Err(quinn::ConnectionError::ConnectionClosed(close)) => assert_eq!(
+            close.error_code,
+            quinn::TransportErrorCode::crypto(120),
+            "{close:?}"
+        ),
+        other => panic!("a client offering h3 alone must be refused, got {other:?}"),
+    }
 }
 
 /// The QUIC transport parameter behind HTTP Datagrams must be advertised too.

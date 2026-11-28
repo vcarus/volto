@@ -97,16 +97,20 @@ impl Config {
     /// Settings under which every client, or every client but those sending
     /// one name, fails its handshake with no explanation.
     fn handshake_warnings(&self, warnings: &mut Vec<String>) {
-        // `h3` is the identifier HTTP/3 is negotiated under, and HTTP/3 is the
-        // only thing this server can serve once a connection is up. A list
-        // without it is legal (the key exists for interop debugging), but it
-        // is a server nobody can reach.
+        // `h3` is the identifier a client offers for HTTP/3 unless it is
+        // configured with another, and this server speaks HTTP/3 under
+        // whichever identifier the handshake picks. A list without `h3` is
+        // legal (the key exists for interop debugging), and a client
+        // configured with one of its identifiers is served. Every other client
+        // is refused in the handshake, which is the mistake this warning names.
         if !self.server.alpn.iter().any(|id| id == "h3") {
             warnings.push(format!(
-                "server.alpn = [{}] does not offer \"h3\", the only protocol this server \
-                 speaks: every client is turned away during the TLS handshake with \
-                 no_application_protocol, an alert that carries no explanation of its own, \
-                 so the server reads as unreachable rather than as misconfigured",
+                "server.alpn = [{}] does not offer \"h3\", the identifier a client offers \
+                 unless it is configured with another. Such a client is refused during the \
+                 TLS handshake with no_application_protocol, an alert that carries no \
+                 explanation of its own, so to it the server reads as unreachable rather \
+                 than as misconfigured. A client configured to offer one of the listed \
+                 identifiers is served",
                 self.server.alpn.join(", ")
             ));
         }
@@ -736,10 +740,11 @@ mod tests {
         );
     }
 
-    /// An ALPN list without `h3` is legal and starts a server every client
-    /// fails against: TLS ends the handshake with `no_application_protocol`,
-    /// which says nothing about why, so without the warning the only trace is a
-    /// handshake error at each end.
+    /// An ALPN list without `h3` is legal and starts a server that refuses
+    /// every client offering `h3` alone: TLS ends the handshake with
+    /// `no_application_protocol`, which says nothing about why, so without the
+    /// warning the only trace is a handshake error at each end. A client that
+    /// offers a listed identifier is served, which `tests/it_settings.rs` shows.
     #[test]
     fn an_alpn_list_without_h3_is_allowed_but_warned_about() {
         let cfg = parse(r#"alpn = ["h3-29"]"#);
