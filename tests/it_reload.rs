@@ -986,12 +986,19 @@ async fn a_reload_during_the_shutdown_drain_is_refused() {
 #[tokio::test]
 async fn reloads_during_a_session_timeout_still_close_the_request_stream() {
     // The session's own timeout, and the most the storm may take, measured
-    // from before the round trip that last touches the session. The storm takes
-    // about 0.3 s on the dev host, 0.24 s of it the sleeps, so the bound leaves
-    // a slow machine several times that. The second between the two covers
-    // the final reload and the scheduling of the session task.
+    // from before the round trip that last touches the session. The second
+    // between the two covers the final reload and the scheduling of the
+    // session task.
+    //
+    // The storm stops starting rounds once `STORM_BUDGET` has passed, so its
+    // length does not grow with the cost of a reload: a reload reads and
+    // parses the certificate, and under AddressSanitizer twenty-four of them
+    // took 2.4 s. It always runs `STORM_MIN_ROUNDS`, which flip the key both
+    // ways twice.
     const SESSION_TIMEOUT: u64 = 3;
     const STORM_BOUND: Duration = Duration::from_secs(2);
+    const STORM_BUDGET: Duration = Duration::from_secs(1);
+    const STORM_MIN_ROUNDS: u32 = 4;
 
     let server = TestServer::start_with(&format!(
         "[limits]\nudp_session_timeout = {SESSION_TIMEOUT}\n{ALLOW_PRIVATE}"
@@ -1008,6 +1015,9 @@ async fn reloads_during_a_session_timeout_still_close_the_request_stream() {
     // Flip the very key it is counting down on, throughout.
     let storm = async {
         for round in 0..STORM_ROUNDS {
+            if round >= STORM_MIN_ROUNDS && touched_by.elapsed() >= STORM_BUDGET {
+                break;
+            }
             let timeout = if round % 2 == 0 { 30 } else { 1 };
             server.rewrite_config(&format!(
                 "[limits]\nudp_session_timeout = {timeout}\n{ALLOW_PRIVATE}"
