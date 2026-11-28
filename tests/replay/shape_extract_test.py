@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Checks shape_extract.py against log lines in the shape the server writes now.
 
-Run it with `python3 tests/replay/shape_extract_test.py`. The fixture lines are
+`cargo test --test it_replay` runs it, and so does
+`python3 tests/replay/shape_extract_test.py`. The fixture lines are
 made up: the addresses are from the documentation ranges and the names are
 under `.example`. Each line copies the message text and the field names of the
 statement it stands for, so a change to either in `src/` that the extractor

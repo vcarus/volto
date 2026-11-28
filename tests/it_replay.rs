@@ -1214,6 +1214,39 @@ fn read_log(text: &str) -> LabLog {
     log
 }
 
+/// `shape_extract.py` still reads the log lines the server writes now.
+///
+/// `tests/replay/shape_extract_test.py` holds the fixture lines and the checks.
+/// It is run from here so that `cargo test`, locally and in CI, runs it. `-I`
+/// keeps the environment and the working directory out of the interpreter's
+/// import path, and `-B` writes no bytecode into the checkout. The test is
+/// skipped, with the reason printed, only when no `python3` is on `PATH`.
+#[test]
+fn the_shape_extractor_reads_the_current_log_lines() {
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/replay/shape_extract_test.py"
+    );
+    let output = match std::process::Command::new("python3")
+        .args(["-I", "-B", script])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipped: no python3 on PATH to run {script}");
+            return;
+        }
+        Err(error) => panic!("python3 must be runnable: {error}"),
+    };
+    assert!(
+        output.status.success(),
+        "{script} failed with {}:\n{}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // --------------------------------------------------------------------------
 // The run
 // --------------------------------------------------------------------------
