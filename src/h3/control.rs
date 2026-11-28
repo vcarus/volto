@@ -171,7 +171,14 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
 /// finishes or resets its send streams and sends CONNECTION_CLOSE at the same
 /// time, and the two can be read here in either order. Answering an ordinary
 /// close with a protocol error would log that race as a fault.
-fn critical_stream_closed(
+///
+/// The same verdict, and the same exemption, apply to a STOP_SENDING on one
+/// of this endpoint's critical streams, which `serve_peer` in
+/// `connection.rs` passes here. quinn sends STOP_SENDING for a receive stream
+/// that is dropped unread while the connection is open, so a peer stack that
+/// drops its readers as it closes can send it in the packet that carries its
+/// CONNECTION_CLOSE.
+pub(super) fn critical_stream_closed(
     detail: impl Into<Cow<'static, str>>,
     close_reason: Option<&quinn::ConnectionError>,
 ) -> Option<Violation> {

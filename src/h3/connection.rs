@@ -63,7 +63,7 @@ use tracing::debug;
 
 use crate::varint::{VARINT_MAX_LEN, len_u64, put_varint, varint_len};
 
-use super::control::serve_stream;
+use super::control::{critical_stream_closed, serve_stream};
 use super::error::{Code, ConnectionError, Violation};
 use super::frame::{self, BufferBudget};
 pub use super::router::{
@@ -750,6 +750,8 @@ fn next_request_id(last_accepted: Option<u64>) -> u64 {
 /// other up.
 ///
 /// `stopped` is [`stop_requested`] over this endpoint's three critical streams.
+/// A STOP_SENDING found once the connection is already closing is not a
+/// violation, for the reason `critical_stream_closed` gives.
 async fn serve_peer(handle: Handle, stopped: impl Future<Output = String>) {
     let mut streams = JoinSet::new();
     let mut stopped = std::pin::pin!(stopped);
@@ -757,7 +759,10 @@ async fn serve_peer(handle: Handle, stopped: impl Future<Output = String>) {
     loop {
         tokio::select! {
             detail = &mut stopped => {
-                handle.fail(Violation::connection(Code::H3_CLOSED_CRITICAL_STREAM, detail));
+                let closed = critical_stream_closed(detail, handle.quic.close_reason().as_ref());
+                if let Some(violation) = closed {
+                    handle.fail(violation);
+                }
                 return;
             }
 
