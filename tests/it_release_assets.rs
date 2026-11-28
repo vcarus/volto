@@ -820,7 +820,7 @@ fn every_push_to_main_keys_its_concurrency_group_on_the_commit() {
 }
 
 /// The floor of ci.yml's shellcheck step is the number of shell scripts the
-/// tree tracks (S9-L3).
+/// tree tracks.
 ///
 /// The floor is there so that a `git ls-files` that comes back short fails the
 /// step instead of linting what it found. One below the tree, it let a listing

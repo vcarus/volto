@@ -359,7 +359,7 @@ const UNHURRIED: &str = "[limits]\nmax_idle_timeout = 5\nkeep_alive_interval = 0
 /// A peer that will not read its 407 must still spend the budget.
 ///
 /// The failure is counted, and the close decided, before the 407 is written, so
-/// a peer that never reads it still reaches the cap (review H1/H2).
+/// a peer that never reads it still reaches the cap.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
     let server = TestServer::start_with(&format!(
@@ -412,8 +412,7 @@ async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
 /// leaves, because that is what returns the stream. RFC 9114 §8.1's
 /// H3_REQUEST_CANCELLED covers "The request or its response (including pushed
 /// response) is cancelled", and a reset is the only end that reaches a peer
-/// granting no window at all: a FIN would wait behind bytes that cannot be sent
-/// (review H1).
+/// granting no window at all: a FIN would wait behind bytes that cannot be sent.
 ///
 /// Raw quinn streams, because `received_reset` observes the reset without
 /// granting the credit an ordinary read would. The shared HTTP/3 client cannot
@@ -468,7 +467,7 @@ async fn a_refusal_the_peer_will_not_take_is_reset() {
 /// It is written before any tunnel exists and by a different piece of code than
 /// `tunnel::refuse_with`, so it needs the deadline said separately: a peer that
 /// grants no room for the answer would otherwise park a server task on a window
-/// that is not coming, holding the request it is refusing (review H1).
+/// that is not coming, holding the request it is refusing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_431_the_peer_will_not_take_is_reset() {
     let server = TestServer::start_with(DELIBERATE).await;
@@ -846,7 +845,7 @@ async fn a_zero_budget_disables_the_cap() {
 /// stream at all. Without a bound, a peer that writes half a varint on each
 /// stream would park a task apiece for the life of the connection, and the
 /// transport could not end it either, since the keep-alive here is answered by
-/// the client's own stack (review L3).
+/// the client's own stack.
 ///
 /// The bound is per stream and so is the answer. The 2s deadline is
 /// `DELIBERATE`'s idle timeout, and the connection is still serving requests

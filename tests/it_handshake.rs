@@ -214,9 +214,9 @@ async fn an_authenticated_connection_is_not_bounded() {
 /// The bound is a deadline measured from the handshake, not a timer restarted by
 /// every wait, and this is the difference between the two. `accept()` returns the
 /// moment the peer *opens* a stream, so a peer that opened one every other idle
-/// timeout — a byte apiece, never a whole request, never a credential — would
-/// rearm a restarted timer before it expired and hold its slot indefinitely,
-/// which D76 exists to end.
+/// timeout would rearm a restarted timer before it expired and hold its slot
+/// indefinitely, which D76 exists to end. Each of those streams carries one
+/// byte, never a whole request and never a credential.
 ///
 /// Each of those streams is reset on its own after an idle timeout, and the
 /// stream allowance comes back, so the peer can keep this up for nothing.
