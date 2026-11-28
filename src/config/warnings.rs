@@ -8,12 +8,13 @@ const PORTS_CLIENTS_NEED: &[(u16, &str)] = &[
     (
         53,
         "every DNS query a client sends through the proxy is refused, which breaks name \
-         resolution for a client that resolves names through the tunnel",
+         resolution for a client that resolves names through the tunnel. Surge's UDP relay \
+         test is such a query, so Surge will report the policy's UDP relay as failing",
     ),
     (
         123,
-        "Surge's UDP availability test is an NTP query to port 123 through the proxy, so \
-         Surge will report the policy as broken",
+        "every NTP query a client sends through the proxy is refused, and a device that \
+         sends all of its traffic through the tunnel sets its clock with one",
     ),
 ];
 

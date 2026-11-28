@@ -544,11 +544,13 @@ With `ipv4` or `ipv6`, volto looks a name up in the preferred family first, and 
   proxy on is the relay's, not one any interface here carries, so a target naming
   that address is judged like any other public address and it is the relay rather
   than this rule that stands in the way.
-- **UDP/123 and UDP/53 must stay reachable.** Surge's UDP availability test is
-  an NTP query to port 123 through the tunnel, so denying port 123 makes Surge
-  report the policy as broken. Denying port 53 refuses every DNS query a client
-  sends through the tunnel, which breaks name resolution for a client that
-  resolves names that way. volto warns if 53 or 123 appears in `denied_ports`.
+- **UDP/53 and UDP/123 must stay reachable.** Denying port 53 refuses every DNS
+  query a client sends through the tunnel, which breaks name resolution for a
+  client that resolves names that way. Surge's UDP relay test is such a query,
+  sent to port 53 of the address its `proxy-test-udp` option names, so Surge
+  then reports the policy's UDP relay as failing. Denying port 123 refuses NTP,
+  which a device that sends all of its traffic through the tunnel sets its
+  clock with. volto warns if 53 or 123 appears in `denied_ports`.
 - `unanswered_packet_budget` stops a client using the proxy as a reflector or a
   port scanner (RFC 9298 §7). The first reply from the target lifts the limit for
   the rest of the session, so it only bites on one-way floods. The default is

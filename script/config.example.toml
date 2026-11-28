@@ -298,9 +298,10 @@ initial_rtt_ms = 150
 
 # Target ports refused regardless of address, answered with 403.
 #
-# 25 is the classic open-relay abuse vector. Do not add 123 or 53: Surge's UDP
-# test is an NTP query to port 123 through the tunnel, and denying 53 breaks
-# clients that resolve names through the tunnel. volto warns if either is
+# 25 is the classic open-relay abuse vector. Do not add 53 or 123. Denying 53
+# breaks clients that resolve names through the tunnel, and Surge's UDP relay
+# test is a DNS query through it. Denying 123 refuses the time sync of a device
+# that sends all of its traffic through the tunnel. volto warns if either is
 # listed. docs/configuration.md#security
 # Default: [25]
 #denied_ports = [25]

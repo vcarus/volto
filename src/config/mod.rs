@@ -265,8 +265,9 @@ const DEFAULT_MAX_TARGETS_PER_CONN: u32 = 256;
 /// Ports no target may be reached on unless the operator says otherwise.
 ///
 /// 25 is the classic open-relay abuse vector. 53 and 123 are deliberately *not*
-/// here. Denying 53 refuses every DNS query a client sends through the tunnel.
-/// Surge's UDP availability test is an NTP query to port 123 through the tunnel.
+/// here. Denying 53 refuses every DNS query a client sends through the tunnel,
+/// and Surge's UDP relay test is one. Denying 123 refuses the time sync of a
+/// device that sends all of its traffic through the tunnel.
 const DEFAULT_DENIED_PORTS: &[u16] = &[25];
 
 /// Default number of packets a UDP session may send before the target answers.
@@ -853,8 +854,8 @@ pub(crate) mod tests {
         assert_eq!(cfg.server.alpn_wire(), vec![b"h3".to_vec()]);
 
         // Security defaults: private space closed and port 25 closed. Port 53
-        // stays open for DNS through the tunnel, and port 123 stays open because
-        // Surge tests UDP with an NTP query.
+        // stays open for DNS through the tunnel, which Surge's UDP relay test
+        // is too, and port 123 stays open for a device's time sync.
         assert!(!cfg.security.allow_private_networks);
         assert_eq!(cfg.security.denied_ports, vec![25]);
         assert!(!cfg.security.denied_ports.contains(&53));
