@@ -985,20 +985,28 @@ async fn a_reload_during_the_shutdown_drain_is_refused() {
 /// quota, which is what this hammers.
 #[tokio::test]
 async fn reloads_during_a_session_timeout_still_close_the_request_stream() {
+    // The session's own timeout, and the most the storm may take, measured
+    // from before the round trip that last touches the session. The storm takes
+    // about 0.3 s on the dev host, 0.24 s of it the sleeps, so the bound leaves
+    // a slow machine several times that. The second between the two covers
+    // the final reload and the scheduling of the session task.
+    const SESSION_TIMEOUT: u64 = 3;
+    const STORM_BOUND: Duration = Duration::from_secs(2);
+
     let server = TestServer::start_with(&format!(
-        "[limits]\nudp_session_timeout = 1\n{ALLOW_PRIVATE}"
+        "[limits]\nudp_session_timeout = {SESSION_TIMEOUT}\n{ALLOW_PRIVATE}"
     ))
     .await;
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
     let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
+    let touched_by = std::time::Instant::now();
     assert_eq!(&udp_round_trip(&client, qsid, b"alive").await[..], b"alive");
 
-    // From here nothing crosses the proxy, so the session's one-second clock is
-    // running. Flip the very key it is counting down on, throughout.
+    // From here nothing crosses the proxy, so the session's clock is running.
+    // Flip the very key it is counting down on, throughout.
     let storm = async {
-        let started = std::time::Instant::now();
         for round in 0..STORM_ROUNDS {
             let timeout = if round % 2 == 0 { 30 } else { 1 };
             server.rewrite_config(&format!(
@@ -1010,18 +1018,18 @@ async fn reloads_during_a_session_timeout_still_close_the_request_stream() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        // The storm ends, well inside the one second this session has left, on
-        // a value that would keep it alive for another half minute if the
-        // timeout were read live rather than snapshotted when the connection
-        // was accepted. That is what makes the assertion below say something,
-        // so a storm too slow to end inside the second fails here instead. It
-        // takes about 0.3 s on the dev host, 0.24 s of it the sleeps; 0.8 s
-        // leaves the round trip before it room inside the second.
-        let took = started.elapsed();
+        // The storm ends, inside the session's timeout, on a value that would
+        // keep it alive for another half minute if the timeout were read live
+        // rather than snapshotted when the connection was accepted. Such a
+        // server fails the wait for the close below. The check is only
+        // meaningful if the session is still open at the last reload, so a
+        // storm that ends too late fails here instead.
+        let age = touched_by.elapsed();
         assert!(
-            took < Duration::from_millis(800),
-            "the storm took {took:?}, so the session may have been reclaimed before \
-             its last reload and the check below would test nothing"
+            age < STORM_BOUND,
+            "the storm ended {age:?} after the session was last touched, so the session \
+             may have been reclaimed before its last reload and the check below would \
+             test nothing"
         );
         server.rewrite_config(&format!(
             "[limits]\nudp_session_timeout = 30\n{ALLOW_PRIVATE}"
