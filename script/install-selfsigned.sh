@@ -5,7 +5,9 @@
 # For the deployment where you do not want to own a domain: the certificate is
 # generated here, on this machine, and the client is told to trust exactly that
 # one certificate by its SHA-256 fingerprint. Surge calls this
-# `server-cert-fingerprint-sha256`.
+# `server-cert-fingerprint-sha256`, and sing-box takes the same hash in base64
+# as `certificate_sha256`. The report at the end prints a Surge policy line and
+# a sing-box outbound with it.
 #
 # The fingerprint is then the clients' only trust anchor, and there is no
 # revocation. The trade-off against the ACME path:
@@ -76,7 +78,8 @@ usage() {
 Usage: sudo script/install-selfsigned.sh [options]
 
 Installs volto with a freshly generated self-signed certificate, a systemd unit
-and one user, then prints the Surge policy line to paste into your config.
+and one user, then prints the Surge policy line and a sing-box outbound (for
+sing-box 1.15.0 or newer) to paste into your client's config.
 
 Options:
   -b, --binary PATH    volto binary to install   (default: ./target/release/volto)
@@ -91,9 +94,10 @@ Options:
                        also set up Encrypted Client Hello on a first install:
                        generate the ECH key /etc/volto/ech.pem with this public
                        name, point the config at it, and put ech-config on the
-                       policy line. The public name is the one name an
-                       observer still sees, so choose a host name that says
-                       nothing about this server. Needs volto 1.6.0 or newer
+                       policy line and an ech object in the sing-box outbound.
+                       The public name is the one name an observer still
+                       sees, so choose a host name that says nothing about
+                       this server. Needs volto 1.6.0 or newer
   -f, --force          regenerate the certificate even if one exists, and
                        reload the service so it serves the new one
       --replace-binary on a host that already has /etc/volto/config.toml,
@@ -144,7 +148,8 @@ certificate changes the fingerprint, so every client has to be updated.
 --replace-binary is the one way this script replaces an installed binary.
 --ech-public-name writes nothing on such a host either: the run prints the
 steps that add an ECH key to an existing config. Once the config names an ECH
-key, every run prints the policy line with its ech-config.
+key, every run prints the policy line with its ech-config and the sing-box
+outbound with its ech object.
 USAGE
 }
 
@@ -155,6 +160,29 @@ die() {
 
 note() {
     echo "  $*"
+}
+
+# Prints $1 as a JSON string (RFC 8259, section 7): a quotation mark and a
+# backslash escaped, each control character as \u00XX, every other character
+# as it is. Builtins only, for the reason generate_config gives: the password
+# goes through here.
+json_string() {
+    local text="$1" out="" ch code i
+    text="${text//\\/\\\\}"
+    text="${text//\"/\\\"}"
+    if [[ "$text" == *[[:cntrl:]]* ]]; then
+        for ((i = 0; i < ${#text}; i++)); do
+            ch="${text:i:1}"
+            if [[ "$ch" == [[:cntrl:]] ]]; then
+                printf -v code '\\u%04x' "'$ch"
+                out+="$code"
+            else
+                out+="$ch"
+            fi
+        done
+        text="$out"
+    fi
+    printf '"%s"' "$text"
 }
 
 # Rejects credentials that the generated config or the Surge policy line could
@@ -1079,6 +1107,57 @@ else
     shown_password="<as in $CONF>"
 fi
 echo "  volto = masque, $address, $PORT, sni=$SNI, server-cert-fingerprint-sha256=${fingerprint#*=}, ${ech_part}username=$conf_username, password=$shown_password"
+echo
+
+# The same server as a sing-box `http` outbound. `version` 3 is HTTP/3, with
+# CONNECT for TCP and CONNECT-UDP for UDP, which sing-box has from 1.15.0 on.
+# volto serves no TCP, so a fallback to HTTP/2 or HTTP/1.1 could only fail, and
+# it is turned off. sing-box takes the certificate pin as the base64 of the same
+# SHA-256 the fingerprint above shows in hex, and with a pin it checks nothing
+# else about the certificate.
+#
+# Every value goes through json_string. check_credentials refuses every
+# character a JSON string would need escaped, so for a credential this run
+# accepted the escape changes nothing. A credential read back out of a config
+# edited by hand can hold a backslash, which there starts a TOML escape this
+# script does not decode, so it prints as a pointer to the config.
+fingerprint_b64="<unknown>"
+fingerprint_hex="${fingerprint#*=}"
+if [[ "$fingerprint_hex" =~ ^([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$ ]]; then
+    # printf's %b turns each \xHH into its byte, inside this shell.
+    pin="$(printf '%b' "\\x${fingerprint_hex//:/\\x}" | openssl enc -base64 -A || true)"
+    [[ ! "$pin" =~ ^[A-Za-z0-9+/]{43}=$ ]] || fingerprint_b64="$pin"
+fi
+sing_box_username="$conf_username"
+sing_box_password="$shown_password"
+[[ "$sing_box_username" != *\\* ]] || sing_box_username="<as in $CONF>"
+[[ "$sing_box_password" != *\\* ]] || sing_box_password="<as in $CONF>"
+
+echo "sing-box outbound, for sing-box 1.15.0 or newer (replace the address if this host is behind a relay):"
+echo
+echo "  {"
+echo "    \"type\": \"http\","
+echo "    \"tag\": \"volto\","
+echo "    \"server\": $(json_string "$address"),"
+echo "    \"server_port\": $PORT,"
+echo "    \"version\": 3,"
+echo "    \"disable_version_fallback\": true,"
+echo "    \"username\": $(json_string "$sing_box_username"),"
+echo "    \"password\": $(json_string "$sing_box_password"),"
+echo "    \"tls\": {"
+echo "      \"enabled\": true,"
+echo "      \"server_name\": $(json_string "$SNI"),"
+if [ -n "$conf_ech_key" ]; then
+    echo "      \"certificate_sha256\": [$(json_string "$fingerprint_b64")],"
+    echo "      \"ech\": {"
+    echo "        \"enabled\": true,"
+    echo "        \"config\": [\"-----BEGIN ECH CONFIGS-----\", $(json_string "$ech_list"), \"-----END ECH CONFIGS-----\"]"
+    echo "      }"
+else
+    echo "      \"certificate_sha256\": [$(json_string "$fingerprint_b64")]"
+fi
+echo "    }"
+echo "  }"
 echo
 echo "Security notes:"
 echo "  * The fingerprint above IS the trust anchor. Carry it to your device over a"
