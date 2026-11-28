@@ -1,14 +1,14 @@
 # Dependabot only touches registry dependencies, action versions and the
 # release build images.
 #
-# Six entries are watched below: the crates in `Cargo.toml`, the crates in
+# Seven entries are watched below: the crates in `Cargo.toml`, the crates in
 # `fuzz/Cargo.toml` (its own workspace, so its own entry -- one manifest per
 # `directory`), the pinned GitHub Actions, the images the release binaries are
-# built in, and the Go and Python modules the `interop` job drives the server
-# with. The last two matter as much as the first: masque-go and aioquic are
-# the independent implementations this project is checked against, so an
-# unwatched copy of either would quietly age into agreeing with us by being
-# too old to disagree.
+# built in, and the two Go modules and the Python module the `interop` job
+# drives the server with. The last three matter as much as the first:
+# masque-go, aioquic and sing-box are the independent implementations this
+# project is checked against, so an unwatched copy of any of them would
+# quietly age into agreeing with us by being too old to disagree.
 #
 # One thing stays outside its reach: transitive-only crates. Dependabot proposes
 # bumps for the dependencies a manifest names, never for the ones they pull in,
@@ -56,12 +56,21 @@ updates:
         patterns:
           - "*"
 
-  # The masque-go client behind the `interop` job. This go.mod is also where
-  # that job reads its Go toolchain version from (`go-version-file:
-  # tests/interop/go.mod` in ci.yml), so a bump of the `go` directive is picked
-  # up by the runner too, not just the module requirements.
+  # The masque-go client behind the `interop` job.
   - package-ecosystem: gomod
     directory: "/tests/interop"
+    schedule:
+      interval: weekly
+
+  # The sing-box client behind the same job, in a Go module of its own so the
+  # masque-go module does not take on its dependency graph. This go.mod is also
+  # where that job reads its Go version from (`go-version-file:
+  # tests/interop/singbox/go.mod` in ci.yml), because sing-box asks for the
+  # newer Go of the two modules, so a bump of its `go` directive reaches the
+  # runner too. sing-box is a direct requirement (tools.go says why), and the
+  # rest of the file is its graph, which moves with it.
+  - package-ecosystem: gomod
+    directory: "/tests/interop/singbox"
     schedule:
       interval: weekly
 

@@ -2,7 +2,7 @@
 # The interop fixture, shared by the `interop` job in .github/workflows/ci.yml
 # and by ./run-local.sh.
 #
-# Both need the same three things before either suite can run: a self-signed
+# Both need the same three things before any suite can run: a self-signed
 # certificate the clients will validate, a server configuration that matches
 # the VOLTO_* environment the suites read, and a way to wait for the server to
 # be listening.
@@ -69,9 +69,10 @@ allow_private_networks = true
 # soft limit, and the defaults, 2 MiB per socket and 256 x 256 tunnels, draw the
 # two warnings the server writes for a host that cannot grant them (log_id
 # einsvqj5 and bt1hbfco). Those are true statements about the runner and say
-# nothing about the two foreign clients, so the fixture asks for what the runner
-# has and the check below keeps its list at the two lines this run earns. Seven
-# tunnels on one loopback need none of the headroom either figure gives up.
+# nothing about the foreign clients, so the fixture asks for what the runner
+# has and the check below keeps its list at the two lines this run earns. The
+# tunnels the suites open on one loopback need none of the headroom either
+# figure gives up.
 socket_recv_buffer = 212992
 socket_send_buffer = 212992
 max_connections = 16
@@ -149,8 +150,8 @@ wait_until_ready() {
 
 # The server log is judged rather than only printed. CLAUDE.md names the interop
 # job as the only independent judge of src/h3, because the in-tree test client is
-# built on volto::h3; a run in which both foreign clients are satisfied while the
-# server logs an error is exactly what that job exists to catch, and neither
+# built on volto::h3; a run in which every foreign client is satisfied while the
+# server logs an error is exactly what that job exists to catch, and no
 # suite can see the server side. The filter list lives here so that ./run-local.sh
 # and the CI job apply the same one.
 #
