@@ -381,9 +381,11 @@ async fn a_session_waits_for_the_peer_settings_until_the_bound() {
 const SETTINGS_ATTEMPTS: usize = 20;
 
 /// How long that test waits for the target to stay silent before it sends the
-/// SETTINGS: well below [`PEER_SETTINGS_WAIT`], so the SETTINGS and the answer
-/// still fit inside the bound.
-const UNSET_WINDOW: Duration = Duration::from_millis(200);
+/// SETTINGS. A server that does not wait relays the datagram about 11 ms after
+/// the connect on the dev host. The window is under a third of
+/// [`PEER_SETTINGS_WAIT`], so the SETTINGS and the answer have the rest of the
+/// bound.
+const UNSET_WINDOW: Duration = Duration::from_millis(100);
 
 /// SETTINGS that are read within the bound end the wait, and the session is on
 /// QUIC datagrams from its first packet (D119).
@@ -394,9 +396,12 @@ const UNSET_WINDOW: Duration = Duration::from_millis(200);
 /// reports each packet it receives tells the two apart without a fixed sleep.
 ///
 /// An attempt counts only when the response arrived less than the bound after
-/// the client began to connect: only then is it certain that the SETTINGS ended
-/// the wait and the bound did not. A machine that stalls for longer makes an
-/// attempt prove nothing, and the next one runs on a new connection.
+/// the client's handshake ended: only then is it certain that the SETTINGS
+/// ended the wait and the bound did not. The server's clock for the bound
+/// starts when its own handshake ends, which is after the client's, so the
+/// client's clock reads less than the server's. A machine that stalls for
+/// longer makes an attempt prove nothing, and the next one runs on a new
+/// connection.
 #[tokio::test]
 async fn a_session_set_up_once_the_settings_are_read_answers_on_datagrams() {
     let server = TestServer::start().await;
@@ -411,8 +416,8 @@ async fn a_session_set_up_once_the_settings_are_read_answers_on_datagrams() {
         })
         .await;
 
-        let started = Instant::now();
         let (_endpoint, connection) = connect_quic(&server).await;
+        let started = Instant::now();
         let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
         let quarter_stream_id = datagram::quarter_stream_id(u64::from(send.id()));
         send.write_all(&connect_udp_headers_frame(
@@ -432,8 +437,8 @@ async fn a_session_set_up_once_the_settings_are_read_answers_on_datagrams() {
         {
             assert!(
                 started.elapsed() >= PEER_SETTINGS_WAIT,
-                "the target heard from the session {:?} after the client began to \
-                 connect, before any SETTINGS were sent and before the bound of \
+                "the target heard from the session {:?} after the client's handshake \
+                 ended, before any SETTINGS were sent and before the bound of \
                  {PEER_SETTINGS_WAIT:?}",
                 started.elapsed()
             );
@@ -470,7 +475,7 @@ async fn a_session_set_up_once_the_settings_are_read_answers_on_datagrams() {
 
     panic!(
         "none of {SETTINGS_ATTEMPTS} responses arrived within {PEER_SETTINGS_WAIT:?} of the \
-         start of its connection, so none showed what ended the wait"
+         end of its handshake, so none showed what ended the wait"
     );
 }
 
