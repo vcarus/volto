@@ -741,13 +741,25 @@ fn next_request_id(last_accepted: Option<u64>) -> u64 {
 /// connection: its unidirectional streams and its HTTP Datagrams.
 ///
 /// One task for both, because both are the connection's rather than any
-/// stream's, both end when it does, and neither can be starved by the other:
-/// [`quinn::Connection::accept_uni`] leaves an unaccepted stream queued and
-/// [`quinn::Connection::read_datagram`] an undelivered datagram, so a branch
-/// that loses the race here loses nothing but the poll. Handling is short: a
-/// unidirectional stream gets a task of its own, and a datagram is a map lookup
-/// and a `try_send` that never blocks. So a flood of one kind cannot hold the
-/// other up.
+/// stream's, and both end when it does. Neither read loses anything when its
+/// branch loses the race: [`quinn::Connection::accept_uni`] leaves an
+/// unaccepted stream queued and [`quinn::Connection::read_datagram`] an
+/// undelivered datagram. Handling is short: a unidirectional stream gets a task
+/// of its own, and a datagram is a map lookup and a `try_send` that never
+/// blocks.
+///
+/// What is guaranteed about the order of work. `select!` picks a ready branch
+/// at random, so a flood of datagrams delays a unidirectional stream by a few
+/// datagrams at most, and not by the whole flood. Each datagram read is charged
+/// to tokio's cooperative budget, so one poll of this task routes at most one
+/// budget of datagrams (128 in tokio 1.54) and then returns `Pending`. The
+/// worker then moves the session task this woke out of its LIFO slot to its run
+/// queue, where any idle worker can take it. What is not guaranteed is
+/// how fast this task gets through a flood: it is rescheduled like any other
+/// task, and datagrams the transport cannot hold meanwhile are dropped by
+/// quinn. The accept branch is not charged. The peer can have at most
+/// `max_concurrent_uni_streams` unidirectional streams open, and gets more
+/// credit only when the tasks this branch spawned have finished with theirs.
 ///
 /// `stopped` is [`stop_requested`] over this endpoint's three critical streams.
 /// A STOP_SENDING found once the connection is already closing is not a
@@ -780,7 +792,17 @@ async fn serve_peer(handle: Handle, stopped: impl Future<Output = String>) {
                 streams.spawn(serve_stream(handle.clone(), recv));
             }
 
-            received = handle.quic.read_datagram() => {
+            // `cooperative` charges tokio's budget for each datagram read, as a
+            // tokio socket read would be charged. quinn's read is not a tokio
+            // resource and charges nothing. Without the charge, this loop runs
+            // without returning `Pending` for as long as datagrams are queued.
+            // The session task that `route_datagram` wakes is put in this
+            // worker's LIFO slot, and no other worker takes a task from that
+            // slot, so the session would not run until this loop stopped.
+            // With the charge, `select!` returns `Pending` once the budget is
+            // spent, the session can run, and the runtime polls this task
+            // again later.
+            received = tokio::task::coop::cooperative(handle.quic.read_datagram()) => {
                 let datagram = match received {
                     Ok(datagram) => datagram,
                     // The connection is gone; so is every session on it.
@@ -1115,5 +1137,82 @@ mod tests {
         };
         assert_eq!(close.error_code.into_inner(), 0x10b);
         assert_eq!(&close.reason[..], b"too many authentication failures");
+    }
+
+    /// One poll of [`serve_peer`] routes at most one cooperative budget of
+    /// datagrams, however many the peer has queued, and then returns `Pending`.
+    ///
+    /// A task that the loop wakes waits in the worker's LIFO slot, which no
+    /// other worker takes from, until the loop returns `Pending`. So without
+    /// this bound a peer that keeps datagrams queued keeps that task from
+    /// running.
+    #[tokio::test]
+    async fn one_poll_of_the_datagram_loop_routes_at_most_one_budget() {
+        // tokio 1.54's `Budget::initial()`: what a task may consume per poll.
+        const TOKIO_BUDGET: u64 = 128;
+        // Several budgets' worth, and far under the 1.25 MB quinn's default
+        // `datagram_receive_buffer_size` holds: 512 datagrams of 3 bytes.
+        const SENT: u64 = 4 * TOKIO_BUDGET;
+
+        let (client, server) =
+            crate::quic::tests::loopback_pair(quinn::TransportConfig::default()).await;
+
+        // Quarter Stream ID 0, Context ID 1, one byte of payload. The router
+        // drops an unknown Context ID and counts it, so the count of drops is
+        // the count of datagrams routed.
+        for _ in 0..SENT {
+            client
+                .send_datagram(Bytes::from_static(&[0x00, 0x01, 0xff]))
+                .expect("queue a datagram");
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while server.stats().frame_rx.datagram < SENT {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("every datagram must reach the server");
+
+        let routed = Arc::new(AtomicU64::new(0));
+        let handle = Handle {
+            quic: server.clone(),
+            idle: Duration::from_secs(5),
+            shared: Arc::new(Shared {
+                router: Arc::new(Router::new(routed.clone())),
+                ..Shared::default()
+            }),
+        };
+
+        // Inside a task of its own, so the poll runs with a whole budget, as
+        // the spawned `serve_peer` does.
+        let (first, after_first, second, after_second) = tokio::spawn(async move {
+            let mut peer = std::pin::pin!(serve_peer(handle, std::future::pending()));
+
+            let first =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(peer.as_mut().poll(cx))).await;
+            let after_first = routed.load(Ordering::Relaxed);
+            // A new poll of this task starts with a new budget.
+            tokio::task::yield_now().await;
+            let second =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(peer.as_mut().poll(cx))).await;
+            let after_second = routed.load(Ordering::Relaxed);
+            (first, after_first, second, after_second)
+        })
+        .await
+        .expect("the polling task");
+
+        assert!(first.is_pending() && second.is_pending());
+        assert!(
+            after_first > 0,
+            "the first poll must route something, or the bound proves nothing"
+        );
+        assert!(
+            after_first <= TOKIO_BUDGET,
+            "one poll routed {after_first} of {SENT} queued datagrams"
+        );
+        assert!(
+            after_second > after_first && after_second - after_first <= TOKIO_BUDGET,
+            "the second poll must route more, within one budget: {after_first} then {after_second}"
+        );
     }
 }
