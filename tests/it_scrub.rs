@@ -447,7 +447,13 @@ fn literal_violations(files: &[Listed], patterns: &[String]) -> Vec<String> {
                 ));
             }
             let bytes = lowered(bytes);
+            let go_sum = Path::new(&file.path).file_name() == Some("go.sum".as_ref());
             for (number, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+                let line = if go_sum {
+                    without_go_sum_checksum(line)
+                } else {
+                    line
+                };
                 for (index, pattern) in patterns.iter().enumerate() {
                     if contains(line, pattern) {
                         violations.push(format!(
@@ -461,6 +467,41 @@ fn literal_violations(files: &[Listed], patterns: &[String]) -> Vec<String> {
         }
     }
     violations
+}
+
+/// A `go.sum` line without its checksum, when the line has the shape `go`
+/// writes, `<module> <version>[/go.mod] h1:<hash>` with the hash in base64 of
+/// 32 bytes. Any other line comes back whole.
+///
+/// The checksum is the one part of the tree that no person writes: `go mod
+/// tidy` copies it from the checksum database, and it is 43 characters of
+/// base64 with letter case dropped before the search. A short literal from the
+/// word list then matches inside a hash by chance (a three-letter one did, in
+/// the 520 lines of the sing-box module's go.sum), and no edit of ours can
+/// change the hash. The module path and the version stay searched, and so does
+/// every line of any other shape.
+fn without_go_sum_checksum(line: &[u8]) -> &[u8] {
+    let Ok(text) = std::str::from_utf8(line) else {
+        return line;
+    };
+    let mut fields = text.split(' ');
+    let (Some(module), Some(version), Some(checksum), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return line;
+    };
+    let is_hash = checksum.strip_prefix("h1:").is_some_and(|hash| {
+        hash.len() == 44
+            && hash.ends_with('=')
+            && hash.as_bytes()[..43]
+                .iter()
+                .all(|&byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/')
+    });
+    if is_hash && !module.is_empty() && !version.is_empty() {
+        &line[..module.len() + 1 + version.len()]
+    } else {
+        line
+    }
 }
 
 /// `bytes` in lower case: every letter when they are UTF-8, the ASCII letters
@@ -605,6 +646,48 @@ fn the_gate_scans_what_the_next_commit_can_carry() {
             "untracked.txt:1 (pattern #1, len 11)",
         ],
         "the untracked and the staged copy must be caught, the ignored file not read"
+    );
+}
+
+/// In a `go.sum` the checksum of a line in go's shape is not searched, and
+/// everything else is: the module path and version of that line, a line of
+/// another shape in the same file, and the same line in a file of another
+/// name.
+#[test]
+fn a_go_sum_checksum_is_the_one_part_not_searched() {
+    let root = scratch_repository("go-sum");
+    fs::create_dir_all(root.join("dev_docs")).expect("create dev_docs");
+    fs::create_dir_all(root.join("module")).expect("create module");
+    fs::write(root.join(WORD_LIST), format!("{MADE_UP_LITERAL}\n")).expect("write the word list");
+    // 11 letters and 32 more characters of base64, then the padding.
+    let hashed = format!(
+        "example.com/a v1.0.0 h1:{MADE_UP_LITERAL}{}=",
+        "A".repeat(32)
+    );
+    let go_sum = format!(
+        "{hashed}\n\
+         example.com/{MADE_UP_LITERAL} v1.0.0/go.mod h1:{}=\n\
+         a note about {MADE_UP_LITERAL}\n",
+        "B".repeat(43)
+    );
+    fs::write(root.join("module/go.sum"), go_sum).expect("write go.sum");
+    fs::write(root.join("notes.txt"), format!("{hashed}\n")).expect("write notes.txt");
+
+    let gate = scratch_gate(&root);
+    let patterns = scrub_patterns(&gate).expect("the word list names a literal");
+    let files = listing(&gate)
+        .expect("the scratch repository can be listed")
+        .expect("the dev host never skips");
+    let violations = literal_violations(&files, &patterns);
+
+    assert_eq!(
+        violations,
+        [
+            "module/go.sum:2 (pattern #1, len 11)",
+            "module/go.sum:3 (pattern #1, len 11)",
+            "notes.txt:1 (pattern #1, len 11)",
+        ],
+        "only the checksum of a go.sum line in go's shape may go unsearched"
     );
 }
 
