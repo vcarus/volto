@@ -374,7 +374,10 @@ having done its job. The counter tells a fall-back apart from a path that never
 got there: the detector is a heuristic over loss bursts, and full-size packets
 lost to ordinary congestion during a bulk transfer look the same to it as a
 path that stopped carrying them, after which the connection sends packets at
-the 1200-byte floor for a one-minute cooldown before probing again. A
+the 1200-byte floor before probing again (`BLACK_HOLE_COOLDOWN` = 10 s;
+quinn's own default is a minute). While a connection sits at the floor, a UDP
+session on it loses every target packet that no longer fits a datagram, which
+is why the wait is short. A
 non-zero count on a path where other connections settle above the floor is
 therefore either that heuristic firing on congestion or a ceiling above the
 size the path carries under load. The paragraphs on the two MTU keys below

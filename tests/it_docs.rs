@@ -598,6 +598,10 @@ fn crate_constants() -> BTreeMap<&'static str, (u64, Dimension)> {
         ),
         ("HOLD_LIFETIME", millis(volto::gate::HOLD_LIFETIME)),
         (
+            "BLACK_HOLE_COOLDOWN",
+            millis(volto::quic::BLACK_HOLE_COOLDOWN),
+        ),
+        (
             "HOLD_FLIGHTS",
             (volto::gate::HOLD_FLIGHTS as u64, Dimension::Count),
         ),

@@ -81,6 +81,7 @@ pub(super) fn transport_config(limits: &crate::config::Limits) -> Result<quinn::
         // absent one.
         let mut mtud = quinn::MtuDiscoveryConfig::default();
         mtud.upper_bound(limits.mtu_upper_bound());
+        mtud.black_hole_cooldown(BLACK_HOLE_COOLDOWN);
         transport.mtu_discovery_config(Some(mtud));
     } else {
         // Stops the upward search, so packets start at `initial_mtu` and are
@@ -378,6 +379,24 @@ const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 /// add roughly 1.6 GiB of theoretical worst case across `max_connections` (256 by
 /// default) in exchange for throughput we cannot measure a need for.
 pub const SEND_WINDOW: u64 = 10_000_000;
+
+/// How long after a black-hole detection the next MTU search starts.
+///
+/// quinn's detector puts a connection back to 1200-byte packets when it holds
+/// four loss bursts of larger ones, and searches upward again after this long
+/// (quinn-proto 0.11.19 `src/connection/mtud.rs`, `on_black_hole_detected`).
+/// Its default is 60 s. The detector also fires on loss that has nothing to do
+/// with size (D122), and while a connection sits at 1200 a CONNECT-UDP session
+/// on it loses every target packet too large for a datagram of that size,
+/// which stalls a QUIC flow inside the session until the search has run.
+///
+/// Ten seconds bounds that stall. The value is not free on a path that
+/// delivers single probes at a size it cannot carry under load: there the
+/// search succeeds, the data is lost again, and each round costs a window of
+/// packets, so a shorter value loses more of them (D122, addendum of
+/// 2026-11-28). On a path that drops probes too, the value changes nothing but
+/// the time of the one search that follows the detection.
+pub const BLACK_HOLE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 
 // D47's invariants and its validation rules, as arithmetic. The rules hold
 // between the values whether or not these three ever become configuration
@@ -890,6 +909,11 @@ mod tests {
         assert!(
             rendered.contains("upper_bound: 1464"),
             "the discovery ceiling must apply: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("black_hole_cooldown: {BLACK_HOLE_COOLDOWN:?}")),
+            "the search after a black-hole detection must start after our cooldown, not \
+             quinn's: {rendered}"
         );
         assert!(
             rendered.contains("initial_rtt: 150ms"),
