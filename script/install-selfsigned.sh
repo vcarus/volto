@@ -723,14 +723,21 @@ else
     trap restore_previous_pair ERR
     trap 'restore_previous_pair interrupted' INT TERM HUP
 
+    # The key is backed up whenever it exists, with a certificate or without
+    # one, so the rollback has a backup for every file it finds at the key path
+    # and removes only a key this run placed.
     if [ -f "$CERT" ]; then
         cert_backup="$CERT.$stamp.bak"
         mv "$CERT" "$cert_backup"
-        if [ -f "$KEY" ]; then
-            key_backup="$KEY.$stamp.bak"
-            mv "$KEY" "$key_backup"
-        fi
+    fi
+    if [ -f "$KEY" ]; then
+        key_backup="$KEY.$stamp.bak"
+        mv "$KEY" "$key_backup"
+    fi
+    if [ -n "$cert_backup" ]; then
         note "backed up the previous certificate to $cert_backup"
+    elif [ -n "$key_backup" ]; then
+        note "backed up the previous key to $key_backup"
     fi
 
     cert_placed=1

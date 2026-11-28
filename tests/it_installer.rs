@@ -2176,3 +2176,85 @@ fn the_script_documents_itself() {
         );
     }
 }
+
+/// On a host that has a key and no certificate, the rollback of a swap puts
+/// the old key back and removes nothing that was there before the run.
+///
+/// The key is backed up whenever it exists, not only beside a certificate.
+/// Without that backup, a failed rename of the new key into place, or a signal
+/// after the rename, left the rollback a file at the key path with no backup
+/// to restore. It removed that file and reported it as the new key, which on
+/// a failed rename was the operator's old one. The stand-in `mv` acts on the
+/// rename of the new key alone, whatever its position among the renames.
+#[test]
+fn a_rollback_on_a_host_with_a_key_and_no_certificate_puts_the_old_key_back() {
+    let script = installer_script();
+
+    for (name, action) in [
+        ("key-only-mv-fails", "exit 1"),
+        (
+            "key-only-signal",
+            "'{real}' \"$@\"; kill -TERM \"$PPID\"; exit 0",
+        ),
+    ] {
+        let root = scratch_tree("install", name, &["etc/volto", "usr/local/bin"]);
+        let conf_dir = root.join("etc/volto");
+        let cert = conf_dir.join("cert.pem");
+        let key = conf_dir.join("key.pem");
+        fs::write(&key, "the old key\n").expect("the key must be writable");
+
+        let binary = plant_binary_without_the_flag(&root, "volto-stub");
+        let stubs = plant_root_stubs(&root, 0, "active");
+        let real = real_tool("mv");
+        write_executable(
+            &stubs.join("mv"),
+            &format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in *key.pem.new) {action} ;; esac\n\
+                 exec '{real}' \"$@\"\n",
+                action = action.replace("{real}", &real.display().to_string()),
+                real = real.display(),
+            ),
+        );
+
+        let output = run_within_deadline(
+            installer(&script)
+                .args([
+                    "--sni",
+                    "volto.test",
+                    "--binary",
+                    binary.to_str().expect("a UTF-8 path to the binary"),
+                    "-u",
+                    "alice",
+                    "-w",
+                    "correct-horse-battery",
+                ])
+                .env("VOLTO_INSTALL_ROOT", &root)
+                .env("PATH", path_with_stubs(&stubs)),
+        );
+        let stderr = stderr_of(&output);
+
+        assert_eq!(output.status.code(), Some(1), "{name}: {stderr}");
+        assert_eq!(
+            fs::read_to_string(&key).ok().as_deref(),
+            Some("the old key\n"),
+            "{name}: the old key must be back at {}: {stderr}",
+            key.display()
+        );
+        assert!(
+            !cert.exists(),
+            "{name}: the new certificate must be removed, it has no previous one: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("restored the previous {}", key.display()))
+                && stderr.contains(&format!("removed the new {}", cert.display()))
+                && !stderr.contains(&format!("removed the new {} and", cert.display())),
+            "{name}: the message must say the key was restored and only the new certificate removed: {stderr}"
+        );
+        let leftovers = backup_leftovers(&conf_dir);
+        assert!(
+            leftovers.is_empty(),
+            "{name}: no new or backup file may stay behind, found {leftovers:?}: {stderr}"
+        );
+    }
+}
