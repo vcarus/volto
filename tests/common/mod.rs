@@ -19,6 +19,10 @@
 pub mod h3client;
 pub mod huffman;
 pub mod rawstream;
+// Also loaded by `scripts.rs`, and `it_cli` and `it_reload` load both.
+#[allow(clippy::duplicate_mod)]
+#[path = "server_table.rs"]
+mod server_table;
 
 pub use h3client::{CONNECT_UDP, ClientStream, H3Client, Response};
 
@@ -2079,10 +2083,6 @@ impl TestServer {
     /// and its certificate pair. For a test that writes a whole file with
     /// [`Self::write_invalid_config`].
     pub fn server_section(&self) -> String {
-        format!(
-            "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n",
-            self.cert.display(),
-            self.key.display(),
-        )
+        server_table::server_section(&self.cert, &self.key, "127.0.0.1:0")
     }
 }

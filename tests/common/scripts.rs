@@ -556,12 +556,8 @@ pub fn loadable_config_text(
     )
 }
 
-/// The `[server]` table naming `listen` and the certificate pair, which every
-/// configuration file a test writes starts with.
-pub fn server_section(cert: &Path, key: &Path, listen: &str) -> String {
-    format!(
-        "[server]\nlisten = \"{listen}\"\ncert = \"{}\"\nkey = \"{}\"\n",
-        cert.display(),
-        key.display(),
-    )
-}
+// Also loaded by `common/mod.rs`, and `it_cli` and `it_reload` load both.
+#[allow(clippy::duplicate_mod)]
+#[path = "server_table.rs"]
+mod server_table;
+pub use server_table::server_section;
