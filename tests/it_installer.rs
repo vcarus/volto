@@ -413,8 +413,12 @@ fn the_password_is_on_no_command_line_the_installer_runs() {
     let recorders = plant_argv_recorders(&root.join("recorders"), &stubs, &planted);
     let missing = root.join("missing");
 
+    // A bash older than 4, such as the 3.2 macOS ships as /bin/bash, runs no
+    // handle and records nothing. That fails here, naming the bash, rather
+    // than letting the runs below pass with no tool recorded as missing.
+    let bash = real_tool("bash");
     let probe = run_within_deadline(
-        record_missing_commands(&mut Command::new(real_tool("bash")), &missing)
+        record_missing_commands(&mut Command::new(&bash), &missing)
             .args(["-c", "a-command-nobody-has 2>/dev/null; true"])
             .env("PATH", &recorders)
             .stdin(Stdio::null()),
@@ -423,7 +427,9 @@ fn the_password_is_on_no_command_line_the_installer_runs() {
     assert_eq!(
         fs::read_to_string(&missing).ok().as_deref(),
         Some("a-command-nobody-has\n"),
-        "this test needs a bash that runs command_not_found_handle (bash 4 or later)"
+        "this test needs a bash that runs command_not_found_handle (bash 4 or later), and \
+         {}, the first bash on PATH, did not run it; put a newer bash ahead of it on PATH",
+        bash.display()
     );
     fs::remove_file(&missing).expect("the probe's record must be removable");
 
