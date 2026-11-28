@@ -4,15 +4,16 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::panic::Location;
 
 use bytes::BytesMut;
 use common::rawstream::{H3_MESSAGE_ERROR, QPACK_DECOMPRESSION_FAILED, close_reason};
 use common::{
-    ALLOW_PRIVATE, H3Client, TIMEOUT, TestServer, assert_peer_reset, auth_section, authorize,
-    basic_credentials, echoes, respond_to, spawn_echo_target,
+    ALLOW_PRIVATE, H3Client, TIMEOUT, TestServer, auth_section, authorize, basic_credentials,
+    echoes_at, respond_to, spawn_echo_target,
 };
 use volto::h3::frame;
-use volto::h3api::{FieldValue, Method, Request, Status};
+use volto::h3api::{FieldValue, Method, Request, Status, peer_reset_code};
 
 /// The user the requests below authenticate as.
 const USER: (&str, &str) = ("surge", "s3cret-p4ssw0rd");
@@ -240,25 +241,52 @@ async fn served() -> (TestServer, SocketAddr, H3Client) {
 }
 
 /// Sends `request` and asserts that the server resets it with H3_MESSAGE_ERROR
-/// within [`TIMEOUT`]. `what` names the request in a failure.
-async fn refused_as_malformed(client: &mut H3Client, request: Request, what: &str) {
-    let mut stream = client
-        .send
-        .send_request(request)
-        .await
-        .unwrap_or_else(|error| panic!("send {what}: {error:?}"));
-    let answer = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .unwrap_or_else(|_| panic!("the server must answer {what} promptly"));
-    match answer {
-        Ok(response) => panic!("{what} must be refused as malformed, got {response:?}"),
-        Err(error) => assert_peer_reset(&error, H3_MESSAGE_ERROR),
+/// within [`TIMEOUT`]. `what` and the caller's line name the request in a
+/// failure.
+#[track_caller]
+fn refused_as_malformed<'a>(
+    client: &'a mut H3Client,
+    request: Request,
+    what: &'a str,
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        let mut stream = client
+            .send
+            .send_request(request)
+            .await
+            .unwrap_or_else(|error| panic!("send {what} at {caller}: {error:?}"));
+        let answer = tokio::time::timeout(TIMEOUT, stream.recv_response())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the server must answer {what}, sent at {caller}, promptly")
+            });
+        match answer {
+            Ok(response) => {
+                panic!("{what}, sent at {caller}, must be refused as malformed, got {response:?}")
+            }
+            Err(error) => assert_eq!(
+                peer_reset_code(&error),
+                Some(H3_MESSAGE_ERROR),
+                "{what}, sent at {caller}, must be reset with H3_MESSAGE_ERROR, got {error:?}"
+            ),
+        }
     }
 }
 
 /// Opens an ordinary tunnel to `target` on `client` and echoes `tag` through
 /// it: the connection carries on after the request a test was about.
-async fn still_tunnels(client: &mut H3Client, target: SocketAddr, tag: &[u8]) {
-    let mut tunnel = common::open_tcp_tunnel_as(client, &target.to_string(), USER.0, USER.1).await;
-    echoes(&mut tunnel, tag).await;
+#[track_caller]
+fn still_tunnels<'a>(
+    client: &'a mut H3Client,
+    target: SocketAddr,
+    tag: &'a [u8],
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        let authority = target.to_string();
+        let mut tunnel =
+            common::open_tcp_tunnel_as_at(client, &authority, USER.0, USER.1, caller).await;
+        echoes_at(&mut tunnel, tag, caller).await;
+    }
 }

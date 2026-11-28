@@ -1092,19 +1092,27 @@ pub fn open_tcp_tunnel_as<'a>(
     username: &'a str,
     password: &'a str,
 ) -> impl Future<Output = ClientStream> + 'a {
-    let caller = Location::caller();
-    async move {
-        let request = authorized_connect(authority, username, password);
-        let (response, stream) = exchange(client, request, caller).await;
-        assert_eq!(
-            response.status,
-            Status::OK,
-            "the tunnel to {authority} opened at {caller} as {username} was refused: \
-             proxy-status={:?}",
-            proxy_status(&response)
-        );
-        stream
-    }
+    open_tcp_tunnel_as_at(client, authority, username, password, Location::caller())
+}
+
+/// The body behind [`open_tcp_tunnel_as`], with `caller` already captured.
+pub async fn open_tcp_tunnel_as_at(
+    client: &mut H3Client,
+    authority: &str,
+    username: &str,
+    password: &str,
+    caller: &'static Location<'static>,
+) -> ClientStream {
+    let request = authorized_connect(authority, username, password);
+    let (response, stream) = exchange(client, request, caller).await;
+    assert_eq!(
+        response.status,
+        Status::OK,
+        "the tunnel to {authority} opened at {caller} as {username} was refused: \
+         proxy-status={:?}",
+        proxy_status(&response)
+    );
+    stream
 }
 
 /// Opens a CONNECT-UDP session to `target` and returns its Quarter Stream ID.
