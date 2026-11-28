@@ -146,7 +146,7 @@ jobs:
     # `fuzz/` is its own cargo workspace (the cargo-fuzz convention), so no
     # other job in this file so much as parses it. Its targets reach into
     # `src` for items that are `pub` only because they ask for them --
-    # `h3::stream::build_request`, `tunnel::tcp::split_authority`,
+    # `h3::request::build_request`, `tunnel::tcp::split_authority`,
     # `tunnel::udp::parse_target` -- and a rename or a signature change to any
     # of them compiles green everywhere here while leaving the fuzzers broken.
     # fuzz.yml runs the targets once a day and on a pull request that changes
