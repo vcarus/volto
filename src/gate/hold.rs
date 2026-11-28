@@ -31,8 +31,9 @@ use super::{Policy, Screened, by_name};
 /// oldest packets that still carry data (RFC 9002 §6.2.4: "An endpoint MAY
 /// send up to two full-sized datagrams containing ack-eliciting packets to
 /// avoid an expensive consecutive PTO expiration due to a single lost
-/// datagram."). From the 333 ms initial RTT quinn and this server default to,
-/// the probe timeouts fall at about 1 s, 3 s and 7 s. A flight of three
+/// datagram or to transmit data from multiple packet number spaces."). From
+/// the 333 ms initial RTT quinn and this server default to, the probe
+/// timeouts fall at about 1 s, 3 s and 7 s. A flight of three
 /// datagrams that loses its third gets the lost bytes back only at the
 /// second of them, 3 s after it began, and a flight of five or six, or a
 /// flight whose retransmission is lost once more, only at the third, 7 s
