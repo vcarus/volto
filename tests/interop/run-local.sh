@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Runs both cross-implementation interop suites (masque-go, then aioquic)
-# against a locally built volto, mirroring the `interop` job in
-# .github/workflows/ci.yml step for step so a local pass predicts a CI pass.
+# Runs the three cross-implementation interop suites (masque-go, then
+# aioquic, then sing-box) against a locally built volto, mirroring the
+# `interop` job in .github/workflows/ci.yml step for step so a local pass
+# predicts a CI pass.
 # The certificate, the configuration and the readiness wait are not mirrored
 # but shared: both this script and that job call ./serve.sh for them.
 #
@@ -14,13 +15,19 @@
 # A second volto process runs beside the first, with an ECH key and
 # `require_ech = true`, for the masque-go ECH case (ech_test.go); its
 # configuration and the two ECHConfigLists come from `serve.sh prepare-ech`,
-# and its log is checked like the first one's.
+# and its log is checked like the first one's. The sing-box suite drives both
+# servers as well.
 #
-# Needs: go (version per ../go.mod), python3, openssl. Exits non-zero on the
+# The sing-box suite (singbox/) is a Go module of its own, which pins the
+# sing-box release and builds it from source on its first test. A cold build
+# takes minutes; Go's build cache makes the next one take seconds.
+#
+# Needs: go (version per singbox/go.mod, which asks for the newer Go of the two
+# modules), python3, openssl. Exits non-zero on the
 # first failing suite, and finishes by handing the server log to
 # `./serve.sh check`, which holds it to the two permitted warnings the ops
 # runbook allows (the private-networks notice from this config, and the 407 the
-# missing-credentials test draws on purpose). That check is in the fixture
+# missing-credentials tests draw on purpose). That check is in the fixture
 # rather than here so the CI job runs the same one.
 set -euo pipefail
 
@@ -99,9 +106,14 @@ if [ ! -x "$VENV/bin/python" ] \
 fi
 "$VENV/bin/python" "$ROOT/tests/interop/aioquic/interop_test.py"
 
+# sing-box, built from the version singbox/go.mod pins and driven through its
+# SOCKS5 inbounds. `-count=1` for the reason the masque-go step gives. The
+# timeout covers a cold build of sing-box as well as the tests.
+(cd "$ROOT/tests/interop/singbox" && go test -v -count=1 -timeout 600s ./...)
+
 # The ops runbook's final step, automated, from the fixture the CI job calls
 # too.
 "$ROOT/tests/interop/serve.sh" check "$WORK/server.log"
 "$ROOT/tests/interop/serve.sh" check "$WORK/server-ech.log"
 
-echo "interop: both suites green"
+echo "interop: all three suites green"

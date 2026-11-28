@@ -297,18 +297,28 @@ jobs:
   interop:
     # Cross-implementation checks. `cargo test` has volto on both ends: its
     # client (`tests/common/h3client.rs`) is built on the server's own codec, so the two agree by construction even
-    # where both are wrong. Here a real volto process is driven by two clients
+    # where both are wrong. Here a real volto process is driven by three clients
     # that share no code, no QUIC stack and no reading of the RFCs with it or
-    # with each other: Go's quic-go/masque-go for CONNECT-UDP and ECH, and
-    # Python's aioquic for CONNECT-UDP and plain CONNECT. aioquic is the only
-    # one of the two that can speak plain CONNECT, so the TCP tunnel's
-    # independent coverage lives entirely in its half.
+    # with each other: Go's quic-go/masque-go for CONNECT-UDP and ECH,
+    # Python's aioquic for CONNECT-UDP and plain CONNECT, and sing-box, the
+    # client this project supports beside Surge, for both through its own
+    # HTTP/3 layer on a fork of quic-go. masque-go cannot speak plain CONNECT,
+    # so the TCP tunnel's independent coverage is in the aioquic and sing-box
+    # halves.
     #
     # Linux only: this is about the protocol on the wire, not about the host, and
     # the platform matrix is already covered by the `test` job above.
+    #
+    # The name stays as it is although sing-box is a third client: branch
+    # protection names this string as a required check, and a job under any
+    # other name would never report under it, so the check would wait forever.
     name: interop (masque-go + aioquic)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A cold build of sing-box took 91 s on an 8-core dev host with the modules
+    # already downloaded. The runner has 4 cores and starts with no module
+    # cache whenever singbox/go.sum changes, so the step is assumed to take up
+    # to 5 minutes there, on top of a cold cargo build.
+    timeout-minutes: 20
     env:
       # Loopback, so nothing outside the runner can reach this server for the
       # minute it lives. The port is arbitrary and unprivileged.
@@ -336,9 +346,17 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          # Single source of truth for the Go version: the module's own go.mod.
-          go-version-file: tests/interop/go.mod
-          cache-dependency-path: tests/interop/go.sum
+          # The job builds two Go modules, and the Go installed here must
+          # satisfy both: setup-go exports GOTOOLCHAIN=local, so no `go`
+          # command downloads a newer toolchain. The sing-box module asks for
+          # the newer Go (sing-box itself requires it), so its go.mod is the
+          # source of the version. A bump in either module that reverses that
+          # order fails the build of the other one with a message naming the
+          # version, which is the cue to point this line at it.
+          go-version-file: tests/interop/singbox/go.mod
+          cache-dependency-path: |
+            tests/interop/go.sum
+            tests/interop/singbox/go.sum
       - run: cargo build --locked
 
       # The certificate and the configuration come from tests/interop/serve.sh,
@@ -389,10 +407,10 @@ jobs:
           VOLTO_ECH_OTHER_CONFIG="$(cat ../../interop/ech-other.list)" \
             go test -v -count=1 -timeout 120s ./...
 
-      # This step and the two after it run even when the masque-go half failed.
-      # aioquic is the only independent coverage of the TCP tunnel, so a Go
-      # failure must not hide its result, and the log check judges both halves.
-      # They need only a server that started.
+      # This step and the ones after it run even when the masque-go half
+      # failed. aioquic and sing-box are the independent coverage of the TCP
+      # tunnel, so a Go failure must not hide their results, and the log check
+      # judges every half. They need only a server that started.
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: ${{ !cancelled() && steps.server.outcome == 'success' }}
         with:
@@ -411,8 +429,23 @@ jobs:
           pip install -r tests/interop/aioquic/requirements.txt
           python tests/interop/aioquic/interop_test.py
 
-      # The server log must be clean as well: a regression both clients
-      # tolerate can still log an error. The filter is shared with
+      # sing-box, built by the suite from the release tests/interop/singbox/go.mod
+      # pins, as a subprocess with a JSON configuration, driven through its
+      # SOCKS5 inbounds against both servers. Its own Go module, so the
+      # masque-go module above does not take on sing-box's dependency graph.
+      # `-count=1` for the reason the masque-go step gives; the timeout covers
+      # a cold build of sing-box as well as the tests.
+      - name: Drive it with sing-box
+        if: ${{ !cancelled() && steps.server.outcome == 'success' }}
+        working-directory: tests/interop/singbox
+        env:
+          VOLTO_CERT: ${{ github.workspace }}/interop/cert.pem
+        run: |
+          VOLTO_ECH_CONFIG="$(cat ../../interop/ech.list)" \
+            go test -v -count=1 -timeout 600s ./...
+
+      # The server log must be clean as well: a regression every client
+      # tolerates can still log an error. The filter is shared with
       # ./run-local.sh through serve.sh. Before the teardown, so a failure here
       # still gets the log printed.
       - name: The server log is clean
