@@ -9,8 +9,9 @@
 //! `#[path = "common/scripts.rs"] mod scripts;` rather than an item inside
 //! `common`. `tests/common/mod.rs` does not declare it, so `mod common;` does
 //! not compile it, and a binary that names it this way links exactly what the
-//! file below uses: the standard library. D66 allows sharing with them only
-//! through a leaf module like this one.
+//! file below uses: the standard library, and rustix to signal a process
+//! group. D66 allows sharing with them only through a leaf module like this
+//! one.
 //!
 //! Nothing here asserts anything about volto. It is paths, process output, and
 //! the files a run has to plant before it can ask a question: the certificate
@@ -23,6 +24,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -300,21 +302,50 @@ pub fn run_within_deadline(command: &mut Command) -> Output {
 /// binary until CI's job timeout, and forever on the dev host. Standard input
 /// is the caller's to set: the runners give it a null stdin, as
 /// [`Command::output`] does, or a file to pipe the script from.
+///
+/// The run ends when the command has exited and both of its output pipes have
+/// closed, as with [`Command::output`]. A process the command started in the
+/// background keeps the pipes open after the command exits, so the deadline
+/// covers the pipes too. The command runs in a process group of its own, and
+/// the deadline kills the whole group, so it reaches such a process as well.
 pub fn run_within(command: &mut Command, limit: Duration) -> Output {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .unwrap_or_else(|error| panic!("{command:?} must be runnable: {error}"));
-    let drain = |mut pipe: Box<dyn Read + Send>| {
+    let group = rustix::process::Pid::from_child(&child);
+    let kill_group = || {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    };
+    let expired = || {
+        format!(
+            "{command:?} or a process it started was still running after {limit:?}, so its \
+             process group was killed"
+        )
+    };
+
+    // Each reader sends its pipe's bytes once the pipe closes, so the wait for
+    // them can be bounded. A reader still blocked at the deadline is left
+    // behind, since killing the group closes its pipe.
+    let (sent, received) = std::sync::mpsc::channel();
+    let drain = |is_stdout: bool, mut pipe: Box<dyn Read + Send>| {
+        let sent = sent.clone();
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             let _ = pipe.read_to_end(&mut bytes);
-            bytes
-        })
+            let _ = sent.send((is_stdout, bytes));
+        });
     };
-    let stdout = drain(Box::new(child.stdout.take().expect("stdout is piped")));
-    let stderr = drain(Box::new(child.stderr.take().expect("stderr is piped")));
+    drain(
+        true,
+        Box::new(child.stdout.take().expect("stdout is piped")),
+    );
+    drain(
+        false,
+        Box::new(child.stderr.take().expect("stderr is piped")),
+    );
 
     let deadline = Instant::now() + limit;
     let mut pause = Duration::from_millis(1);
@@ -326,17 +357,31 @@ pub fn run_within(command: &mut Command, limit: Duration) -> Output {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            kill_group();
             let _ = child.wait();
-            panic!("{command:?} was still running after {limit:?}, so it was killed");
+            panic!("{}", expired());
         }
         std::thread::sleep(pause);
         pause = (pause * 2).min(Duration::from_millis(20));
     };
+
+    let (mut stdout, mut stderr) = (None, None);
+    while stdout.is_none() || stderr.is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok((is_stdout, bytes)) = received.recv_timeout(left) else {
+            kill_group();
+            panic!("{}", expired());
+        };
+        if is_stdout {
+            stdout = Some(bytes);
+        } else {
+            stderr = Some(bytes);
+        }
+    }
     Output {
         status,
-        stdout: stdout.join().expect("the stdout reader must not panic"),
-        stderr: stderr.join().expect("the stderr reader must not panic"),
+        stdout: stdout.unwrap_or_default(),
+        stderr: stderr.unwrap_or_default(),
     }
 }
 

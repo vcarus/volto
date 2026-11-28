@@ -2154,6 +2154,47 @@ fn a_run_that_does_not_end_is_killed_at_its_deadline() {
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }
 
+/// A run whose command exits while a process it started in the background
+/// still holds its standard output is killed at the same deadline, and the
+/// background process goes with it.
+#[test]
+fn a_background_process_holding_the_output_is_killed_at_the_deadline() {
+    let root = scratch_tree("install", "held-output", &[]);
+    let pid_file = root.join("pid");
+    let started = std::time::Instant::now();
+    let outcome = std::panic::catch_unwind(|| {
+        scripts::run_within(
+            Command::new("sh")
+                .args(["-c", "sleep 600 & echo $! > \"$1\"", "sh"])
+                .arg(&pid_file)
+                .stdin(Stdio::null()),
+            std::time::Duration::from_secs(1),
+        )
+    });
+    let message = outcome
+        .expect_err("a run whose output is still held past its deadline must panic")
+        .downcast::<String>()
+        .map(|message| *message)
+        .unwrap_or_default();
+    assert!(message.contains("was still running after 1s"), "{message}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+    let pid: i32 = fs::read_to_string(&pid_file)
+        .expect("the script must have written the background pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+    let pid = rustix::process::Pid::from_raw(pid).expect("a positive pid");
+    let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while rustix::process::test_kill_process(pid).is_ok() {
+        assert!(
+            std::time::Instant::now() < gone_by,
+            "the background process {pid} outlived the deadline's kill"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// `-h` must work and describe the safety-relevant flags.
 #[test]
 fn the_script_documents_itself() {
