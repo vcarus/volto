@@ -1027,12 +1027,10 @@ async fn run_connection(run: Run, plan: shape::ConnectionPlan, connection_tag: u
         }
     }
 
-    // Letting go of the client is not a neutral act. `H3Client` holds its
-    // control stream as a `quinn::SendStream`, and a dropped `SendStream`
-    // *finishes*: the peer gets a FIN on the one stream RFC 9114 §6.2.1 says
-    // must never close, and the server answers it -- correctly -- with
-    // H3_CLOSED_CRITICAL_STREAM. A client that has merely gone quiet sends no
-    // such thing; it stops sending, and nothing else.
+    // Letting go of the client is not a neutral act. Dropping an `H3Client`
+    // closes its connection with code 0, so the server sees a peer close. A
+    // client that has merely gone quiet sends no such thing; it stops sending,
+    // and nothing else.
     //
     // On a path with a round trip the release instants above can come while
     // the connection still works.
