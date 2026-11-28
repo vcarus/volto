@@ -1099,14 +1099,22 @@ echo "expires:     $expiry"
 echo
 echo "Surge policy line (replace the address if this host is behind a relay):"
 echo
-# The password is printed only to a terminal. Without one, stdout is the
-# journal of the timer's service or a log file, which other users can read.
+# The credentials as the Surge policy line and the sing-box outbound below show
+# them, the same two values for both. The password is printed only to a
+# terminal. Without one, stdout is the journal of the timer's service or a log
+# file, which other users can read. A credential read back out of a config
+# edited by hand can hold a backslash, which there starts a TOML escape this
+# script does not decode. The text between the quotes is then not the
+# credential, so both forms print a pointer to the config instead.
+shown_username="$conf_username"
 if [ -t 1 ]; then
     shown_password="$conf_password"
 else
     shown_password="<as in $CONF>"
 fi
-echo "  volto = masque, $address, $PORT, sni=$SNI, server-cert-fingerprint-sha256=${fingerprint#*=}, ${ech_part}username=$conf_username, password=$shown_password"
+[[ "$shown_username" != *\\* ]] || shown_username="<as in $CONF>"
+[[ "$shown_password" != *\\* ]] || shown_password="<as in $CONF>"
+echo "  volto = masque, $address, $PORT, sni=$SNI, server-cert-fingerprint-sha256=${fingerprint#*=}, ${ech_part}username=$shown_username, password=$shown_password"
 echo
 
 # The same server as a sing-box `http` outbound. `version` 3 is HTTP/3, with
@@ -1118,9 +1126,7 @@ echo
 #
 # Every value goes through json_string. check_credentials refuses every
 # character a JSON string would need escaped, so for a credential this run
-# accepted the escape changes nothing. A credential read back out of a config
-# edited by hand can hold a backslash, which there starts a TOML escape this
-# script does not decode, so it prints as a pointer to the config.
+# accepted the escape changes nothing.
 fingerprint_b64="<unknown>"
 fingerprint_hex="${fingerprint#*=}"
 if [[ "$fingerprint_hex" =~ ^([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$ ]]; then
@@ -1128,11 +1134,6 @@ if [[ "$fingerprint_hex" =~ ^([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$ ]]; then
     pin="$(printf '%b' "\\x${fingerprint_hex//:/\\x}" | openssl enc -base64 -A || true)"
     [[ ! "$pin" =~ ^[A-Za-z0-9+/]{43}=$ ]] || fingerprint_b64="$pin"
 fi
-sing_box_username="$conf_username"
-sing_box_password="$shown_password"
-[[ "$sing_box_username" != *\\* ]] || sing_box_username="<as in $CONF>"
-[[ "$sing_box_password" != *\\* ]] || sing_box_password="<as in $CONF>"
-
 echo "sing-box outbound, for sing-box 1.15.0 or newer (replace the address if this host is behind a relay):"
 echo
 echo "  {"
@@ -1142,8 +1143,8 @@ echo "    \"server\": $(json_string "$address"),"
 echo "    \"server_port\": $PORT,"
 echo "    \"version\": 3,"
 echo "    \"disable_version_fallback\": true,"
-echo "    \"username\": $(json_string "$sing_box_username"),"
-echo "    \"password\": $(json_string "$sing_box_password"),"
+echo "    \"username\": $(json_string "$shown_username"),"
+echo "    \"password\": $(json_string "$shown_password"),"
 echo "    \"tls\": {"
 echo "      \"enabled\": true,"
 echo "      \"server_name\": $(json_string "$SNI"),"

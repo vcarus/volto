@@ -2853,18 +2853,11 @@ fn on_a_terminal_the_sing_box_outbound_carries_the_secrets_as_valid_json() {
     const PASSWORD: &str = "p@ss/w*rd'$(x)`{}[]#%^~?=+\u{fc}";
     let root = host_root("sing-box-terminal");
     let stubs = plant_root_stubs(&root, 0, "active");
-    let mut command = Command::new("python3");
-    command
-        .args([
-            "-c",
-            "import os, pty, sys\n\
-             sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))",
-        ])
-        .arg(real_tool("bash"))
-        .arg(installer_script())
-        .args([
-            "--binary",
-            real_binary().to_str().expect("a UTF-8 path to the binary"),
+
+    let output = run_install_on_a_terminal(
+        &root,
+        &stubs,
+        &[
             "-u",
             USERNAME,
             "-w",
@@ -2873,13 +2866,8 @@ fn on_a_terminal_the_sing_box_outbound_carries_the_secrets_as_valid_json() {
             "volto.test",
             "--ech-public-name",
             ECH_PUBLIC_NAME,
-        ]);
-    in_the_checkout_without_installer_variables(&mut command);
-    command
-        .env("VOLTO_INSTALL_ROOT", &*root)
-        .env("PATH", path_with_stubs(&stubs));
-
-    let output = run_within_deadline(&mut command);
+        ],
+    );
 
     let stdout = stdout_of(&output);
     assert!(output.status.success(), "{stdout}\n{}", stderr_of(&output));
@@ -2897,40 +2885,87 @@ fn on_a_terminal_the_sing_box_outbound_carries_the_secrets_as_valid_json() {
     );
 }
 
+/// Runs the full install path on a terminal that Python's `pty.spawn` gives
+/// it, with `root` and `stubs` as [`run_full_install_with_stubs`] takes them
+/// and the real binary. What the run prints reaches the returned stdout.
+fn run_install_on_a_terminal(root: &Path, stubs: &Path, args: &[&str]) -> Output {
+    let mut command = Command::new("python3");
+    command
+        .args([
+            "-c",
+            "import os, pty, sys\n\
+             sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))",
+        ])
+        .arg(real_tool("bash"))
+        .arg(installer_script())
+        .args([
+            "--binary",
+            real_binary().to_str().expect("a UTF-8 path to the binary"),
+        ])
+        .args(args);
+    in_the_checkout_without_installer_variables(&mut command);
+    command
+        .env("VOLTO_INSTALL_ROOT", root)
+        .env("PATH", path_with_stubs(stubs));
+    run_within_deadline(&mut command)
+}
+
 /// A credential read back from a config edited by hand can hold a TOML escape,
-/// which the installer does not decode. The outbound then names the config in
-/// its place rather than print a value that is not the credential, and stays
-/// valid JSON.
+/// which the installer does not decode. The Surge policy line and the sing-box
+/// outbound then both name the config in its place rather than print a value
+/// that is not the credential, on a terminal and on a pipe, and the outbound
+/// stays valid JSON.
 #[test]
-fn a_toml_escape_in_the_config_is_not_copied_into_the_sing_box_outbound() {
-    if !python3_on_path("a_toml_escape_in_the_config_is_not_copied_into_the_sing_box_outbound") {
+fn a_toml_escape_in_the_config_is_not_copied_into_the_report() {
+    if !python3_on_path("a_toml_escape_in_the_config_is_not_copied_into_the_report") {
         return;
     }
-    let root = configured_root("sing-box-toml-escape", "");
-    let config = root.join("etc/volto/config.toml");
-    let text = fs::read_to_string(&config).expect("the planted config");
-    fs::write(
-        &config,
-        text.replace("username = \"user1\"", "username = \"us\\u0065r1\""),
-    )
-    .expect("the config must be writable");
-    let stubs = plant_root_stubs(&root, 0, "active");
+    for terminal in [false, true] {
+        let name = if terminal {
+            "toml-escape-terminal"
+        } else {
+            "toml-escape-pipe"
+        };
+        let root = configured_root(name, "");
+        let config = root.join("etc/volto/config.toml");
+        let text = fs::read_to_string(&config).expect("the planted config");
+        let edited = text.replace(
+            "{ username = \"user1\", password = \"planted\" }",
+            "{ username = \"us\\u0065r1\", password = \"pl\\u0061nted\" }",
+        );
+        assert_ne!(edited, text, "the planted user line must be the one edited");
+        fs::write(&config, edited).expect("the config must be writable");
+        let stubs = plant_root_stubs(&root, 0, "active");
 
-    // --force, because the planted certificate is a placeholder with no pin.
-    let output = run_full_install_with_stubs(&root, &stubs, &["--sni", "volto.test", "--force"]);
+        // --force, because the planted certificate is a placeholder with no pin.
+        let args = ["--sni", "volto.test", "--force"];
+        let output = if terminal {
+            run_install_on_a_terminal(&root, &stubs, &args)
+        } else {
+            run_full_install_with_stubs(&root, &stubs, &args)
+        };
 
-    let stdout = stdout_of(&output);
-    assert!(output.status.success(), "{}", stderr_of(&output));
-    let placeholder = format!("<as in {}>", config.display());
-    assert_eq!(
-        printed_sing_box_outbound(&root, &stdout),
-        expected_sing_box_outbound(
-            &policy_line_address(&stdout),
-            &placeholder,
-            &placeholder,
-            &certificate_pin(&root),
-            None,
-        ),
-        "{stdout}"
-    );
+        let stdout = stdout_of(&output);
+        assert!(output.status.success(), "{name}: {}", stderr_of(&output));
+        let placeholder = format!("<as in {}>", config.display());
+        assert!(
+            stdout.contains(&format!("username={placeholder}, password={placeholder}")),
+            "{name}: the policy line must name the config for both credentials: {stdout}"
+        );
+        assert!(
+            !stdout.contains("\\u0065") && !stdout.contains("\\u0061"),
+            "{name}: the TOML escape text reached the report: {stdout}"
+        );
+        assert_eq!(
+            printed_sing_box_outbound(&root, &stdout),
+            expected_sing_box_outbound(
+                &policy_line_address(&stdout),
+                &placeholder,
+                &placeholder,
+                &certificate_pin(&root),
+                None,
+            ),
+            "{name}: {stdout}"
+        );
+    }
 }
